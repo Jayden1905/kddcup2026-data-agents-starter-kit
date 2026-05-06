@@ -13,6 +13,7 @@ from typing import Any
 
 from data_agent_baseline.agents.investigation import InvestigationAgent, InvestigationAgentConfig
 from data_agent_baseline.agents.model import AzureOpenAIModelAdapter, OpenAIModelAdapter
+from data_agent_baseline.agents.question_driven import QuestionDrivenAgent
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
@@ -117,6 +118,11 @@ def _build_agent(
                 max_iterations=config.agent.max_investigation_iterations,
             ),
             fast_model=fast_model,
+            log_callback=log_callback,
+        )
+    if agent_type == "question_driven":
+        return QuestionDrivenAgent(
+            model=model,
             log_callback=log_callback,
         )
     return ReActAgent(

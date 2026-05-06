@@ -2,8 +2,8 @@ dataset:
   root_path: data/public/input
 
 agent:
-  # agent_type: "react" (default) or "investigation" (closed-loop plan/execute/evaluate)
-  agent_type: react
+  # agent_type: "question_driven" (default), "react", or "investigation"
+  agent_type: question_driven
 
   # backend: "openai" (default) or "azure_openai"
   backend: openai

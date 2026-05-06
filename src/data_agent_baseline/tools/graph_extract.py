@@ -104,9 +104,10 @@ RULES:
 - For relationships: if entity A references entity B's ID, create an edge.
 - QUALITATIVE LABELS: For each measurement or assessment, if the text describes it
   using qualitative language, add a corresponding "_status" field with the exact
-  label from the text. Examples:
-  - "abnormal", "elevated", "impaired", "compromised", "markedly impaired" → record it
-  - "normal", "healthy", "within range", "unremarkable", "adequate" → record it
+  FULL label from the text (include severity modifiers). Examples:
+  - "significantly elevated" → record "significantly elevated" (not just "elevated")
+  - "markedly impaired" → record "markedly impaired" (not just "impaired")
+  - "normal", "within range", "unremarkable" → record it
   For instance, "CRE: 3.5 (abnormal)" → add "CRE_status": "abnormal".
   ONLY add _status when the descriptor appears in the SAME sentence/clause as that
   field's value. A general category description does NOT apply to every field —
@@ -611,13 +612,16 @@ RULES:
     descriptor explicitly modifies.
   - If a field has a value but NO adjacent qualitative descriptor, do NOT add
     a _status for it.
+  - Capture the FULL qualifying phrase as the label, including severity modifiers.
+    E.g. "significantly elevated" not just "elevated", "markedly impaired" not
+    just "impaired".
 
 TEXT SEGMENTS:
 {text}
 """.strip()
 
 
-def _segment_by_records(text: str, id_field: str) -> list[str]:
+def _segment_by_records(text: str, id_field: str, sample_ids: list | None = None) -> list[str]:
     """Split text into segments, each containing one logical record.
 
     Splits on paragraph boundaries, then groups paragraphs that belong to the
@@ -631,19 +635,44 @@ def _segment_by_records(text: str, id_field: str) -> list[str]:
     segments: list[str] = []
     current: list[str] = []
 
-    # Patterns that signal a new record starting
-    id_patterns = [
+    # Build ID pattern from sample IDs if available (handles alphanumeric IDs)
+    id_patterns: list[re.Pattern] = []
+
+    if sample_ids:
+        str_ids = [str(s) for s in sample_ids if s is not None]
+        # Detect alphanumeric prefix pattern (e.g. rec[A-Za-z0-9]+)
+        prefixes: dict[str, int] = {}
+        for sid in str_ids:
+            m = re.match(r"^([a-zA-Z]+)", sid)
+            if m and len(m.group(1)) >= 2 and not sid.isdigit():
+                prefix = m.group(1)
+                prefixes[prefix] = prefixes.get(prefix, 0) + 1
+        if prefixes:
+            top_prefix = max(prefixes, key=lambda k: prefixes[k])
+            if prefixes[top_prefix] >= 2:
+                # Require mixed case/digits after prefix to avoid matching English words
+                suffix_len = max(len(s) - len(top_prefix) for s in str_ids if s.startswith(top_prefix))
+                min_suffix = max(5, suffix_len - 3)
+                # Use lookahead to require at least one digit OR one uppercase after prefix
+                id_patterns.append(re.compile(
+                    r"\b" + re.escape(top_prefix)
+                    + r"(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]{"
+                    + str(min_suffix) + r",}"
+                ))
+
+    # Fallback numeric patterns
+    id_patterns.extend([
         re.compile(r"\bpatient\s+(\d{3,})", re.IGNORECASE),
         re.compile(r"\bID\s+(\d{3,})", re.IGNORECASE),
         re.compile(r"\b(?:entry|record|ruling|asset|unit)\s+(?:ID\s+)?(\d{3,})", re.IGNORECASE),
         re.compile(r"\b(?:Medical Record Number|MRN)\s+(\d{3,})", re.IGNORECASE),
         re.compile(r"\bcataloged under ID\s+(\d+)", re.IGNORECASE),
         re.compile(r"\bregistered (?:as|under) ID\s+(\d+)", re.IGNORECASE),
-    ]
+    ])
 
     def _starts_new_record(para: str) -> bool:
         for pat in id_patterns:
-            m = pat.search(para[:200])
+            m = pat.search(para[:300])
             if m:
                 return True
         return False
@@ -776,7 +805,7 @@ def _extract_segmented(
     question: str,
 ) -> list[dict[str, Any]]:
     """Record-segmented extraction: split by record boundaries, batch, parallel extract."""
-    segments = _segment_by_records(text, entity_schema["id_field"])
+    segments = _segment_by_records(text, entity_schema["id_field"], entity_schema.get("sample_ids"))
     if not segments:
         return []
 
@@ -808,7 +837,134 @@ def _extract_segmented(
             all_records.extend(recs)
 
     normalized = _normalize_field_names(all_records)
-    return _resolve_entities(normalized, entity_schema["id_field"])
+    resolved = _resolve_entities(normalized, entity_schema["id_field"])
+    return _repair_null_values(model, text, resolved, entity_schema, question)
+
+
+# ---------------------------------------------------------------------------
+# NULL value repair pass
+# ---------------------------------------------------------------------------
+
+NULL_REPAIR_PROMPT = """
+A prior extraction pass found records with missing values. Search the FULL text
+below and fill in the missing fields for these specific records.
+
+RECORDS WITH MISSING DATA (fill in NULL fields):
+{records_json}
+
+SCHEMA:
+- ID field: {id_field}
+- Known attributes: {attributes}
+
+Return ONLY a JSON object (no markdown fences):
+{{
+  "records": [
+    {{"{id_field}": <id_value>, "<field>": <filled_value>, ...}},
+    ...
+  ]
+}}
+
+RULES:
+- Only return records that you found additional data for.
+- For each record, include the ID and ONLY the fields you found values for.
+- The data may be scattered across different sections — search the ENTIRE text.
+- If a value was corrected in the text, use the CORRECTED/FINAL value.
+- If you truly cannot find a value, omit that record from the output.
+
+TEXT:
+{text}
+""".strip()
+
+
+def _repair_null_values(
+    model: ModelAdapter,
+    text: str,
+    records: list[dict[str, Any]],
+    entity_schema: dict[str, Any],
+    question: str,
+) -> list[dict[str, Any]]:
+    """Second pass: find and fill NULL values in extracted records."""
+    if not records:
+        return records
+
+    id_field = entity_schema["id_field"]
+
+    # Find records with NULL in non-ID, non-status fields
+    incomplete: list[dict[str, Any]] = []
+    for r in records:
+        null_fields = [
+            k for k, v in r.items()
+            if v is None and k != id_field and not k.endswith("_status")
+        ]
+        if null_fields and r.get(id_field) is not None:
+            incomplete.append(r)
+
+    if not incomplete or len(incomplete) > 50:
+        return records
+
+    # Build a compact representation of what's missing
+    missing_info = []
+    for r in incomplete:
+        entry = {id_field: r[id_field]}
+        for k, v in r.items():
+            if v is None and k != id_field and not k.endswith("_status"):
+                entry[k] = "NULL — FILL THIS"
+            elif v is not None:
+                entry[k] = v
+        missing_info.append(entry)
+
+    # Limit text to avoid token overflow — take only paragraphs mentioning missing IDs
+    missing_ids = {str(r[id_field]) for r in incomplete}
+    paragraphs = _paragraph_split(text)
+    relevant_paras = [p for p in paragraphs if any(mid in p for mid in missing_ids)]
+    if not relevant_paras:
+        return records
+    repair_text = "\n\n".join(relevant_paras)
+    if len(repair_text) > MAX_BATCH_CHARS * 2:
+        repair_text = repair_text[:MAX_BATCH_CHARS * 2]
+
+    prompt = NULL_REPAIR_PROMPT.format(
+        records_json=json.dumps(missing_info, ensure_ascii=False, indent=2),
+        id_field=id_field,
+        attributes=_format_attributes(entity_schema.get("attributes", [])),
+        text=repair_text,
+    )
+    messages = [
+        ModelMessage(role="system", content=EXTRACTION_SYSTEM),
+        ModelMessage(role="user", content=prompt),
+    ]
+
+    try:
+        raw = model.complete(messages)
+        data = _parse_json_response(raw)
+        repairs = data.get("records", [])
+        if not isinstance(repairs, list):
+            return records
+    except Exception:
+        return records
+
+    # Apply repairs
+    repair_map: dict[str, dict[str, Any]] = {}
+    for r in repairs:
+        if isinstance(r, dict) and r.get(id_field) is not None:
+            repair_map[str(r[id_field])] = r
+
+    if not repair_map:
+        return records
+
+    result = []
+    for r in records:
+        rid = str(r.get(id_field, ""))
+        if rid in repair_map:
+            patched = dict(r)
+            for k, v in repair_map[rid].items():
+                if k != id_field and v is not None and patched.get(k) is None:
+                    patched[k] = v
+            result.append(patched)
+        else:
+            result.append(r)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -937,9 +1093,11 @@ def _write_entity_table(
 
 
 def _clean_orphaned_status(conn: sqlite3.Connection, table_name: str) -> None:
-    """Nullify _status fields where the corresponding value field is NULL.
+    """Clean up hallucinated data: orphaned statuses and data-void records.
 
-    If CRE_status is set but CRE is NULL, the status was hallucinated.
+    1. Nullify _status fields where the corresponding value field is NULL.
+    2. Nullify all non-ID fields in rows where most value columns are NULL
+       (data void records that shouldn't have any extracted values).
     """
     try:
         cursor = conn.execute(f"PRAGMA table_info('{table_name}')")
@@ -947,6 +1105,7 @@ def _clean_orphaned_status(conn: sqlite3.Connection, table_name: str) -> None:
     except Exception:
         return
 
+    # Pass 1: Orphaned status cleanup
     status_cols = [c for c in columns if c.endswith("_status")]
     for status_col in status_cols:
         base = status_col.removesuffix("_status")
@@ -955,6 +1114,32 @@ def _clean_orphaned_status(conn: sqlite3.Connection, table_name: str) -> None:
                 f'UPDATE "{table_name}" SET "{status_col}" = NULL '
                 f'WHERE "{base}" IS NULL AND "{status_col}" IS NOT NULL'
             )
+
+    # Pass 2: Data void cleanup — if a row has >= 70% NULL value columns,
+    # it's a void record; nullify any stray non-NULL values (likely hallucinated)
+    # Detect ID columns: first column, anything ending in _id, or named "id"/"date"
+    id_and_date_cols = {columns[0]} if columns else set()
+    id_and_date_cols |= {c for c in columns if c.lower() in ("id", "date", "birthday")}
+    id_and_date_cols |= {c for c in columns if c.lower().endswith("_id") or c.lower() == "record_id"}
+    meta_cols = id_and_date_cols | {c for c in columns if c.endswith("_status") or c.endswith("_abnormal")}
+    value_cols = [c for c in columns if c not in meta_cols]
+
+    if len(value_cols) >= 3:
+        # Build a CASE expression that counts NULLs among value columns
+        null_count_expr = " + ".join(
+            f'CASE WHEN "{c}" IS NULL THEN 1 ELSE 0 END' for c in value_cols
+        )
+        # Only null out rows where ALL value columns are NULL (true data voids)
+        threshold = len(value_cols)
+
+        # For data-void rows, null out status and value columns (keep ID/date)
+        cols_to_null = [c for c in columns if c not in id_and_date_cols]
+        set_clause = ", ".join(f'"{c}" = NULL' for c in cols_to_null)
+        conn.execute(
+            f'UPDATE "{table_name}" SET {set_clause} '
+            f'WHERE ({null_count_expr}) >= {threshold}'
+        )
+
     conn.commit()
 
 

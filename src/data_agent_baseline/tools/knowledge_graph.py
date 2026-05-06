@@ -27,6 +27,9 @@ DOMAIN KNOWLEDGE:
 QUESTION:
 {question}
 
+CURRENT DATE: {current_date}
+Use this for any age, duration, or time-elapsed calculations (e.g. strftime('%Y', '{current_date}') for year).
+
 Return ONLY a JSON object (no markdown fences) with these keys:
 {{
   "computation_steps": [
@@ -80,6 +83,25 @@ RULES:
 - Use DISTINCT in SQL to avoid duplicate rows from joins.
 - If the question asks for a property of entity X, SELECT from X's own table,
   not from a related table that happens to have a column with the same name.
+- BIDIRECTIONAL RELATIONSHIP TABLES: If a table has two FK columns pointing to
+  the same entity type (e.g. atom_id + atom_id2 in a "connected" table), the table
+  likely stores EACH relationship TWICE (once per direction). To count relationships
+  per entity: JOIN on ONLY ONE FK column (e.g. WHERE atom_id = X), NEVER sum
+  counts from both columns. Joining on both sides DOUBLE-COUNTS every relationship.
+  Formula for "average bonds per atom": COUNT(bond_id) / COUNT(DISTINCT atom_id)
+  using a single JOIN on one FK column.
+- TEXT VALUE MATCHING: The question may phrase values differently from the data.
+  E.g. "Brazilian Portuguese" in the question may be stored as "Portuguese (Brazil)"
+  in the data. When filtering text columns, prefer LIKE '%keyword%' COLLATE NOCASE
+  over exact match. If the domain knowledge shows example values, use the data's
+  format, not the question's phrasing.
+- AVERAGE vs SUM: When the question asks for "average X", check the DOMAIN
+  KNOWLEDGE for a formula definition. "Average monthly consumption" may mean
+  AVG(consumption_per_record)/12 or SUM(consumption)/COUNT(customers)/12 —
+  use the formula from knowledge.md if one is provided.
+- RATIO vs COUNT: "How many times was X more than Y" or "How many times greater"
+  means RATIO = X / Y (producing a decimal result), NOT a count of occurrences.
+  Similarly, "how many times less" = Y / X. Use CAST(X AS REAL) / Y in SQL.
 """.strip()
 
 
@@ -122,6 +144,19 @@ def _validate_grounding(kg: dict[str, Any], db_path: Path | None) -> list[str]:
                 conn.execute(f"EXPLAIN {sql}")
             except sqlite3.OperationalError as e:
                 errors.append(f"Step {step.get('step', '?')} SQL error: {e}")
+                continue
+            # Run the query and flag empty results on filter queries
+            try:
+                cursor = conn.execute(sql)
+                rows = cursor.fetchall()
+                if not rows or (len(rows) == 1 and rows[0][0] in (0, None)):
+                    errors.append(
+                        f"Step {step.get('step', '?')} returned empty/zero — "
+                        f"the filter value may not match actual data format. "
+                        f"Check sample values with: SELECT DISTINCT <col> FROM <table> LIMIT 10"
+                    )
+            except Exception:
+                pass
 
         # Validate join paths reference real tables
         for jp in kg.get("join_paths", []):
@@ -170,11 +205,14 @@ def build_knowledge_graph(
     db_path: Path | None = None,
     max_retries: int = 5,
 ) -> dict[str, Any]:
+    from datetime import datetime as _datetime
+
     prompt = KNOWLEDGE_GRAPH_PROMPT.format(
         file_tree=file_tree,
         schema_hint=schema_hint or "(no structured data files)",
         knowledge_text=knowledge_text or "(no knowledge.md found)",
         question=question,
+        current_date=_datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
     messages = [
         ModelMessage(role="system", content="You are a semantic data analyst."),

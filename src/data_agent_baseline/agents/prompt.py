@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import datetime
 
 from data_agent_baseline.benchmark.schema import PublicTask
 
@@ -151,6 +151,11 @@ CRITICAL — USE execute_python OR execute_context_sql TO PRODUCE FINAL DATA:
   references such a column, check BOTH sources to determine which one the
   question is asking about. Prefer the column from the entity's own table
   (e.g. driver's number comes from drivers, not qualifying).
+
+- RATIO vs COUNT: "How many times was X more than Y" or "How many times greater"
+  means RATIO = X / Y (a decimal number), NOT a count of occurrences. Similarly,
+  "how many times less" = Y / X. Only interpret as integer count if the question
+  explicitly says "how many times did [event] occur" or "on how many occasions".
 
 LARGE UNSTRUCTURED DOCUMENTS (>20KB markdown/text files):
 - If the evidence mentions "Saved N records to _extracted_XXXX.csv", the system
@@ -383,7 +388,7 @@ def build_investigation_planner_prompt(
         .replace("__QUESTION__", question)
         .replace("__EVIDENCE__", evidence or "(none yet)")
         .replace("__GAPS__", gaps or "(none — this is the first iteration)")
-        .replace("__CURRENT_DATE__", date.today().isoformat())
+        .replace("__CURRENT_DATE__", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
 
 
@@ -391,7 +396,7 @@ def build_investigation_evaluator_prompt(
     *, question: str, evidence: str, schema: str = ""
 ) -> str:
     prompt = INVESTIGATION_EVALUATOR_PROMPT.replace(
-        "__CURRENT_DATE__", date.today().isoformat()
+        "__CURRENT_DATE__", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
     parts = [
         prompt,
@@ -408,7 +413,7 @@ def build_investigation_synthesizer_prompt(
     *, question: str, evidence: str, schema: str = ""
 ) -> str:
     prompt = INVESTIGATION_SYNTHESIZER_PROMPT.replace(
-        "__CURRENT_DATE__", date.today().isoformat()
+        "__CURRENT_DATE__", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
     parts = [prompt, "", f"QUESTION:\n{question}"]
     if schema:

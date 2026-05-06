@@ -317,16 +317,14 @@ Return ONLY a JSON object mapping each label to its category (no markdown fences
 }}
 
 RULES:
-- "abnormal" = pathological, impaired, compromised, elevated, critical, acute,
-  deficient, severely affected, reduced function, dysfunction, damage
-- "borderline" = explicitly described as "borderline", "at the limit", "equivocal",
-  or "slightly" — ONLY use this category if the word "borderline" or equivalent
-  hedging language appears in the label itself
-- "normal" = normal, healthy, within range, unremarkable, adequate, stable, quiescent
-- KEY: If the label says "impaired" or "compromised" WITHOUT the word "borderline",
-  classify as "abnormal". These words indicate confirmed dysfunction, not uncertainty.
-- When in doubt between abnormal and borderline, choose abnormal.
-- When in doubt between borderline and normal, choose normal.
+- "abnormal" = the label clearly indicates a confirmed problem (with severity words
+  like "significantly", "markedly", "severely", or words like "impaired", "compromised",
+  "damage", "dysfunction")
+- "borderline" = the label indicates mild or unqualified deviation (e.g. just "elevated"
+  or "high" without severity modifier)
+- "normal" = the label indicates a healthy or expected state
+- Labels WITH a severity modifier (e.g. "significantly elevated") → abnormal.
+  Labels WITHOUT a severity modifier (e.g. just "elevated") → borderline.
 """.strip()
 
 
@@ -375,7 +373,7 @@ def _classify_and_materialize(
     if not status_map:
         return ""
 
-    # Flatten all labels for LLM classification
+    # Flatten all labels for classification
     all_labels: set[str] = set()
     for cols in status_map.values():
         for values in cols.values():
@@ -384,48 +382,29 @@ def _classify_and_materialize(
     if not all_labels:
         return ""
 
-    labels_text = "\n".join(f"  - {label}" for label in sorted(all_labels))
-    prompt = LABEL_CLASSIFICATION_PROMPT.format(
-        question=question,
-        knowledge_text=knowledge_text or "(none available)",
-        status_labels=labels_text,
+    # Rule-based classification: deterministic, no LLM dependency
+    _ABNORMAL_MARKERS = (
+        "significantly", "markedly", "severely", "impaired", "compromised",
+        "dysfunction", "damage", "critical", "acute", "deficient",
+        "active disease", "reduced function",
     )
-    messages = [
-        ModelMessage(role="system", content="You are a data domain expert."),
-        ModelMessage(role="user", content=prompt),
-    ]
+    _NORMAL_MARKERS = (
+        "normal", "healthy", "unremarkable", "adequate", "stable",
+        "within range", "negative", "clear", "quiescent",
+    )
 
-    try:
-        raw = model.complete(messages)
-    except Exception:
-        return ""
+    abnormal_labels: set[str] = set()
+    normal_labels: set[str] = set()
+    borderline_labels: set[str] = set()
 
-    # Parse LLM classification
-    try:
-        raw_stripped = raw.strip()
-        if raw_stripped.startswith("```"):
-            raw_stripped = re.sub(r"^```\w*\n?", "", raw_stripped)
-            raw_stripped = re.sub(r"\n?```$", "", raw_stripped)
-        classification: dict[str, str] = json.loads(raw_stripped)
-    except (json.JSONDecodeError, ValueError):
-        return ""
-
-    # Determine which labels are "abnormal"
-    abnormal_labels = {
-        label.lower()
-        for label, cat in classification.items()
-        if cat == "abnormal"
-    }
-    normal_labels = {
-        label.lower()
-        for label, cat in classification.items()
-        if cat == "normal"
-    }
-    borderline_labels = {
-        label.lower()
-        for label, cat in classification.items()
-        if cat == "borderline"
-    }
+    for label in all_labels:
+        low = label.lower()
+        if any(m in low for m in _ABNORMAL_MARKERS):
+            abnormal_labels.add(low)
+        elif any(m in low for m in _NORMAL_MARKERS):
+            normal_labels.add(low)
+        else:
+            borderline_labels.add(low)
 
     # Materialize boolean _abnormal columns in DB
     try:
