@@ -100,7 +100,9 @@ def _run_python_code(
         )
 
 
-def execute_python_code(context_root: Path, code: str, *, timeout_seconds: int = 30) -> dict[str, Any]:
+def execute_python_code(
+    context_root: Path, code: str, *, timeout_seconds: int = 30
+) -> dict[str, Any]:
     resolved_context_root = context_root.resolve()
     with tempfile.TemporaryDirectory() as temp_dir:
         stdout_path = Path(temp_dir) / "stdout.txt"

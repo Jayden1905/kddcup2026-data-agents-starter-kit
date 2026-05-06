@@ -14,7 +14,7 @@ from data_agent_baseline.tools.filesystem import (
 from data_agent_baseline.tools.python_exec import execute_python_code
 from data_agent_baseline.tools.sqlite import execute_read_only_sql, inspect_sqlite_schema
 
-EXECUTE_PYTHON_TIMEOUT_SECONDS = 30
+EXECUTE_PYTHON_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +55,11 @@ def _read_json(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionR
 def _read_doc(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_chars = int(action_input.get("max_chars", 4000))
-    return ToolExecutionResult(ok=True, content=read_doc_preview(task, path, max_chars=max_chars))
+    offset = int(action_input.get("offset", 0))
+    return ToolExecutionResult(
+        ok=True,
+        content=read_doc_preview(task, path, max_chars=max_chars, offset=offset),
+    )
 
 
 def _inspect_sqlite_schema(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
@@ -83,7 +87,11 @@ def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecu
 def _answer(_: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
     columns = action_input.get("columns")
     rows = action_input.get("rows")
-    if not isinstance(columns, list) or not columns or not all(isinstance(item, str) for item in columns):
+    if (
+        not isinstance(columns, list)
+        or not columns
+        or not all(isinstance(item, str) for item in columns)
+    ):
         raise ValueError("answer.columns must be a non-empty list of strings.")
     if not isinstance(rows, list):
         raise ValueError("answer.rows must be a list.")
@@ -122,7 +130,9 @@ class ToolRegistry:
             lines.append(f"  input_schema: {spec.input_schema}")
         return "\n".join(lines)
 
-    def execute(self, task: PublicTask, action: str, action_input: dict[str, Any]) -> ToolExecutionResult:
+    def execute(
+        self, task: PublicTask, action: str, action_input: dict[str, Any]
+    ) -> ToolExecutionResult:
         if action not in self.handlers:
             raise KeyError(f"Unknown tool: {action}")
         return self.handlers[action](task, action_input)
@@ -141,7 +151,11 @@ def create_default_tool_registry() -> ToolRegistry:
         "execute_context_sql": ToolSpec(
             name="execute_context_sql",
             description="Run a read-only SQL query against a sqlite/db file inside context.",
-            input_schema={"path": "relative/path/to/file.sqlite", "sql": "SELECT ...", "limit": 200},
+            input_schema={
+                "path": "relative/path/to/file.sqlite",
+                "sql": "SELECT ...",
+                "limit": 200,
+            },
         ),
         "execute_python": ToolSpec(
             name="execute_python",
@@ -171,8 +185,16 @@ def create_default_tool_registry() -> ToolRegistry:
         ),
         "read_doc": ToolSpec(
             name="read_doc",
-            description="Read a text-like document inside context.",
-            input_schema={"path": "relative/path/to/file.md", "max_chars": 4000},
+            description=(
+                "Read a chunk of a text document inside context. "
+                "Use offset to paginate through large files. "
+                "Returns file_size_bytes and total_chars so you know the full size."
+            ),
+            input_schema={
+                "path": "relative/path/to/file.md",
+                "max_chars": 4000,
+                "offset": 0,
+            },
         ),
         "read_json": ToolSpec(
             name="read_json",

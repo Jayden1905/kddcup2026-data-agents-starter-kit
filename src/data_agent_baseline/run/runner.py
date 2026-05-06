@@ -11,7 +11,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from data_agent_baseline.agents.model import OpenAIModelAdapter
+from data_agent_baseline.agents.investigation import InvestigationAgent, InvestigationAgentConfig
+from data_agent_baseline.agents.model import AzureOpenAIModelAdapter, OpenAIModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
@@ -31,7 +32,9 @@ class TaskRunArtifacts:
         return {
             "task_id": self.task_id,
             "task_output_dir": str(self.task_output_dir),
-            "prediction_csv_path": str(self.prediction_csv_path) if self.prediction_csv_path else None,
+            "prediction_csv_path": str(self.prediction_csv_path)
+            if self.prediction_csv_path
+            else None,
             "trace_path": str(self.trace_path),
             "succeeded": self.succeeded,
             "failure_reason": self.failure_reason,
@@ -62,11 +65,64 @@ def create_run_output_dir(output_root: Path, *, run_id: str | None = None) -> tu
 
 
 def build_model_adapter(config: AppConfig):
+    backend = config.agent.backend.lower()
+    if backend == "azure_openai":
+        return AzureOpenAIModelAdapter(
+            deployment_name=config.agent.deployment_name or config.agent.model,
+            api_key=config.agent.api_key,
+            endpoint=config.agent.api_base,
+            api_version=config.agent.api_version,
+            temperature=config.agent.temperature,
+        )
     return OpenAIModelAdapter(
         model=config.agent.model,
         api_base=config.agent.api_base,
         api_key=config.agent.api_key,
         temperature=config.agent.temperature,
+    )
+
+
+def build_fast_model_adapter(config: AppConfig):
+    fast_model = config.agent.fast_model
+    if not fast_model:
+        return None
+    backend = (config.agent.fast_backend or config.agent.backend).lower()
+    api_base = config.agent.fast_api_base or config.agent.api_base
+    api_key = config.agent.fast_api_key or config.agent.api_key
+    if backend == "azure_openai":
+        return AzureOpenAIModelAdapter(
+            deployment_name=config.agent.fast_deployment_name or fast_model,
+            api_key=api_key,
+            endpoint=api_base,
+            api_version=config.agent.api_version,
+            temperature=config.agent.temperature,
+        )
+    return OpenAIModelAdapter(
+        model=fast_model,
+        api_base=api_base,
+        api_key=api_key,
+    )
+
+
+def _build_agent(
+    *, model, tools: ToolRegistry, config: AppConfig, fast_model=None, log_callback=None
+):
+    agent_type = config.agent.agent_type.lower()
+    if agent_type == "investigation":
+        return InvestigationAgent(
+            model=model,
+            tools=tools,
+            config=InvestigationAgentConfig(
+                max_steps=config.agent.max_steps,
+                max_iterations=config.agent.max_investigation_iterations,
+            ),
+            fast_model=fast_model,
+            log_callback=log_callback,
+        )
+    return ReActAgent(
+        model=model,
+        tools=tools,
+        config=ReActAgentConfig(max_steps=config.agent.max_steps),
     )
 
 
@@ -99,20 +155,29 @@ def _run_single_task_core(
     config: AppConfig,
     model=None,
     tools: ToolRegistry | None = None,
+    fast_model=None,
+    log_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
-    agent = ReActAgent(
-        model=model or build_model_adapter(config),
-        tools=tools or create_default_tool_registry(),
-        config=ReActAgentConfig(max_steps=config.agent.max_steps),
+    effective_model = model or build_model_adapter(config)
+    effective_tools = tools or create_default_tool_registry()
+    effective_fast_model = fast_model or build_fast_model_adapter(config)
+    agent = _build_agent(
+        model=effective_model,
+        tools=effective_tools,
+        config=config,
+        fast_model=effective_fast_model,
+        log_callback=log_callback,
     )
     run_result = agent.run(task)
     return run_result.to_dict()
 
 
-def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]) -> None:
+def _run_single_task_in_subprocess(
+    task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]
+) -> None:
     try:
         queue.put(
             {
@@ -148,7 +213,9 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         if process.is_alive():
             process.kill()
             process.join()
-        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
+        return _failure_run_result_payload(
+            task_id, f"Task timed out after {timeout_seconds} seconds."
+        )
 
     if queue.empty():
         exit_code = process.exitcode
@@ -162,10 +229,14 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     result = queue.get()
     if result.get("ok"):
         return dict(result["run_result"])
-    return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
+    return _failure_run_result_payload(
+        task_id, f"Task failed with uncaught error: {result['error']}"
+    )
 
 
-def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any]) -> TaskRunArtifacts:
+def _write_task_outputs(
+    task_id: str, run_output_dir: Path, run_result: dict[str, Any]
+) -> TaskRunArtifacts:
     task_output_dir = run_output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
     trace_path = task_output_dir / "trace.json"
@@ -216,7 +287,9 @@ def run_benchmark(
     limit: int | None = None,
     progress_callback: Callable[[TaskRunArtifacts], None] | None = None,
 ) -> tuple[Path, list[TaskRunArtifacts]]:
-    effective_run_id, run_output_dir = create_run_output_dir(config.run.output_dir, run_id=config.run.run_id)
+    effective_run_id, run_output_dir = create_run_output_dir(
+        config.run.output_dir, run_id=config.run.run_id
+    )
 
     dataset = DABenchPublicDataset(config.dataset.root_path)
     tasks = dataset.iter_tasks()

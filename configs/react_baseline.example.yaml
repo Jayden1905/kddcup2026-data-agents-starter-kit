@@ -2,11 +2,27 @@ dataset:
   root_path: data/public/input
 
 agent:
+  # agent_type: "react" (default) or "investigation" (closed-loop plan/execute/evaluate)
+  agent_type: react
+
+  # backend: "openai" (default) or "azure_openai"
+  backend: openai
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
   max_steps: 16
   temperature: 0.0
+
+  # --- Azure OpenAI settings (only used when backend: azure_openai) ---
+  # api_version: "2025-01-01-preview"
+  # deployment_name: gpt-4.1
+
+  # --- Investigation agent settings (only used when agent_type: investigation) ---
+  # max_investigation_iterations: 5
+
+  # --- Dual LLM (optional: cheaper/faster model for plan + evaluate phases) ---
+  # fast_model: gpt-4.1-mini
+  # fast_deployment_name: gpt-4.1-mini   # Azure only
 
 run:
   output_dir: artifacts/runs

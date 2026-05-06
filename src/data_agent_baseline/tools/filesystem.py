@@ -42,46 +42,100 @@ def list_context_tree(task: PublicTask, *, max_depth: int = 4) -> dict[str, obje
     }
 
 
-def read_csv_preview(task: PublicTask, relative_path: str, *, max_rows: int = 20) -> dict[str, object]:
+def read_csv_preview(
+    task: PublicTask, relative_path: str, *, max_rows: int = 20
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     with path.open(newline="") as handle:
         reader = csv.reader(handle)
-        rows = list(reader)
-
-    if not rows:
-        return {
-            "path": relative_path,
-            "columns": [],
-            "rows": [],
-            "row_count": 0,
-        }
-
-    header = rows[0]
-    data_rows = rows[1:]
+        header = next(reader, None)
+        if header is None:
+            return {
+                "path": relative_path,
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "total_row_count": 0,
+            }
+        preview_rows: list[list[str]] = []
+        for row in reader:
+            if len(preview_rows) < max_rows:
+                preview_rows.append(row)
+            else:
+                break
+        has_more = len(preview_rows) == max_rows
+        total_estimate: int | None = None
+        if has_more:
+            file_size = path.stat().st_size
+            if file_size > 1_000_000:
+                total_estimate = _estimate_csv_rows(path, file_size)
     return {
         "path": relative_path,
         "columns": header,
-        "rows": data_rows[:max_rows],
-        "row_count": len(data_rows),
+        "rows": preview_rows,
+        "row_count": len(preview_rows),
+        "has_more": has_more,
+        **({"estimated_total_rows": total_estimate} if total_estimate else {}),
     }
 
 
-def read_json_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def _estimate_csv_rows(path: Path, file_size: int) -> int:
+    sample_size = 0
+    sample_lines = 0
+    with path.open(newline="") as handle:
+        next(handle, None)
+        for line in handle:
+            sample_size += len(line.encode("utf-8", errors="replace"))
+            sample_lines += 1
+            if sample_lines >= 100:
+                break
+    if sample_lines == 0 or sample_size == 0:
+        return 0
+    avg_line_bytes = sample_size / sample_lines
+    return int(file_size / avg_line_bytes)
+
+
+def read_json_preview(
+    task: PublicTask, relative_path: str, *, max_chars: int = 4000
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
-    payload = json.loads(path.read_text())
-    preview = json.dumps(payload, ensure_ascii=False, indent=2)
+    file_size = path.stat().st_size
+    if file_size <= max_chars * 3:
+        payload = json.loads(path.read_text())
+        preview = json.dumps(payload, ensure_ascii=False, indent=2)
+    else:
+        raw = path.read_text(errors="replace")[: max_chars * 3]
+        try:
+            payload = json.loads(raw)
+            preview = json.dumps(payload, ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            preview = raw
     return {
         "path": relative_path,
         "preview": preview[:max_chars],
-        "truncated": len(preview) > max_chars,
+        "truncated": file_size > max_chars * 3,
+        "file_size_bytes": file_size,
     }
 
 
-def read_doc_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def read_doc_preview(
+    task: PublicTask,
+    relative_path: str,
+    *,
+    max_chars: int = 4000,
+    offset: int = 0,
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
+    file_size = path.stat().st_size
     text = path.read_text(errors="replace")
+    total_chars = len(text)
+    chunk = text[offset : offset + max_chars]
     return {
         "path": relative_path,
-        "preview": text[:max_chars],
-        "truncated": len(text) > max_chars,
+        "preview": chunk,
+        "offset": offset,
+        "chars_returned": len(chunk),
+        "total_chars": total_chars,
+        "file_size_bytes": file_size,
+        "truncated": (offset + len(chunk)) < total_chars,
     }

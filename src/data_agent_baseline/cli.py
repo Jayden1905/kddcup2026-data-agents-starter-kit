@@ -16,7 +16,12 @@ from rich.table import Table
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import load_app_config
-from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
+from data_agent_baseline.run.runner import (
+    TaskRunArtifacts,
+    create_run_output_dir,
+    run_benchmark,
+    run_single_task,
+)
 from data_agent_baseline.tools.filesystem import list_context_tree
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -93,7 +98,11 @@ def status(
     table.add_row("configs_dir", str(CONFIGS_DIR), _status_value(CONFIGS_DIR))
     table.add_row("artifacts_dir", str(ARTIFACTS_DIR), _status_value(ARTIFACTS_DIR))
     table.add_row("runs_dir", str(ARTIFACT_RUNS_DIR), _status_value(ARTIFACT_RUNS_DIR))
-    table.add_row("dataset_root", str(app_config.dataset.root_path), _status_value(app_config.dataset.root_path))
+    table.add_row(
+        "dataset_root",
+        str(app_config.dataset.root_path),
+        _status_value(app_config.dataset.root_path),
+    )
     table.add_row("config_path", str(config_path), _status_value(config_path))
 
     console.print(table)
@@ -138,7 +147,9 @@ def run_task_command(
     """Run the ReAct baseline on one task."""
     app_config = load_app_config(config)
     try:
-        _, run_output_dir = create_run_output_dir(app_config.run.output_dir, run_id=app_config.run.run_id)
+        _, run_output_dir = create_run_output_dir(
+            app_config.run.output_dir, run_id=app_config.run.run_id
+        )
     except (ValueError, FileExistsError) as exc:
         raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
     artifacts = run_single_task(task_id=task_id, config=app_config, run_output_dir=run_output_dir)
@@ -255,6 +266,16 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+
+@app.command()
+def tui(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+) -> None:
+    """Launch the interactive task runner TUI."""
+    from data_agent_baseline.tui import run_tui
+
+    run_tui(config)
 
 
 def main() -> None:
