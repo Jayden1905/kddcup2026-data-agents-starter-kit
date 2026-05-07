@@ -1,5 +1,5 @@
 CONFIG ?= configs/react_baseline.local.yaml
-TASK   ?= task_1
+TASK   ?= task_11
 LIMIT  ?= 5
 
 .PHONY: install tui run run-bench status inspect lint fmt test

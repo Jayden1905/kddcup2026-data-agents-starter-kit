@@ -40,8 +40,18 @@ def _load_gold_csv(task_id: str) -> tuple[list[str], list[list[str]]] | None:
 
 class TaskListScreen(Screen):
     BINDINGS = [
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
         Binding("q", "quit_app", "Quit"),
     ]
+
+    def action_cursor_down(self) -> None:
+        table = self.query_one("#task-table", DataTable)
+        table.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        table = self.query_one("#task-table", DataTable)
+        table.action_cursor_up()
 
     def __init__(self, dataset: DABenchPublicDataset) -> None:
         super().__init__()
@@ -73,12 +83,14 @@ class TaskListScreen(Screen):
 class RunScreen(Screen):
     BINDINGS = [
         Binding("escape", "go_back", "Back to list"),
+        Binding("c", "cancel_run", "Cancel"),
         Binding("q", "quit_app", "Quit"),
     ]
 
     def __init__(self, task_id: str) -> None:
         super().__init__()
         self.task_id = task_id
+        self._cancelled = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -93,31 +105,57 @@ class RunScreen(Screen):
     def _run_agent(self) -> None:
         app: DABenchTUI = self.app  # type: ignore[assignment]
         log_widget = self.query_one("#agent-log", RichLog)
-
-        def log_cb(msg: str) -> None:
-            self.app.call_from_thread(log_widget.write, msg)
-
-        log_cb(f"[bold]Task: {self.task_id}[/bold]")
-        log_cb(f"Question: {app.dataset.get_task(self.task_id).question}")
-        log_cb("")
+        run_label = self.query_one("#run-label", Label)
 
         start = perf_counter()
+        last_label_update = 0.0
+
+        def write_log(msg: str) -> None:
+            self.app.call_from_thread(log_widget.write, msg)
+
+        def update_label(elapsed: float) -> None:
+            run_label.update(f" Running: {self.task_id}  |  Elapsed: {elapsed:.0f}s")
+
+        def log_cb(step: dict | str) -> None:
+            nonlocal last_label_update
+            elapsed = perf_counter() - start
+            ts = f"[dim]{elapsed:6.1f}s[/dim]"
+            if isinstance(step, dict):
+                action = step.get("action", "")
+                detail = step.get("detail", "")
+                self.app.call_from_thread(log_widget.write, f"{ts} [bold cyan]\\[{action}][/bold cyan] {detail}")
+            else:
+                self.app.call_from_thread(log_widget.write, f"{ts} {step}")
+            if elapsed - last_label_update > 5.0:
+                last_label_update = elapsed
+                self.app.call_from_thread(update_label, elapsed)
+
+        write_log(f"[bold]Task: {self.task_id}[/bold]")
+        write_log(f"Question: {app.dataset.get_task(self.task_id).question}")
+        write_log("")
+        # Fresh model per task to avoid connection reuse rate-limiting
+        model = build_model_adapter(app.config)
+        fast_model = build_fast_model_adapter(app.config)
         try:
             run_result = _run_single_task_core(
                 task_id=self.task_id,
                 config=app.config,
-                model=app.model,
+                model=model,
                 tools=app.tools,
-                fast_model=app.fast_model,
+                fast_model=fast_model,
                 log_callback=log_cb,
             )
         except Exception as exc:
-            log_cb(f"[bold red]Agent error: {exc}[/bold red]")
+            write_log(f"[bold red]Agent error: {exc}[/bold red]")
             return
 
         elapsed = perf_counter() - start
-        log_cb("")
-        log_cb(f"[bold]Completed in {elapsed:.1f}s[/bold]")
+        write_log("")
+        write_log(f"[bold]Completed in {elapsed:.1f}s[/bold]")
+        self.app.call_from_thread(
+            run_label.update,
+            f" Done: {self.task_id}  |  Total: {elapsed:.1f}s",
+        )
 
         try:
             _, run_output_dir = create_run_output_dir(
@@ -149,15 +187,26 @@ class RunScreen(Screen):
             ),
         )
 
+    def action_cancel_run(self) -> None:
+        self._cancelled = True
+        self.workers.cancel_all()
+        log_widget = self.query_one("#agent-log", RichLog)
+        log_widget.write("[bold yellow]Cancelled.[/bold yellow]")
+
     def action_go_back(self) -> None:
+        self._cancelled = True
+        self.workers.cancel_all()
         self.app.pop_screen()
 
     def action_quit_app(self) -> None:
+        self.workers.cancel_all()
         self.app.exit()
 
 
 class ResultsScreen(Screen):
     BINDINGS = [
+        Binding("n", "run_next", "Next task"),
+        Binding("p", "run_prev", "Prev task"),
         Binding("escape", "go_back", "Back to list"),
         Binding("q", "quit_app", "Quit"),
     ]
@@ -237,6 +286,28 @@ class ResultsScreen(Screen):
         if len(self.pred_rows) != len(gold_rows):
             diffs.append(f"row count: pred={len(self.pred_rows)} vs gold={len(gold_rows)}")
         return " MISMATCH: " + "; ".join(diffs) if diffs else " MISMATCH (values differ)"
+
+    def _get_adjacent_task_id(self, direction: int) -> str | None:
+        app: DABenchTUI = self.app  # type: ignore[assignment]
+        task_ids = [t.task_id for t in app.dataset.iter_tasks()]
+        try:
+            idx = task_ids.index(self.task_id)
+            new_idx = idx + direction
+            if 0 <= new_idx < len(task_ids):
+                return task_ids[new_idx]
+        except ValueError:
+            pass
+        return None
+
+    def action_run_next(self) -> None:
+        next_id = self._get_adjacent_task_id(1)
+        if next_id:
+            self.app.switch_screen(RunScreen(next_id))
+
+    def action_run_prev(self) -> None:
+        prev_id = self._get_adjacent_task_id(-1)
+        if prev_id:
+            self.app.switch_screen(RunScreen(prev_id))
 
     def action_go_back(self) -> None:
         self.app.switch_screen(TaskListScreen(self.app.dataset))  # type: ignore[attr-defined]

@@ -7,8 +7,8 @@ from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 90  # seconds per API call
-MAX_RETRIES = 2
+REQUEST_TIMEOUT = 60  # seconds per API call
+MAX_RETRIES = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,10 +47,11 @@ class OpenAIModelAdapter:
 
     def _get_client(self) -> OpenAI:
         if self._client is None:
+            from httpx import Timeout
             self._client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
-                timeout=REQUEST_TIMEOUT,
+                timeout=Timeout(REQUEST_TIMEOUT, connect=10.0),
             )
         return self._client
 
@@ -68,6 +69,8 @@ class OpenAIModelAdapter:
         }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        if "qwen" in self.model.lower():
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -79,7 +82,7 @@ class OpenAIModelAdapter:
                 raise RuntimeError("Model request timed out after retries.")
             except APIError as exc:
                 if attempt < MAX_RETRIES - 1 and exc.status_code in (429, 502, 503):
-                    backoff = (2 ** attempt) * 3  # 3s, 6s, 12s
+                    backoff = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s
                     time.sleep(backoff)
                     continue
                 raise RuntimeError(f"Model request failed: {exc}") from exc

@@ -241,7 +241,8 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
 
 
 def _write_task_outputs(
-    task_id: str, run_output_dir: Path, run_result: dict[str, Any]
+    task_id: str, run_output_dir: Path, run_result: dict[str, Any],
+    dataset_root: Path | None = None,
 ) -> TaskRunArtifacts:
     task_output_dir = run_output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
@@ -257,6 +258,13 @@ def _write_task_outputs(
             list(answer.get("columns", [])),
             [list(row) for row in answer.get("rows", [])],
         )
+
+    if dataset_root:
+        import shutil
+        agent_log = dataset_root / task_id / "context" / "_agent.log"
+        if agent_log.exists():
+            shutil.copy2(agent_log, task_output_dir / "agent.log")
+            agent_log.unlink()
 
     return TaskRunArtifacts(
         task_id=task_id,
@@ -282,7 +290,8 @@ def run_single_task(
     else:
         run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
     run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
-    return _write_task_outputs(task_id, run_output_dir, run_result)
+    dataset_root = Path(config.dataset.root_path)
+    return _write_task_outputs(task_id, run_output_dir, run_result, dataset_root=dataset_root)
 
 
 def run_benchmark(

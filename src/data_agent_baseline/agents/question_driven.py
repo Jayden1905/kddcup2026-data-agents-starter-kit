@@ -23,16 +23,6 @@ from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
 from data_agent_baseline.agents.runtime import AgentRunResult, StepRecord
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.pipeline.context_scanner import TaskContext, scan_context
-from data_agent_baseline.pipeline.doc_extractor import (
-    extract_all_docs,
-    write_extracted_table,
-)
-from data_agent_baseline.pipeline.llm_extractor import (
-    discover_schema,
-    extract_from_docs,
-    should_use_llm_extraction,
-    write_llm_extracted_table,
-)
 from data_agent_baseline.pipeline.kg_builder import (
     KnowledgeGraph,
     build_kg_from_sqlite,
@@ -43,7 +33,7 @@ from data_agent_baseline.tools.knowledge_graph import consolidate_to_sqlite
 logger = logging.getLogger(__name__)
 
 CONSOLIDATED_DB_NAME = "_consolidated.db"
-TASK_TIME_BUDGET_SECONDS = 480  # bail before 600s hard timeout
+TASK_TIME_BUDGET_SECONDS = 850  # bail before 900s hard timeout
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +41,7 @@ TASK_TIME_BUDGET_SECONDS = 480  # bail before 600s hard timeout
 # ---------------------------------------------------------------------------
 
 SQL_RULES = [
+    "PRIORITY: Your SQL must answer the user's EXACT question — re-read it before writing.",
     "Use only tables and columns shown in the schema.",
     "SELECT only columns that answer the question. Never SELECT *.",
     "Check SAMPLE DATA for date ranges and formats before writing WHERE clauses.",
@@ -59,7 +50,10 @@ SQL_RULES = [
     "\"X containing Y\" means filter X itself (WHERE X.prop = Y).",
     "Use LIKE '%keyword%' COLLATE NOCASE for text. Use CAST(x AS REAL) for division.",
     "Never return raw record IDs — JOIN to get human-readable names.",
-    "Never use LIMIT unless the question asks for a specific count.",
+    "NEVER use LIMIT unless the question explicitly asks for a specific count (e.g., 'top 3'). For superlatives (lowest/highest/most/least/best/worst), use a subquery: WHERE col = (SELECT MIN/MAX(col) ...) — there may be ties.",
+    "Escape apostrophes in strings: use '' (double single-quote) inside SQL string literals.",
+    "For COUNT/SUM/aggregations: the column being aggregated must semantically match what the question asks about. Re-read the question to determine the correct column.",
+    "Do NOT use GROUP BY + aggregate (SUM/AVG) unless the question explicitly asks for totals or averages. 'lowest/highest X' means MIN/MAX of individual rows, not grouped sums.",
 ]
 
 
@@ -98,14 +92,26 @@ def _build_sql_prompt(
 
     parts.append(f"\nQUESTION: {question}")
 
-    parts.append('\nReturn ONLY a JSON object:\n{"thought": "reasoning", "sql": "SELECT ..."}')
-
     rules = "\n".join(f"- {r}" for r in SQL_RULES)
-    if grounding_context and "FORMULA" in grounding_context:
-        rules += "\n- Follow the FORMULA in SEMANTIC GROUNDING exactly."
+    if grounding_context:
+        if "FORMULA" in grounding_context:
+            rules += "\n- Follow the FORMULA in SEMANTIC GROUNDING exactly."
+        if "FILTER VALUES" in grounding_context:
+            rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use EXACTLY the values from FILTER VALUES above. Do NOT substitute other values."
+        if "SELECT THESE COLUMNS" in grounding_context:
+            rules += "\n- SELECT the columns listed in SELECT THESE COLUMNS."
     elif knowledge_text and "formula" in knowledge_text.lower():
         rules += "\n- If DOMAIN KNOWLEDGE defines a formula, follow it exactly."
     parts.append(f"\nRULES:\n{rules}")
+
+    # Put mandatory filter constraint LAST so it's freshest in model's context
+    if grounding_context and "FILTER VALUES" in grounding_context:
+        import re as _re
+        fv_match = _re.search(r"FILTER VALUES:\n((?:  .+\n?)+)", grounding_context)
+        if fv_match:
+            parts.append(f"\n⚠️ MANDATORY WHERE CLAUSE (do NOT change these values):\n{fv_match.group(1).strip()}")
+
+    parts.append('\nReturn ONLY a JSON object:\n{"thought": "reasoning", "sql": "SELECT ..."}')
 
     return "\n".join(parts)
 
@@ -117,10 +123,18 @@ def _build_evaluate_prompt(
     sql_error: str,
     data_text: str,
     kg_context: str = "",
+    knowledge_text: str = "",
+    grounding_context: str = "",
 ) -> str:
     parts = ["Evaluate whether these query results answer the question."]
 
     parts.append(f"\nQUESTION: {question}")
+
+    if knowledge_text:
+        parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1500]}")
+
+    if grounding_context:
+        parts.append(f"\nVALIDATED PLAN:\n{grounding_context}")
 
     if kg_context:
         parts.append(f"\nSCHEMA:\n{kg_context}")
@@ -135,59 +149,96 @@ def _build_evaluate_prompt(
 Return ONLY a JSON object:
 {"verdict": "complete"/"incomplete", "reasoning": "why", "gaps": [], "info_queries": [], "suggested_sql": "..."}
 
-- "complete" = data answers the question. Don't over-think.
-- "incomplete" = error, empty, or wrong data.
-- suggested_sql must be a DIFFERENT approach. Never repeat the same failing query.""")
+- Re-read the QUESTION. Does the data ACTUALLY answer what was asked?
+- TRUST the VALIDATED PLAN's filter values — they have been verified against DOMAIN KNOWLEDGE.
+- FIRST CHECK: Does the SQL's WHERE clause use the EXACT filter values from VALIDATED PLAN? If not → "incomplete".
+- "complete" = SQL uses correct filters from VALIDATED PLAN AND data has rows AND answers the question.
+- "incomplete" = SQL uses wrong filter values, or error, empty, or wrong columns.
+- Do NOT question filter values that match the VALIDATED PLAN — those are correct.
+- MULTIPLE ROWS ARE VALID: If the query returns multiple rows, that means there are ties or multiple matches — this is CORRECT. Do NOT mark as incomplete just because there are multiple results.
+- suggested_sql must use the VALIDATED PLAN's filter values. Never repeat the same failing query.""")
 
     return "\n".join(parts)
 
 
-SEMANTIC_GROUNDING_PROMPT = """Decompose this question into a structured plan for SQL generation.
+DOMAIN_ANCHOR_PROMPT = """Given this question and domain knowledge, extract ONLY the definitions and rules that are directly relevant to answering the question.
+
+QUESTION: {question}
+
+DOMAIN KNOWLEDGE:
+{knowledge_text}
+
+Return ONLY a JSON object:
+{{"anchors": ["exact quote of each relevant definition — include the exact numeric values/mappings"], "use_case_sql": "the complete SQL from a USE CASE that answers the same or very similar question, or null if none match"}}
+
+RULES:
+- For anchors: quote the EXACT definition including numeric mappings (e.g., "'severe' corresponds to value 2").
+- For use_case_sql: if the domain knowledge has a USE CASE whose question matches or is very similar to the user's question, copy its SQL EXACTLY. This SQL is the authoritative answer pattern.
+- If a definition distinguishes between similar terms (e.g., "most severe = 1" vs "severe = 2"), quote BOTH so the distinction is clear.
+- Be precise and complete — these anchors will be used as immutable ground truth.
+""".strip()
+
+SEMANTIC_GROUNDING_PROMPT = """Your ONLY goal is to answer the user's EXACT question — nothing more, nothing less.
 
 QUESTION: {question}
 
 DATABASE SCHEMA:
 {kg_context}
 {sample_section}
-{knowledge_section}
-Return ONLY a JSON object with these fields:
+{anchor_section}
+{previous_attempt}
+Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
-  "formula": "mathematical formula or aggregation needed (e.g. SUM(amount)/COUNT(*), MAX(date) - MIN(date)). Use 'direct_lookup' if no calculation needed.",
+  "what_user_wants": "restate EXACTLY what output the user expects — column(s), grain, and format",
+  "formula": "SQL expression (SUM, COUNT, AVG, CAST, etc.) or 'direct_lookup' if no calculation",
   "computation_steps": ["step1: find X", "step2: calculate Y from X"],
-  "data_requirements": ["table.column needed", "table2.column2 for filter"],
-  "reasoning": "brief explanation of HOW to get the answer from the data",
-  "domain_rules": ["any constraints: date formats, units, special cases"],
-  "known_values": {{"column_name": ["specific values to filter on"]}},
+  "data_requirements": ["table.column needed for output", "table2.column2 for filter"],
+  "reasoning": "brief HOW to get the answer — must trace back to what_user_wants",
+  "domain_rules": ["constraints from DOMAIN KNOWLEDGE that affect the query"],
+  "known_values": {{"column_name": ["exact filter values verified in SAMPLE DATA"]}},
   "join_paths": ["tableA.col -> tableB.col -> tableC.col"]
 }}
 
 RULES:
-- For join_paths, trace the FULL path from source to target using FK relationships in the schema.
-- For known_values, use EXACT values from DOMAIN KNOWLEDGE definitions. If knowledge says "X means value Y", use Y.
-- For formula, write the actual SQL expression (SUM, COUNT, AVG, etc.) or "direct_lookup".
-- Keep computation_steps as concrete SQL operations, not abstract descriptions.
-- Pay attention to DOMAIN KNOWLEDGE definitions — they override common-sense interpretations.
+- Start by understanding what_user_wants — every other field must serve that goal.
+- GROUND TRUTH section contains immutable facts extracted from domain knowledge. You MUST follow them exactly.
+- For known_values: use values from GROUND TRUTH first. Then verify they exist in SAMPLE DATA.
+- For formula: if the question asks "average monthly X", that may mean SUM/12 or AVG depending on data grain. Check SAMPLE DATA to understand the grain (one row per month? per year?).
+- For join_paths: trace the FULL FK path shown in DATABASE SCHEMA. Never skip intermediate tables.
+- For data_requirements: list ONLY columns needed for output + filters. Do NOT include extra columns.
+- If GROUND TRUTH includes a USE CASE SQL, follow its structure but ensure the selected/aggregated column semantically matches what the question asks about.
 """.strip()
 
-GROUNDING_VALIDATE_PROMPT = """Check if this grounding plan correctly answers the question.
+GROUNDING_VALIDATE_PROMPT = """You are a strict validator. Check if this plan EXACTLY answers the user's question.
 
 QUESTION: {question}
-
-GROUNDING PLAN:
-{grounding_json}
-{knowledge_section}
+{anchor_section}
 {sample_section}
-Verify:
-1. Do known_values use the EXACT correct values? (Check DOMAIN KNOWLEDGE definitions carefully)
-2. Are join_paths complete — no missing intermediate tables?
-3. Does the formula match what the question asks (count, list, sum, average, etc.)?
-4. Are there any ambiguous terms in the question that need clarification from DOMAIN KNOWLEDGE?
+PLAN:
+{grounding_json}
+
+VALIDATE EACH:
+1. FILTER VALUES — CRITICAL:
+   - GROUND TRUTH is the FINAL AUTHORITY. If the plan's filter values contradict GROUND TRUTH, fix them.
+   - If GROUND TRUTH has a USE CASE SQL, the plan's known_values MUST match that SQL's WHERE clause.
+   - If a filter value comes directly from the QUESTION (e.g., a name, title, or specific term the user mentioned), keep it even if it's not in SAMPLE DATA. SAMPLE DATA is only a small subset.
+   - Only reject values that contradict GROUND TRUTH definitions, NOT values that are simply absent from the sample.
+2. OUTPUT GRAIN: What shape does the user expect?
+   - "how many" → single COUNT value
+   - "list all" → multiple rows
+   - "what is the X" → single value
+   - Do NOT add extra columns the question didn't ask for.
+3. FORMULA: Does it match EXACTLY what user asks?
+   - "average monthly X" with yearly data → need /12
+   - "percentage" → need *100
+   - Check GROUND TRUTH for formula definitions.
+4. JOIN PATHS: Complete? No missing intermediate tables?
 
 Return ONLY a JSON object:
-{{"verdict": "sufficient"/"insufficient", "issues": ["issue1", "issue2"], "corrections": {{"field_name": "corrected_value"}}}}
+{{"verdict": "correct"/"needs_fix", "fixed_known_values": {{"column_name": ["corrected_values"]}}, "fixed_data_requirements": ["table.column", ...], "fixed_join_paths": ["tableA.col -> tableB.col"], "reasoning": "one sentence explaining what was wrong"}}
 
-- "sufficient" = plan is correct and complete.
-- "insufficient" = something is wrong or missing. List issues and provide corrections.
+- "correct" = ALL filter values, formula, columns, and joins match GROUND TRUTH and the question's intent.
+- "needs_fix" = ANY mismatch with GROUND TRUTH found. You MUST provide the corrected values.
 """.strip()
 
 
@@ -196,15 +247,18 @@ def _build_semantic_prompt(
     question: str,
     kg_context: str,
     sample_data: str = "",
-    knowledge_text: str = "",
+    anchor_text: str = "",
+    previous_attempt: str = "",
 ) -> str:
     sample_section = f"\nSAMPLE DATA:\n{sample_data[:3000]}" if sample_data else ""
-    knowledge_section = f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1500]}" if knowledge_text else ""
+    anchor_section = f"\nGROUND TRUTH (immutable — you MUST follow these):\n{anchor_text}" if anchor_text else ""
+    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt}" if previous_attempt else ""
     return SEMANTIC_GROUNDING_PROMPT.format(
         question=question,
         kg_context=kg_context,
         sample_section=sample_section,
-        knowledge_section=knowledge_section,
+        anchor_section=anchor_section,
+        previous_attempt=prev_section,
     )
 
 
@@ -212,15 +266,15 @@ def _build_grounding_validate_prompt(
     *,
     question: str,
     grounding: dict[str, Any],
-    knowledge_text: str = "",
+    anchor_text: str = "",
     sample_data: str = "",
 ) -> str:
-    knowledge_section = f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1500]}" if knowledge_text else ""
+    anchor_section = f"\nGROUND TRUTH (immutable — you MUST follow these):\n{anchor_text}" if anchor_text else ""
     sample_section = f"\nSAMPLE DATA:\n{sample_data[:2000]}" if sample_data else ""
     return GROUNDING_VALIDATE_PROMPT.format(
         question=question,
         grounding_json=json.dumps(grounding, indent=2)[:3000],
-        knowledge_section=knowledge_section,
+        anchor_section=anchor_section,
         sample_section=sample_section,
     )
 
@@ -229,17 +283,38 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     """Format semantic grounding output as structured context for SQL generation."""
     parts: list[str] = []
 
+    what_user_wants = grounding.get("what_user_wants", "")
+    if what_user_wants:
+        parts.append(f"USER WANTS: {what_user_wants}")
+
     formula = grounding.get("formula", "")
     if formula and formula != "direct_lookup":
         parts.append(f"FORMULA: {formula}")
 
-    steps = grounding.get("computation_steps", [])
-    if steps:
-        parts.append("STEPS:\n" + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(steps)))
-
     join_paths = grounding.get("join_paths", [])
     if join_paths:
         parts.append("JOIN PATHS:\n" + "\n".join(f"  {jp}" for jp in join_paths))
+
+    known_values = grounding.get("known_values", {})
+
+    # Rebuild steps to reflect validated known_values (avoid stale filter references)
+    steps = grounding.get("computation_steps", [])
+    if steps:
+        rebuilt_steps = []
+        for s in steps:
+            # Replace any stale filter value references with the validated ones
+            rebuilt = s
+            for col, vals in known_values.items():
+                if col.lower() in s.lower() and vals:
+                    correct_val = ", ".join(str(v) for v in vals)
+                    import re as _re
+                    rebuilt = _re.sub(
+                        rf"(?i){col}\s*=\s*\S+",
+                        f"{col} = {correct_val}",
+                        rebuilt,
+                    )
+            rebuilt_steps.append(rebuilt)
+        parts.append("STEPS:\n" + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(rebuilt_steps)))
 
     known_values = grounding.get("known_values", {})
     if known_values:
@@ -247,6 +322,13 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
                     for k, vs in known_values.items() if vs]
         if kv_lines:
             parts.append("FILTER VALUES:\n" + "\n".join(kv_lines))
+
+    data_reqs = grounding.get("data_requirements", [])
+    output_cols = [r for r in data_reqs if "output" in r.lower() or "select" in r.lower()]
+    if not output_cols:
+        output_cols = [r for r in data_reqs if "." in r]
+    if output_cols:
+        parts.append("SELECT THESE COLUMNS:\n" + "\n".join(f"  {c}" for c in output_cols))
 
     domain_rules = grounding.get("domain_rules", [])
     if domain_rules:
@@ -266,20 +348,28 @@ def _build_answer_prompt(
     question: str,
     data_text: str,
     knowledge_text: str = "",
+    grounding_context: str = "",
 ) -> str:
-    parts = [f"Answer this question from the data.\n\nQUESTION: {question}"]
+    parts = [f"Format this SQL output into exactly what the user asked for.\n\nQUESTION: {question}"]
 
-    parts.append(f"\nDATA:\n{data_text}")
+    if grounding_context:
+        parts.append(f"\nPLAN:\n{grounding_context}")
+
+    parts.append(f"\nSQL OUTPUT:\n{data_text}")
 
     if knowledge_text:
-        parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:2000]}")
+        parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1500]}")
 
     parts.append("""
 Return ONLY a JSON object:
-{"columns": ["col1"], "rows": [["value1"], ["value2"]]}
+{"columns": ["col1", "col2"], "rows": [["value1", "value2"], ...]}
 
-- Only include columns that answer the question.
-- Return ALL rows — never truncate.""")
+RULES:
+- Return EVERY row from SQL OUTPUT — never drop or truncate rows.
+- Column names must semantically match what the QUESTION asks about. Derive column names from the question, not from SQL aliases.
+- Only include columns that answer the question — drop extra columns.
+- Do NOT merge, split, or transform values — keep them exactly as in SQL OUTPUT.
+- Do NOT add rows that aren't in SQL OUTPUT.""")
 
     return "\n".join(parts)
 
@@ -308,6 +398,8 @@ class QuestionDrivenAgent:
         self._start_time = time.monotonic()
         context_dir = task.context_dir
         question = task.question
+        self._log_file = context_dir / "_agent.log"
+        self._log_file.write_text(f"=== {task.task_id} ===\nQ: {question}\n\n")
 
         # Clean up stale DB
         stale_db = context_dir / CONSOLIDATED_DB_NAME
@@ -336,31 +428,35 @@ class QuestionDrivenAgent:
                 db_path = context_dir / CONSOLIDATED_DB_NAME
                 sqlite3.connect(str(db_path)).close()
 
-            # Step 3: Doc extraction
-            extracted_tables = []
+            # Track which tables came from structured data (CSV/JSON)
+            structured_tables: list[str] = []
+            if db_path.exists():
+                try:
+                    _conn = sqlite3.connect(str(db_path))
+                    structured_tables = [
+                        r[0] for r in _conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall() if not r[0].startswith("_")
+                    ]
+                    _conn.close()
+                except Exception:
+                    pass
+
+            # Step 3: Doc extraction (LLM-based, batched by section)
             if ctx.doc_sources:
                 doc_paths = [doc.path for doc in ctx.doc_sources]
-                # First try fast regex extraction
-                extracted_tables = extract_all_docs(doc_paths, db_path=db_path)
-                for table in extracted_tables:
-                    write_extracted_table(db_path, table)
-                    self._log("doc_extracted",
-                              f"Table '{table.name}': {len(table.records)} records, "
-                              f"FK: {table.fk_links}")
-
-                # If regex is insufficient, use LLM extraction
-                if should_use_llm_extraction(ctx.task_type, question, extracted_tables, db_path):
-                    self._log("llm_extract_start", "Regex insufficient — using LLM extraction")
-                    try:
-                        schema = discover_schema(self.model, doc_paths, question)
-                        self._log("llm_schema", f"Schema: {schema.get('columns', [])}")
-                        llm_tables = extract_from_docs(self.model, doc_paths, schema)
-                        for table in llm_tables:
-                            write_llm_extracted_table(db_path, table)
-                            self._log("llm_extracted",
-                                      f"Table '{table.name}': {len(table.records)} records")
-                    except RuntimeError as e:
-                        self._log("llm_extract_error", str(e))
+                from data_agent_baseline.pipeline.llm_extractor import (
+                    hybrid_extract_docs,
+                )
+                hybrid_extract_docs(
+                    doc_paths=doc_paths,
+                    db_path=db_path,
+                    model=self.model,
+                    knowledge_text=ctx.knowledge_text,
+                    time_remaining_fn=self._time_remaining,
+                    log_fn=self._log,
+                    structured_tables=structured_tables,
+                )
 
             # Step 4: Build KG from full DB (deterministic)
             kg = build_kg_from_sqlite(db_path)
@@ -378,17 +474,20 @@ class QuestionDrivenAgent:
             grounding_context = ""
             if self._time_remaining() > 200:
                 grounding_context = self._call_semantic_grounding(
-                    question, kg_context, sample_data, ctx.knowledge_text
+                    question, kg_context, sample_data, ctx.knowledge_text,
+                    db_path=db_path,
                 )
 
             # ----------------------------------------------------------
-            # Closed loop: PLAN → EXECUTE → EVALUATE (max 3 iterations)
+            # Closed loop: PLAN → EXECUTE → EVALUATE (max 4 iterations)
             # ----------------------------------------------------------
             max_iterations = 4
             data_result = None
             sql = ""
             gaps_text = ""
             extra_context = ""  # info from exploratory queries
+            all_gaps: set[str] = set()  # dedup gaps across iterations
+            failed_sqls: list[str] = []
 
             for iteration in range(1, max_iterations + 1):
                 if self._time_remaining() < 120:
@@ -414,14 +513,33 @@ class QuestionDrivenAgent:
                     sql_error = self.steps[-1].get("detail", "") if self.steps else ""
                     data_result = {"columns": [], "rows": []}
 
+                # Force-incomplete on empty results (skip LLM eval)
+                if not data_result.get("rows"):
+                    if sql_error:
+                        self._log("evaluate", f"Verdict: incomplete (SQL error: {sql_error})")
+                        all_gaps.add(f"SQL ERROR: {sql_error}. Fix the syntax.")
+                    else:
+                        self._log("evaluate", "Verdict: incomplete (empty result)")
+                        all_gaps.add(
+                            "Query returned 0 rows — check table names, "
+                            "join columns, and filter values against SAMPLE DATA"
+                        )
+                    failed_sqls.append(sql[:200])
+                    gaps_text = "\n".join(f"- {g}" for g in all_gaps)
+                    gaps_text += "\n".join(
+                        f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
+                    )
+                    continue
+
                 # Skip evaluate on last iteration or low time — just use what we have
                 if iteration == max_iterations or self._time_remaining() < 120:
-                    if data_result.get("rows"):
-                        break
+                    break
 
                 # EVALUATE: Check if result answers the question
                 eval_result = self._call_evaluate(
-                    question, sql, sql_error, data_result, kg_context
+                    question, sql, sql_error, data_result, kg_context,
+                    knowledge_text=ctx.knowledge_text,
+                    grounding_context=grounding_context,
                 )
                 verdict = eval_result.get("verdict", "complete")
                 self._log("evaluate", f"Verdict: {verdict}")
@@ -440,7 +558,6 @@ class QuestionDrivenAgent:
                         data_result = suggested_result
                         sql = suggested
                         self._log("suggested_sql_ok", "Suggested SQL returned data")
-                        # Don't break — let next iteration evaluate if result is correct
 
                 # Run info queries to gather more context about the data
                 info_queries = eval_result.get("info_queries", [])
@@ -460,12 +577,17 @@ class QuestionDrivenAgent:
                 if not gaps and not info_parts and not suggested:
                     break
 
-                for g in gaps:
+                # Deduplicate gaps
+                new_gaps = [g for g in gaps if g not in all_gaps]
+                all_gaps.update(new_gaps)
+                for g in new_gaps:
                     self._log("gap", g)
 
-                gaps_text = "\n".join(f"- {g}" for g in gaps)
-                # Include the failed SQL so the generator knows what NOT to repeat
-                gaps_text += f"\n- FAILED SQL (do not repeat): {sql[:200]}"
+                failed_sqls.append(sql[:200])
+                gaps_text = "\n".join(f"- {g}" for g in all_gaps)
+                gaps_text += "\n".join(
+                    f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
+                )
 
             # Fallback if loop exhausted without good data
             if not data_result or not data_result.get("rows"):
@@ -474,12 +596,19 @@ class QuestionDrivenAgent:
                 else:
                     data_result = {"columns": [], "rows": []}
 
-            # Final LLM call: Format answer
-            if self._time_remaining() < 30:
-                # Emergency: no time for LLM — use raw SQL result directly
-                answer = self._raw_result_to_answer(data_result)
+            # Format answer via LLM synthesizer
+            self._log("pre_answer", f"cols={data_result.get('columns') if data_result else None}, rows={len(data_result.get('rows',[])) if data_result else 0}")
+            if self._time_remaining() > 30 and data_result and data_result.get("rows"):
+                answer = self._call_answer(
+                    question, data_result, ctx.knowledge_text,
+                    grounding_context=grounding_context,
+                )
+                # Fallback: if LLM returned empty rows, use raw SQL result
+                if not answer or not answer.get("rows"):
+                    self._log("answer_fallback", "LLM returned empty — using raw SQL result")
+                    answer = self._raw_result_to_answer(data_result)
             else:
-                answer = self._call_answer(question, data_result, ctx.knowledge_text)
+                answer = self._raw_result_to_answer(data_result)
 
             # Cleanup
             if db_path.exists():
@@ -544,6 +673,8 @@ class QuestionDrivenAgent:
         sql_error: str,
         data_result: dict[str, Any],
         kg_context: str = "",
+        knowledge_text: str = "",
+        grounding_context: str = "",
     ) -> dict[str, Any]:
         if data_result and data_result.get("rows"):
             data_text = self._format_data_as_table(data_result)
@@ -556,6 +687,8 @@ class QuestionDrivenAgent:
             sql_error=sql_error,
             data_text=data_text,
             kg_context=kg_context,
+            knowledge_text=knowledge_text,
+            grounding_context=grounding_context,
         )
 
         messages = [ModelMessage(role="user", content=prompt)]
@@ -575,6 +708,7 @@ class QuestionDrivenAgent:
         question: str,
         data_result: dict[str, Any] | None,
         knowledge_text: str,
+        grounding_context: str = "",
     ) -> dict[str, Any]:
         if data_result and data_result.get("rows"):
             data_text = self._format_data_as_table(data_result)
@@ -587,15 +721,53 @@ class QuestionDrivenAgent:
             question=question,
             data_text=data_text,
             knowledge_text=knowledge_text,
+            grounding_context=grounding_context,
         )
 
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
-        return self._parse_json(raw)
+        self._log("answer_raw", raw if raw else "(empty)")
+        parsed = self._parse_json(raw)
+        self._log("answer_parsed", json.dumps(parsed, default=str) if parsed else "(empty)")
+        return parsed
 
     # ------------------------------------------------------------------
     # LLM Call: Semantic Grounding (pre-planning decomposition with validation)
     # ------------------------------------------------------------------
+
+    def _extract_domain_anchors(self, question: str, knowledge_text: str) -> str:
+        """Extract relevant domain definitions as immutable ground truth.
+
+        Uses LLM to identify which definitions and use cases are relevant,
+        then formats them as clear, unambiguous anchors.
+        """
+        if not knowledge_text:
+            return ""
+        prompt = DOMAIN_ANCHOR_PROMPT.format(
+            question=question,
+            knowledge_text=knowledge_text[:4000],
+        )
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if not isinstance(parsed, dict):
+            return knowledge_text[:2000]
+
+        parts: list[str] = []
+        anchors = parsed.get("anchors", [])
+        for a in anchors:
+            parts.append(f"- {a}")
+        use_case_sql = parsed.get("use_case_sql")
+        if use_case_sql:
+            parts.append(f"\nMATCHING USE CASE SQL (follow this exactly):\n  {use_case_sql}")
+
+        if not parts:
+            return knowledge_text[:2000]
+
+        anchor_text = "\n".join(parts)
+        self._log("domain_anchors", anchor_text)
+        return anchor_text
 
     def _call_semantic_grounding(
         self,
@@ -603,34 +775,69 @@ class QuestionDrivenAgent:
         kg_context: str,
         sample_data: str,
         knowledge_text: str,
+        db_path: Path | None = None,
     ) -> str:
-        """Decompose the question into structured grounding, validate, iterate."""
-        # Step 1: Generate initial grounding
-        prompt = _build_semantic_prompt(
-            question=question,
-            kg_context=kg_context,
-            sample_data=sample_data,
-            knowledge_text=knowledge_text,
-        )
-        messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
-        grounding = self._parse_json(raw)
+        """Closed loop: Ground → Validate → Verify data → Re-ground (max 3 iterations)."""
+        max_grounding_iters = 3
+        grounding: dict[str, Any] = {}
+        previous_attempt = ""
 
-        if not isinstance(grounding, dict) or not grounding:
-            self._log("semantic_grounding", "(failed to parse)")
-            return ""
+        # Extract domain anchors as immutable ground truth
+        anchor_text = self._extract_domain_anchors(question, knowledge_text)
 
-        self._log("semantic_grounding_v1", json.dumps(grounding, default=str)[:300])
+        # Track previous fixes to detect oscillation
+        prev_fixed_kv: dict[str, list] = {}
+        first_grounding: dict[str, Any] = {}
 
-        # Step 2: Validate loop (max 2 iterations)
-        for validate_iter in range(2):
-            if self._time_remaining() < 150:
+        for g_iter in range(1, max_grounding_iters + 1):
+            if self._time_remaining() < 120:
+                break
+
+            self._log("grounding_iter", f"--- Grounding iteration {g_iter} ---")
+
+            # GROUND: Decompose question (pass previous feedback on re-ground)
+            prompt = _build_semantic_prompt(
+                question=question,
+                kg_context=kg_context,
+                sample_data=sample_data,
+                anchor_text=anchor_text,
+                previous_attempt=previous_attempt,
+            )
+            messages = [ModelMessage(role="user", content=prompt)]
+            raw = self._model_call_with_retry(messages)
+            grounding = self._parse_json(raw)
+
+            if not isinstance(grounding, dict) or not grounding:
+                # Retry once
+                self._log("semantic_grounding", "(failed to parse, retrying)")
+                raw = self._model_call_with_retry(messages)
+                grounding = self._parse_json(raw)
+
+            if not isinstance(grounding, dict) or not grounding:
+                self._log("semantic_grounding", "(failed to parse after retry)")
+                if first_grounding:
+                    grounding = first_grounding
+                    break
+                return ""
+
+            if not first_grounding:
+                first_grounding = json.loads(json.dumps(grounding))
+
+            # Verify filter values against actual DB before validation
+            if db_path and grounding.get("known_values"):
+                grounding = self._validate_filter_values(db_path, grounding)
+
+            self._log(f"grounding_v{g_iter}",
+                      json.dumps(grounding, default=str))
+
+            # VALIDATE: Check if grounding is correct and complete
+            if self._time_remaining() < 100:
                 break
 
             val_prompt = _build_grounding_validate_prompt(
                 question=question,
                 grounding=grounding,
-                knowledge_text=knowledge_text,
+                anchor_text=anchor_text,
                 sample_data=sample_data,
             )
             val_messages = [ModelMessage(role="user", content=val_prompt)]
@@ -640,26 +847,126 @@ class QuestionDrivenAgent:
             if not isinstance(val_result, dict):
                 break
 
-            verdict = val_result.get("verdict", "sufficient")
-            if verdict == "sufficient":
-                self._log("grounding_validated", f"OK after {validate_iter + 1} check(s)")
+            verdict = val_result.get("verdict", "correct")
+
+            if verdict == "correct":
+                self._log("grounding_validated", "OK")
                 break
 
-            # Apply corrections
-            corrections = val_result.get("corrections", {})
-            issues = val_result.get("issues", [])
-            self._log("grounding_issues", f"{issues}")
+            # Build feedback for next iteration
+            reasoning = val_result.get("reasoning", "")
+            self._log("grounding_fix", reasoning)
 
-            if not corrections:
+            fixed_kv = val_result.get("fixed_known_values", {})
+            fixed_dr = val_result.get("fixed_data_requirements", [])
+            fixed_jp = val_result.get("fixed_join_paths", [])
+
+            # Detect oscillation: if validator reverses a previous fix, stop
+            if fixed_kv and prev_fixed_kv:
+                oscillating = False
+                for col, vals in fixed_kv.items():
+                    if col in prev_fixed_kv and set(str(v) for v in vals) != set(str(v) for v in prev_fixed_kv[col]):
+                        oscillating = True
+                        break
+                if oscillating:
+                    self._log("grounding_oscillation", "Validator reversed previous fix — using first grounding")
+                    grounding = first_grounding
+                    break
+
+            if fixed_kv:
+                kv = grounding.get("known_values", {})
+                kv.update(fixed_kv)
+                grounding["known_values"] = kv
+                prev_fixed_kv = fixed_kv
+                self._log("grounding_fix_kv", str(fixed_kv))
+            if fixed_dr:
+                grounding["data_requirements"] = fixed_dr
+                self._log("grounding_fix_dr", str(fixed_dr))
+            if fixed_jp:
+                grounding["join_paths"] = fixed_jp
+                self._log("grounding_fix_jp", str(fixed_jp))
+
+            # If validator didn't suggest any fixes, no point looping
+            if not fixed_kv and not fixed_dr and not fixed_jp:
                 break
 
-            for field, corrected in corrections.items():
-                grounding[field] = corrected
-            self._log("grounding_corrected", f"Applied: {list(corrections.keys())}")
+            # Pass feedback to next generation so it doesn't repeat the mistake
+            previous_attempt = (
+                f"Your previous plan had this error: {reasoning}\n"
+                f"Corrected values: {json.dumps(fixed_kv)}\n"
+                f"You MUST use these corrected values in known_values."
+            )
 
         formatted = _format_grounding_for_sql(grounding)
-        self._log("semantic_grounding_final", formatted[:400] if formatted else "(empty)")
+        self._log("semantic_grounding_final", formatted if formatted else "(empty)")
         return formatted
+
+    def _validate_filter_values(
+        self, db_path: Path, grounding: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Check that filter values in grounding actually exist in the DB.
+
+        If a value doesn't exist, try to find the closest match.
+        """
+        known_values = grounding.get("known_values", {})
+        if not known_values:
+            return grounding
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            tables_cols = {}
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall():
+                tname = row[0]
+                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                tables_cols[tname] = cols
+
+            for col_name, values in list(known_values.items()):
+                if not values:
+                    continue
+                # Find which table has this column
+                target_table = None
+                for tname, cols in tables_cols.items():
+                    if col_name in cols or col_name.lower() in [c.lower() for c in cols]:
+                        target_table = tname
+                        actual_col = next(
+                            c for c in cols if c.lower() == col_name.lower()
+                        )
+                        break
+                if not target_table:
+                    continue
+
+                # Check if values exist
+                for val in values:
+                    try:
+                        result = conn.execute(
+                            f'SELECT COUNT(*) FROM "{target_table}" '
+                            f'WHERE "{actual_col}" = ?', (val,)
+                        ).fetchone()
+                        if result and result[0] > 0:
+                            self._log("filter_verified",
+                                      f"{col_name}='{val}' exists in {target_table} ({result[0]} rows)")
+                            continue
+                        # Value not found — try LIKE search for close match
+                        like_result = conn.execute(
+                            f'SELECT DISTINCT "{actual_col}" FROM "{target_table}" '
+                            f'WHERE "{actual_col}" LIKE ? LIMIT 5',
+                            (f'%{val}%',)
+                        ).fetchall()
+                        if like_result:
+                            known_values[col_name] = [r[0] for r in like_result]
+                            self._log("filter_fix",
+                                      f"{col_name}: '{val}' not found, "
+                                      f"using {known_values[col_name]}")
+                            break
+                    except Exception:
+                        pass
+        finally:
+            conn.close()
+
+        grounding["known_values"] = known_values
+        return grounding
 
     # ------------------------------------------------------------------
     # Helpers
@@ -714,15 +1021,23 @@ class QuestionDrivenAgent:
         """Execute SQL and return results."""
         if not sql:
             return None
+        if not db_path.exists():
+            self._log("sql_error", f"DB missing: {db_path}")
+            return None
         try:
             conn = sqlite3.connect(str(db_path))
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if not tables:
+                self._log("sql_error", f"DB empty (0 tables): {db_path}")
+                conn.close()
+                return None
             cursor = conn.execute(sql)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
             conn.close()
             return {"columns": columns, "rows": [list(r) for r in rows]}
         except Exception as e:
-            self._log("sql_error", f"SQL failed: {e}")
+            self._log("sql_error", f"SQL failed (tables={tables}): {e}")
             return None
 
     def _gather_relevant_data(
@@ -771,6 +1086,32 @@ class QuestionDrivenAgent:
         fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
         if fence:
             raw = fence.group(1).strip()
+
+        def _try_parse(text: str) -> Any:
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Fix trailing commas
+            fixed = re.sub(r",\s*([}\]])", r"\1", text)
+            try:
+                return json.loads(fixed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Fix single quotes → double quotes (but not apostrophes in words)
+            fixed2 = re.sub(r"(?<![a-zA-Z])'|'(?![a-zA-Z])", '"', fixed)
+            try:
+                return json.loads(fixed2)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Fix unquoted keys: key: → "key":
+            fixed3 = re.sub(r'(?m)^\s*([a-zA-Z_]\w*)\s*:', r'"\1":', fixed)
+            try:
+                return json.loads(fixed3)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            return None
+
         for start, end in [("{", "}"), ("[", "]")]:
             idx = raw.find(start)
             if idx >= 0:
@@ -781,21 +1122,16 @@ class QuestionDrivenAgent:
                     elif raw[i] == end:
                         depth -= 1
                         if depth == 0:
-                            candidate = raw[idx:i + 1]
-                            try:
-                                return json.loads(candidate)
-                            except json.JSONDecodeError:
-                                # Try fixing trailing commas
-                                fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
-                                try:
-                                    return json.loads(fixed)
-                                except json.JSONDecodeError:
-                                    break
+                            result = _try_parse(raw[idx:i + 1])
+                            if result is not None:
+                                return result
+                            break
                 break
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return {}
+
+        result = _try_parse(raw)
+        if result is not None:
+            return result
+        return {}
 
     def _build_column_hints(self, question: str, kg: KnowledgeGraph) -> str:
         """Map words from the question to actual column names in the schema."""
@@ -844,6 +1180,11 @@ class QuestionDrivenAgent:
         self.steps.append(step)
         if self.log_callback:
             self.log_callback(step)
+        elapsed = time.monotonic() - self._start_time
+        print(f"[{elapsed:6.1f}s] [{action}] {detail}", flush=True)
+        if hasattr(self, "_log_file") and self._log_file:
+            with open(self._log_file, "a") as f:
+                f.write(f"[{elapsed:6.1f}s] [{action}] {detail}\n")
 
     def _build_result(self, answer: dict[str, Any], task: PublicTask) -> AgentRunResult:
         """Convert LLM answer to AgentRunResult."""

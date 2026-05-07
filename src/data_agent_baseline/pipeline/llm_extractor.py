@@ -1,14 +1,11 @@
-"""LLM-based document extractor for tasks where regex extraction is insufficient.
-
-Triggered when:
-  - task_type == "doc_only" (no structured data at all)
-  - OR regex extraction misses columns the question asks about
+"""Hybrid document extraction: structure-aware parsing + LLM extraction.
 
 Pipeline:
-  1. Schema discovery: sample doc text + question → column definitions
-  2. Chunk doc by record boundaries
-  3. Extract per chunk (1 LLM call each)
-  4. Merge all records → write to SQLite
+  1. Parse markdown structure (deterministic, fast)
+  2. Discover schema from knowledge.md (deterministic)
+  3. Batch sections into chunks (~8000 chars each)
+  4. LLM extracts records per chunk (schema-guided)
+  5. Merge records by ID+Date → write to SQLite
 """
 
 from __future__ import annotations
@@ -16,256 +13,341 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
+from data_agent_baseline.pipeline.field_discoverer import DocumentSchema, discover_schema
+from data_agent_baseline.pipeline.md_parser import Section, filter_data_sections, parse_md_structure
+from data_agent_baseline.pipeline.sqlite_writer import _sanitize_column_name
 
 
-CHUNK_SIZE = 18000  # chars per LLM call
+EXTRACT_PROMPT = """Extract ALL records from this text into a JSON array.
 
-SCHEMA_PROMPT = """Analyze this document excerpt and determine what structured data can be extracted.
-
-DOCUMENT EXCERPT:
-{doc_sample}
-
-QUESTION (what we need to answer):
-{question}
-
-Based on the document structure, identify ALL columns/fields that appear for each record.
-Each record is identified by a numeric ID (patient number, case ID, etc.).
-
-Return ONLY a JSON object:
-{{
-  "id_field": "the field name for the record identifier",
-  "columns": ["col1", "col2", "col3"],
-  "id_pattern": "regex pattern to find record IDs in the text"
-}}
-
-The columns should include ALL data fields you can see (dates, measurements, categories, etc.), not just what the question asks about. Use short lowercase names with underscores.
-""".strip()
-
-EXTRACT_PROMPT = """Extract structured records from this document chunk.
-
-COLUMNS TO EXTRACT: {columns}
+ENTITY: {entity_name}
 ID FIELD: {id_field}
-
-DOCUMENT CHUNK:
-{chunk}
-
-Extract every record you find. Each record starts with an ID ({id_field}).
-Return ONLY a JSON array of objects, one per record:
-[
-  {{"{id_field}": "12345", "col1": "value1", "col2": "value2"}},
-  ...
-]
+FIELDS: {field_list}
 
 RULES:
-- Extract exact values as they appear (numbers, dates, text).
-- If a field is not mentioned for a record, omit it (don't include null).
-- For dates, preserve the original format.
-- Return raw numeric values without units.
-- Include ALL records in the chunk — don't skip any.
-""".strip()
+1. Each object: {{"{id_field}": "...", "Date": "YYYY-MM-DD", ...only fields present...}}
+2. CORRECTIONS: initially X, corrected/adjusted to Y → use ONLY Y.
+3. NaN/unavailable → null. Not mentioned → omit.
+4. Numbers only, no units.
+5. If text explicitly describes a field as elevated/impaired/compromised/dysfunction → add "<field>_status": "abnormal". If normal/healthy/unremarkable → "normal". Only for explicitly described fields.
+6. Extract EVERY record.
+
+TEXT:
+{text_chunk}
+
+JSON array only:"""
 
 
-@dataclass
-class LLMExtractedTable:
-    name: str
-    id_field: str
-    columns: list[str]
-    records: list[dict[str, Any]]
+def _build_field_list(schema: DocumentSchema) -> str:
+    parts = []
+    for f in schema.fields:
+        desc = f.name
+        if f.aliases:
+            desc += f" (aka {', '.join(f.aliases[:3])})"
+        parts.append(desc)
+    return ", ".join(parts)
 
 
-def should_use_llm_extraction(
-    task_type: str,
-    question: str,
-    regex_tables: list[Any],
-    db_path: Path | None = None,
-) -> bool:
-    """Decide whether LLM extraction is needed.
+def _detect_section_fields(text: str, schema: DocumentSchema) -> str:
+    """Detect which schema fields are actually mentioned in this section.
 
-    Triggers only when task_type is "doc_only" — meaning there's no structured
-    data (CSV/JSON/DB) at all, and we must extract everything from prose docs.
-
-    For "mixed" tasks, the structured data already provides queryable tables and
-    the regex extraction supplements it — LLM extraction adds cost without benefit.
+    Returns a comma-separated field list for the prompt. Only includes fields
+    whose name or alias appears in the text, keeping output compact.
     """
-    return task_type == "doc_only"
+    text_lower = text.lower()
+    found: list[str] = []
+    for f in schema.fields:
+        names_to_check = [f.name.lower()] + [a.lower() for a in (f.aliases or [])]
+        for name in names_to_check:
+            if name in text_lower:
+                desc = f.name
+                if f.aliases:
+                    desc += f" (aka {', '.join(f.aliases[:3])})"
+                found.append(desc)
+                break
+    return ", ".join(found) if found else ""
 
 
-def discover_schema(
-    model: ModelAdapter,
-    doc_paths: list[Path],
-    question: str,
-) -> dict[str, Any]:
-    """Use LLM to discover the schema from a document sample."""
-    # Take first ~4000 chars from each doc
-    sample_parts = []
-    for path in doc_paths[:3]:
-        text = path.read_text(errors="replace")
-        sample_parts.append(f"--- {path.name} ---\n{text[:4000]}")
-    doc_sample = "\n\n".join(sample_parts)
-
-    prompt = SCHEMA_PROMPT.format(doc_sample=doc_sample, question=question)
-    messages = [ModelMessage(role="user", content=prompt)]
-    raw = model.complete(messages)
-
-    return _parse_json(raw) or {"id_field": "_id", "columns": [], "id_pattern": r"\d{4,}"}
-
-
-def extract_from_docs(
-    model: ModelAdapter,
-    doc_paths: list[Path],
-    schema: dict[str, Any],
-) -> list[LLMExtractedTable]:
-    """Extract structured records from documents using LLM."""
-    id_field = schema.get("id_field", "_id")
-    columns = schema.get("columns", [])
-    id_pattern = schema.get("id_pattern", r"\d{4,}")
-
-    if not columns:
-        return []
-
-    all_records: dict[str, dict[str, Any]] = {}  # id → merged record
-
-    for doc_path in doc_paths:
-        text = doc_path.read_text(errors="replace")
-        chunks = _chunk_by_records(text, id_pattern, CHUNK_SIZE)
-
-        for chunk in chunks:
-            if len(chunk.strip()) < 50:
-                continue
-
-            prompt = EXTRACT_PROMPT.format(
-                columns=json.dumps(columns),
-                id_field=id_field,
-                chunk=chunk,
-            )
-            messages = [ModelMessage(role="user", content=prompt)]
-
-            try:
-                raw = model.complete(messages)
-            except RuntimeError:
-                continue
-
-            parsed = _parse_json(raw)
-            if isinstance(parsed, list):
-                for record in parsed:
-                    if not isinstance(record, dict):
-                        continue
-                    rid = str(record.get(id_field, ""))
-                    if not rid:
-                        continue
-                    if rid not in all_records:
-                        all_records[rid] = {id_field: rid}
-                    # Merge: later values overwrite earlier ones
-                    for k, v in record.items():
-                        if v is not None and v != "":
-                            all_records[rid][k] = v
-
-    if not all_records:
-        return []
-
-    # Build table per source doc (or one combined)
-    records_list = list(all_records.values())
-    table_name = doc_paths[0].stem if len(doc_paths) == 1 else "extracted"
-
-    return [LLMExtractedTable(
-        name=table_name,
-        id_field=id_field,
-        columns=[id_field] + columns,
-        records=records_list,
-    )]
-
-
-def write_llm_extracted_table(db_path: Path, table: LLMExtractedTable) -> None:
-    """Write LLM-extracted table to SQLite, replacing any existing regex version."""
-    conn = sqlite3.connect(str(db_path))
-
-    # Drop existing table if regex already created one
-    conn.execute(f'DROP TABLE IF EXISTS "{table.name}"')
-
-    # Determine all columns from records
-    all_cols = list(table.columns)
-    for rec in table.records:
-        for k in rec.keys():
-            if k not in all_cols:
-                all_cols.append(k)
-
-    col_defs = ", ".join(f'"{c}" TEXT' for c in all_cols)
-    conn.execute(f'CREATE TABLE "{table.name}" ({col_defs})')
-
-    placeholders = ", ".join(["?"] * len(all_cols))
-    for rec in table.records:
-        values = [str(rec.get(c, "")) if rec.get(c) is not None else None for c in all_cols]
-        conn.execute(f'INSERT INTO "{table.name}" VALUES ({placeholders})', values)
-
-    conn.commit()
-    conn.close()
-
-
-def _chunk_by_records(text: str, id_pattern: str, max_chars: int) -> list[str]:
-    """Split text into chunks at record boundaries."""
-    try:
-        pattern = re.compile(id_pattern)
-    except re.error:
-        pattern = re.compile(r"\d{4,}")
-
-    # Find all record start positions
-    starts = [m.start() for m in pattern.finditer(text)]
-
-    if not starts:
-        # No records found — just split by size
-        return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
-
-    chunks = []
-    current_start = 0
-
-    for i, pos in enumerate(starts):
-        # Check if adding the next record would exceed chunk size
-        if pos - current_start > max_chars and current_start < pos:
-            chunks.append(text[current_start:pos])
-            current_start = pos
-
-    # Don't forget the last chunk
-    if current_start < len(text):
-        chunks.append(text[current_start:])
-
-    return chunks
-
-
-def _parse_json(raw: str) -> Any:
-    """Parse JSON from LLM response."""
+def _parse_llm_json(raw: str) -> list[dict[str, Any]]:
     if not raw:
-        return None
+        return []
     raw = raw.strip()
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
     if fence:
         raw = fence.group(1).strip()
-    for start, end in [("{", "}"), ("[", "]")]:
-        idx = raw.find(start)
-        if idx >= 0:
-            depth = 0
-            for i in range(idx, len(raw)):
-                if raw[i] == start:
-                    depth += 1
-                elif raw[i] == end:
-                    depth -= 1
-                    if depth == 0:
-                        candidate = raw[idx:i + 1]
-                        try:
-                            return json.loads(candidate)
-                        except json.JSONDecodeError:
-                            fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
-                            try:
-                                return json.loads(fixed)
-                            except json.JSONDecodeError:
-                                break
-            break
+    bracket_start = raw.find("[")
+    bracket_end = raw.rfind("]")
+    if bracket_start == -1 or bracket_end == -1:
+        return []
+    json_str = raw[bracket_start:bracket_end + 1]
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
+        data = json.loads(json_str)
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+    except json.JSONDecodeError:
+        fixed = re.sub(r",\s*([}\]])", r"\1", json_str)
+        try:
+            data = json.loads(fixed)
+            if isinstance(data, list):
+                return [r for r in data if isinstance(r, dict)]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _chunk_sections(sections: list[Section], max_chars: int = 15000) -> list[str]:
+    """Pack data-bearing paragraphs into chunks of ~max_chars."""
+    chunks: list[str] = []
+    buffer: list[str] = []
+    buffer_len = 0
+
+    for section in sections:
+        for para in section.paragraphs:
+            if len(para) < 30:
+                continue
+            if buffer and buffer_len + len(para) > max_chars:
+                chunks.append("\n\n".join(buffer))
+                buffer = []
+                buffer_len = 0
+            buffer.append(para)
+            buffer_len += len(para)
+
+    if buffer:
+        chunks.append("\n\n".join(buffer))
+    return chunks
+
+
+def _chunk_by_section(sections: list[Section], max_chars: int = 30000) -> list[tuple[str, str]]:
+    """Chunk by section groups, returning (section_heading, text) pairs.
+
+    Groups consecutive sections into chunks up to max_chars.
+    Returns the heading of the first section in each group for field detection.
+    """
+    chunks: list[tuple[str, str]] = []
+    buffer: list[str] = []
+    buffer_len = 0
+    heading = ""
+
+    for section in sections:
+        section_text = "\n\n".join(p for p in section.paragraphs if len(p) >= 30)
+        if not section_text:
+            continue
+
+        if buffer and buffer_len + len(section_text) > max_chars:
+            chunks.append((heading, "\n\n".join(buffer)))
+            buffer = []
+            buffer_len = 0
+            heading = ""
+
+        if not heading:
+            heading = section.heading
+        buffer.append(section_text)
+        buffer_len += len(section_text)
+
+    if buffer:
+        chunks.append((heading, "\n\n".join(buffer)))
+    return chunks
+
+
+def hybrid_extract_docs(
+    doc_paths: list[Path],
+    db_path: Path,
+    model: ModelAdapter,
+    knowledge_text: str = "",
+    time_remaining_fn: Callable[[], float] = lambda: 300.0,
+    log_fn: Callable[[str, str], None] | None = None,
+    structured_tables: list[str] | None = None,
+) -> int:
+    """Hybrid extraction pipeline: structure parsing + LLM extraction.
+
+    Drop-in replacement for deterministic_extract_docs().
+    """
+    if not doc_paths:
+        return 0
+
+    protected = {t.lower() for t in structured_tables} if structured_tables else set()
+    total_records = 0
+
+    for doc_path in doc_paths:
+        if time_remaining_fn() < 60:
+            break
+
+        try:
+            text = doc_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) < 100:
+            continue
+
+        # Stage 1: Parse structure (deterministic)
+        sections = parse_md_structure(text)
+        data_sections = filter_data_sections(sections)
+        if not data_sections:
+            if log_fn:
+                log_fn("extract_skip", f"{doc_path.stem}: no data-dense sections")
+            continue
+
+        # Stage 2: Discover schema (deterministic)
+        schema = discover_schema(text, doc_path.stem, knowledge_text)
+        if log_fn:
+            log_fn("schema", f"{doc_path.stem}: {len(schema.fields)} fields, "
+                   f"entity={schema.entity_name}")
+
+        # Stage 3: Chunk by section groups
+        section_chunks = _chunk_by_section(data_sections, max_chars=30000)
+        if log_fn:
+            log_fn("chunks", f"{doc_path.stem}: {len(section_chunks)} section chunks")
+
+        # Stage 4: LLM extraction per section chunk (sequential)
+        id_field = schema.id_field or "ID"
+        all_records: list[dict[str, Any]] = []
+
+        for i, (heading, chunk_text) in enumerate(section_chunks):
+            if time_remaining_fn() < 40:
+                if log_fn:
+                    log_fn("time_bail", f"Stopping at chunk {i}/{len(section_chunks)}")
+                break
+
+            # Detect which fields are mentioned in this section
+            section_fields = _detect_section_fields(chunk_text, schema)
+            if not section_fields:
+                section_fields = _build_field_list(schema)
+
+            prompt = EXTRACT_PROMPT.format(
+                entity_name=schema.entity_name,
+                id_field=id_field,
+                field_list=section_fields,
+                text_chunk=chunk_text,
+            )
+            messages = [ModelMessage(role="user", content=prompt)]
+
+            try:
+                response = model.complete(messages)
+            except Exception as e:
+                if log_fn:
+                    log_fn("llm_error", f"Chunk {i}: {str(e)[:100]}")
+                continue
+
+            records = _parse_llm_json(response)
+            if log_fn:
+                log_fn("chunk_done", f"Chunk {i}/{len(section_chunks)}: "
+                       f"{len(records)} records ({len(chunk_text)} chars)")
+            all_records.extend(records)
+
+        if log_fn:
+            log_fn("extracted", f"{doc_path.stem}: {len(all_records)} raw records")
+
+        if not all_records:
+            continue
+
+        # Stage 5: Merge records by ID+Date and write to SQLite
+        n_written = _merge_and_write(
+            all_records, schema, db_path, protected, id_field, log_fn
+        )
+        total_records += n_written
+
+    if log_fn:
+        log_fn("pipeline_done", f"Total: {total_records} records from {len(doc_paths)} docs")
+
+    return total_records
+
+
+def _merge_and_write(
+    records: list[dict[str, Any]],
+    schema: DocumentSchema,
+    db_path: Path,
+    protected: set[str],
+    id_field: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> int:
+    """Merge extracted records by composite key and write to SQLite."""
+    merged: dict[str, dict[str, Any]] = {}
+
+    for rec in records:
+        rid = str(rec.get(id_field, rec.get("ID", rec.get("id", ""))))
+        if not rid:
+            continue
+        date_val = rec.get("Date", rec.get("date", ""))
+        if date_val:
+            key = f"{rid}_{date_val}"
+        else:
+            key = rid
+
+        if key not in merged:
+            merged[key] = {"record_id": key, id_field.lower(): rid}
+        for k, v in rec.items():
+            if k in (id_field, "ID", "id"):
+                continue
+            col = _sanitize_column_name(k)
+            if v is not None:
+                merged[key][col] = v
+
+    if not merged:
+        return 0
+
+    table_name = _sanitize_column_name(schema.entity_name)
+    if protected and table_name in protected:
+        table_name = f"{table_name}_doc"
+
+    all_cols: set[str] = set()
+    for rec in merged.values():
+        all_cols.update(rec.keys())
+    all_cols.discard("record_id")
+    sorted_cols = sorted(all_cols)
+
+    col_types: dict[str, str] = {}
+    for col in sorted_cols:
+        is_numeric = True
+        for rec in merged.values():
+            val = rec.get(col)
+            if val is None:
+                continue
+            try:
+                float(val)
+            except (ValueError, TypeError):
+                is_numeric = False
+                break
+        col_types[col] = "REAL" if is_numeric else "TEXT"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+        col_defs = ["record_id TEXT PRIMARY KEY"]
+        for col in sorted_cols:
+            col_defs.append(f"{col} {col_types.get(col, 'TEXT')}")
+        create_sql = f"CREATE TABLE {table_name} ({', '.join(col_defs)})"
+        conn.execute(create_sql)
+
+        insert_cols = ["record_id"] + sorted_cols
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        insert_sql = (
+            f"INSERT OR REPLACE INTO {table_name} "
+            f"({', '.join(insert_cols)}) VALUES ({placeholders})"
+        )
+
+        for rec in merged.values():
+            row = [rec.get("record_id")]
+            for col in sorted_cols:
+                val = rec.get(col)
+                if val is not None and col_types.get(col) == "REAL":
+                    try:
+                        val = float(val)
+                    except (ValueError, TypeError):
+                        pass
+                row.append(val)
+            conn.execute(insert_sql, row)
+
+        conn.commit()
+        if log_fn:
+            log_fn("sqlite", f"Wrote {len(merged)} records to '{table_name}'")
+    finally:
+        conn.close()
+
+    return len(merged)
