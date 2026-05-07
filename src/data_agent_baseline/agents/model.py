@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
-from openai import APIError, AzureOpenAI, OpenAI
+from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
+
+REQUEST_TIMEOUT = 90  # seconds per API call
+MAX_RETRIES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,15 +43,22 @@ class OpenAIModelAdapter:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.temperature = temperature
+        self._client: OpenAI | None = None
+
+    def _get_client(self) -> OpenAI:
+        if self._client is None:
+            self._client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=REQUEST_TIMEOUT,
+            )
+        return self._client
 
     def complete(self, messages: list[ModelMessage]) -> str:
         if not self.api_key:
             raise RuntimeError("Missing model API key in config.agent.api_key.")
 
-        client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.api_base,
-        )
+        client = self._get_client()
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -58,18 +69,36 @@ class OpenAIModelAdapter:
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
 
-        try:
-            response = client.chat.completions.create(**kwargs)
-        except APIError as exc:
-            raise RuntimeError(f"Model request failed: {exc}") from exc
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.chat.completions.create(**kwargs)
+            except APITimeoutError:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError("Model request timed out after retries.")
+            except APIError as exc:
+                if attempt < MAX_RETRIES - 1 and exc.status_code in (429, 502, 503):
+                    backoff = (2 ** attempt) * 3  # 3s, 6s, 12s
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(f"Model request failed: {exc}") from exc
 
-        choices = response.choices or []
-        if not choices:
-            raise RuntimeError("Model response missing choices.")
-        content = choices[0].message.content
-        if not isinstance(content, str):
-            raise RuntimeError("Model response missing text content.")
-        return content
+            choices = response.choices or []
+            if not choices:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError("Model response missing choices.")
+            content = choices[0].message.content
+            if not isinstance(content, str):
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError("Model response missing text content.")
+            return content
+
+        raise RuntimeError("Model request failed after retries.")
 
 
 def _normalize_azure_endpoint(endpoint: str) -> str:

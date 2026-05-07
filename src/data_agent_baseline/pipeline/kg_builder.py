@@ -226,6 +226,23 @@ def _infer_foreign_keys(
                         table_names_lower[ref_name], "id", True,
                     ))
 
+            # Pattern 2b: "link_to_<table>" → table's ID column
+            m3 = re.match(r"^link_to_(.+)$", col_lower)
+            if m3:
+                ref_name = m3.group(1)
+                if ref_name in table_names_lower and ref_name != table.name.lower():
+                    ref_actual = table_names_lower[ref_name]
+                    # Try common ID column names in the referenced table
+                    for ref_col_candidate in [f"{ref_name}_id", "id", "_id"]:
+                        ref_cols_lower = {c.name.lower(): c.name for t in tables
+                                          if t.name == ref_actual for c in t.columns}
+                        if ref_col_candidate in ref_cols_lower:
+                            candidates.append((
+                                table.name, col.name,
+                                ref_actual, ref_cols_lower[ref_col_candidate], True,
+                            ))
+                            break
+
             # Pattern 3: same column name exists in another table (shared key)
             # Only for ID-like columns to avoid false positives (e.g. "Diagnosis")
             if col_lower in unique_cols and _is_joinable_column(col_lower):
