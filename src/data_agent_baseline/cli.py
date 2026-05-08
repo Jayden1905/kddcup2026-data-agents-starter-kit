@@ -406,9 +406,14 @@ def tui(
             run_output_dir = app_config.run.output_dir / "tui_run"
             run_output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Fresh model per task to avoid stale connections
+        from data_agent_baseline.run.runner import build_model_adapter
+        fresh_model = build_model_adapter(app_config)
+
         start = perf_counter()
         artifacts = run_single_task(
-            task_id=task.task_id, config=app_config, run_output_dir=run_output_dir
+            task_id=task.task_id, config=app_config, run_output_dir=run_output_dir,
+            model=fresh_model,
         )
         elapsed = perf_counter() - start
 

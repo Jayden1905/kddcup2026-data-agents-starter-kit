@@ -49,8 +49,12 @@ SQL_RULES = [
     "JOIN through the full FK path. Never skip intermediate linking tables.",
     "\"X containing Y\" means filter X itself (WHERE X.prop = Y).",
     "Use LIKE '%keyword%' COLLATE NOCASE for text. Use CAST(x AS REAL) for division.",
-    "Never return raw record IDs — JOIN to get human-readable names.",
+    "If the question asks for names/descriptions, JOIN to get human-readable values instead of raw IDs.",
+    "Only SELECT columns the question explicitly asks for. Do NOT add extra columns (dates, amounts, etc.) that the question didn't mention.",
     "NEVER use LIMIT unless the question explicitly asks for a specific count (e.g., 'top 3'). For superlatives (lowest/highest/most/least/best/worst), use a subquery: WHERE col = (SELECT MIN/MAX(col) ...) — there may be ties.",
+    "When using MIN/MAX on text columns (times, dates), ALWAYS exclude empty strings: add WHERE col != '' AND col IS NOT NULL in the subquery.",
+    "If a column is often NULL (shown as None/null in SAMPLE DATA), comparisons like col < X return nothing for NULL rows. Consider whether the question refers to a DIFFERENT column or table.",
+    "If the question asks 'which/what X' (asking for names/identifiers), use SELECT DISTINCT to avoid duplicate rows.",
     "Escape apostrophes in strings: use '' (double single-quote) inside SQL string literals.",
     "For COUNT/SUM/aggregations: the column being aggregated must semantically match what the question asks about. Re-read the question to determine the correct column.",
     "Do NOT use GROUP BY + aggregate (SUM/AVG) unless the question explicitly asks for totals or averages. 'lowest/highest X' means MIN/MAX of individual rows, not grouped sums.",
@@ -173,6 +177,7 @@ Return ONLY a JSON object:
 
 RULES:
 - For anchors: quote the EXACT definition including numeric mappings (e.g., "'severe' corresponds to value 2").
+- CRITICAL: If ANY word from the question matches a column/field name defined in DOMAIN KNOWLEDGE, you MUST include that definition. For example, if the question mentions "type" and the knowledge defines a "type" field, include it.
 - For use_case_sql: if the domain knowledge has a USE CASE whose question matches or is very similar to the user's question, copy its SQL EXACTLY. This SQL is the authoritative answer pattern.
 - If a definition distinguishes between similar terms (e.g., "most severe = 1" vs "severe = 2"), quote BOTH so the distinction is clear.
 - Be precise and complete — these anchors will be used as immutable ground truth.
@@ -189,8 +194,8 @@ DATABASE SCHEMA:
 {previous_attempt}
 Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
-  "what_user_wants": "restate EXACTLY what output the user expects — column(s), grain, and format",
-  "formula": "SQL expression (SUM, COUNT, AVG, CAST, etc.) or 'direct_lookup' if no calculation",
+  "what_user_wants": "restate EXACTLY what output the user expects — only columns the question EXPLICITLY mentions",
+  "formula": "the EXACT SQL expression to compute the answer — if GROUND TRUTH defines a metric formula, translate it literally to SQL without simplifying or removing any operations",
   "computation_steps": ["step1: find X", "step2: calculate Y from X"],
   "data_requirements": ["table.column needed for output", "table2.column2 for filter"],
   "reasoning": "brief HOW to get the answer — must trace back to what_user_wants",
@@ -203,9 +208,10 @@ RULES:
 - Start by understanding what_user_wants — every other field must serve that goal.
 - GROUND TRUTH section contains immutable facts extracted from domain knowledge. You MUST follow them exactly.
 - For known_values: use values from GROUND TRUTH first. Then verify they exist in SAMPLE DATA.
-- For formula: if the question asks "average monthly X", that may mean SUM/12 or AVG depending on data grain. Check SAMPLE DATA to understand the grain (one row per month? per year?).
+- For formula: if GROUND TRUTH defines a metric formula (e.g., "Metric = X / N"), translate it literally to SQL. Keep ALL parts — do NOT remove operations even if you think the data makes them redundant. The aggregation function must match the question intent ("average" → AVG, "total" → SUM).
 - For join_paths: trace the FULL FK path shown in DATABASE SCHEMA. Never skip intermediate tables.
 - For data_requirements: list ONLY columns needed for output + filters. Do NOT include extra columns.
+- Do NOT invent output columns the question didn't ask for. If the question says "list all X", SELECT only the column that identifies X — do NOT add properties (like amount, date) unless the question explicitly asks for them.
 - If GROUND TRUTH includes a USE CASE SQL, follow its structure but ensure the selected/aggregated column semantically matches what the question asks about.
 """.strip()
 
@@ -228,10 +234,10 @@ VALIDATE EACH:
    - "list all" → multiple rows
    - "what is the X" → single value
    - Do NOT add extra columns the question didn't ask for.
-3. FORMULA: Does it match EXACTLY what user asks?
-   - "average monthly X" with yearly data → need /12
-   - "percentage" → need *100
-   - Check GROUND TRUTH for formula definitions.
+3. FORMULA: Does it compute what the USER asked for?
+   - The aggregation function is determined by the QUESTION, not GROUND TRUTH: "average" → AVG(), "total" → SUM(), "percentage" → *100.
+   - GROUND TRUTH defines the calculation structure (what to divide by, what columns to use), but the QUESTION determines the aggregation type.
+   - Do NOT change AVG to SUM or SUM to AVG. Only check that the arithmetic and columns are correct.
 4. JOIN PATHS: Complete? No missing intermediate tables?
 
 Return ONLY a JSON object:
@@ -318,8 +324,16 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
 
     known_values = grounding.get("known_values", {})
     if known_values:
-        kv_lines = [f"  {k} IN ({', '.join(repr(v) for v in vs)})"
-                    for k, vs in known_values.items() if vs]
+        kv_lines = []
+        for k, vs in known_values.items():
+            if not vs:
+                continue
+            # If any value contains '%', emit LIKE instruction
+            if any('%' in str(v) for v in vs):
+                like_vals = ", ".join(repr(v) for v in vs)
+                kv_lines.append(f"  {k} LIKE {like_vals}")
+            else:
+                kv_lines.append(f"  {k} IN ({', '.join(repr(v) for v in vs)})")
         if kv_lines:
             parts.append("FILTER VALUES:\n" + "\n".join(kv_lines))
 
@@ -366,9 +380,11 @@ Return ONLY a JSON object:
 
 RULES:
 - Return EVERY row from SQL OUTPUT — never drop or truncate rows.
-- Column names must semantically match what the QUESTION asks about. Derive column names from the question, not from SQL aliases.
-- Only include columns that answer the question — drop extra columns.
-- Do NOT merge, split, or transform values — keep them exactly as in SQL OUTPUT.
+- Drop columns that are NOT needed to answer the question (e.g., intermediate IDs used only for joining).
+- NEVER merge multiple columns into one (e.g., don't combine first_name + last_name into full_name).
+- NEVER split one column into multiple.
+- NEVER rename columns — use the exact SQL column names.
+- Do NOT transform values — keep them exactly as in SQL OUTPUT.
 - Do NOT add rows that aren't in SQL OUTPUT.""")
 
     return "\n".join(parts)
@@ -520,10 +536,15 @@ class QuestionDrivenAgent:
                         all_gaps.add(f"SQL ERROR: {sql_error}. Fix the syntax.")
                     else:
                         self._log("evaluate", "Verdict: incomplete (empty result)")
-                        all_gaps.add(
-                            "Query returned 0 rows — check table names, "
-                            "join columns, and filter values against SAMPLE DATA"
-                        )
+                        # Diagnose which filters are wrong
+                        diag = self._diagnose_empty_result(db_path, sql)
+                        if diag:
+                            all_gaps.add(diag)
+                        else:
+                            all_gaps.add(
+                                "Query returned 0 rows — check table names, "
+                                "join columns, and filter values against SAMPLE DATA"
+                            )
                     failed_sqls.append(sql[:200])
                     gaps_text = "\n".join(f"- {g}" for g in all_gaps)
                     gaps_text += "\n".join(
@@ -589,6 +610,20 @@ class QuestionDrivenAgent:
                     f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
                 )
 
+            # Deduplicate rows if the question asks for unique items
+            if data_result and data_result.get("rows"):
+                rows = data_result["rows"]
+                unique_rows = []
+                seen = set()
+                for row in rows:
+                    key = tuple(str(v) for v in row)
+                    if key not in seen:
+                        seen.add(key)
+                        unique_rows.append(row)
+                if len(unique_rows) < len(rows):
+                    self._log("dedup", f"Removed {len(rows) - len(unique_rows)} duplicate rows")
+                    data_result["rows"] = unique_rows
+
             # Fallback if loop exhausted without good data
             if not data_result or not data_result.get("rows"):
                 if self._time_remaining() > 60:
@@ -596,16 +631,16 @@ class QuestionDrivenAgent:
                 else:
                     data_result = {"columns": [], "rows": []}
 
-            # Format answer via LLM synthesizer
-            self._log("pre_answer", f"cols={data_result.get('columns') if data_result else None}, rows={len(data_result.get('rows',[])) if data_result else 0}")
-            if self._time_remaining() > 30 and data_result and data_result.get("rows"):
-                answer = self._call_answer(
+            # Format answer via schema-based synthesizer
+            raw_row_count = len(data_result.get("rows", [])) if data_result else 0
+            self._log("pre_answer", f"cols={data_result.get('columns') if data_result else None}, rows={raw_row_count}")
+            if data_result and data_result.get("rows"):
+                answer = self._call_answer_with_schema(
                     question, data_result, ctx.knowledge_text,
                     grounding_context=grounding_context,
                 )
-                # Fallback: if LLM returned empty rows, use raw SQL result
                 if not answer or not answer.get("rows"):
-                    self._log("answer_fallback", "LLM returned empty — using raw SQL result")
+                    self._log("answer_fallback", "Synthesizer failed — using raw SQL result")
                     answer = self._raw_result_to_answer(data_result)
             else:
                 answer = self._raw_result_to_answer(data_result)
@@ -731,6 +766,74 @@ class QuestionDrivenAgent:
         self._log("answer_parsed", json.dumps(parsed, default=str) if parsed else "(empty)")
         return parsed
 
+    def _call_answer_with_schema(
+        self,
+        question: str,
+        data_result: dict[str, Any],
+        knowledge_text: str,
+        grounding_context: str = "",
+    ) -> dict[str, Any]:
+        """Two-phase answer: LLM picks columns from schema, code applies to full data."""
+        columns = data_result.get("columns", [])
+        rows = data_result.get("rows", [])
+
+        if not columns or not rows:
+            return {}
+
+        # Single column — no need to ask LLM
+        if len(columns) == 1:
+            return self._raw_result_to_answer(data_result)
+
+        # Extract user intent from grounding context
+        user_wants = ""
+        if grounding_context:
+            match = re.search(r"USER WANTS:\s*(.+)", grounding_context)
+            if match:
+                user_wants = match.group(1).strip()
+
+        col_list = "\n".join(f"  {i}: {c}" for i, c in enumerate(columns))
+        prompt = f"""The user asked a question. The SQL returned these columns. Which columns should appear in the final output?
+
+QUESTION: {question}
+USER INTENT: {user_wants or question}
+
+SQL RESULT COLUMNS:
+{col_list}
+
+Return ONLY: {{"keep_columns": [0, 2]}}
+
+RULES:
+- The output must contain ONLY the information the user EXPLICITLY asked for — nothing extra.
+- "list all X" or "list the X" = ONLY the identifier/ID column of X. Do NOT add properties (amount, date, name, etc.) unless the question EXPLICITLY mentions them.
+- "X and Y" = both X and Y columns, but ONLY those two.
+- Remove columns that were only used for filtering (WHERE) or joining — they are not part of the answer.
+- Remove columns whose values are constant (same for every row) — those are filter echoes.
+- When in doubt, keep FEWER columns. Only include a column if the question directly asks for that information.
+- NEVER merge columns. Just pick indices to keep."""
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if not isinstance(parsed, dict) or "keep_columns" not in parsed:
+            self._log("answer_schema", "(failed to parse, using raw)")
+            return self._raw_result_to_answer(data_result)
+
+        keep_indices = parsed.get("keep_columns", [])
+
+        # Validate indices
+        if not keep_indices or not all(isinstance(i, int) and 0 <= i < len(columns) for i in keep_indices):
+            self._log("answer_schema", f"Invalid indices {keep_indices}, using raw")
+            return self._raw_result_to_answer(data_result)
+
+        # Use SQL column names directly
+        output_names = [columns[i] for i in keep_indices]
+
+        # Apply column selection to ALL rows (no LLM, no truncation)
+        filtered_rows = [[str(row[i]) for i in keep_indices] for row in rows]
+
+        self._log("answer_schema", f"Kept columns {keep_indices} → {output_names} ({len(filtered_rows)} rows)")
+        return {"columns": output_names, "rows": filtered_rows}
+
     # ------------------------------------------------------------------
     # LLM Call: Semantic Grounding (pre-planning decomposition with validation)
     # ------------------------------------------------------------------
@@ -766,6 +869,23 @@ class QuestionDrivenAgent:
             return knowledge_text[:2000]
 
         anchor_text = "\n".join(parts)
+
+        # Translate formula anchors to SQL-ready form based on question intent
+        # Replace "[Total ... X] / N" with "AVG(X) / N" when question asks for average
+        q_lower = question.lower()
+        if "average" in q_lower or "avg" in q_lower:
+            def _rewrite_formula(m: re.Match) -> str:
+                # Extract the last word before / as the column name
+                before_div = m.group(1).strip().rstrip("]")
+                col = before_div.split()[-1]
+                n = m.group(2)
+                return f"AVG({col}) / {n}"
+            anchor_text = re.sub(
+                r'\[?Total\s+([\w\s]+?)\]?\s*/\s*(\d+)',
+                _rewrite_formula,
+                anchor_text,
+            )
+
         self._log("domain_anchors", anchor_text)
         return anchor_text
 
@@ -874,11 +994,15 @@ class QuestionDrivenAgent:
                     break
 
             if fixed_kv:
-                kv = grounding.get("known_values", {})
-                kv.update(fixed_kv)
-                grounding["known_values"] = kv
-                prev_fixed_kv = fixed_kv
-                self._log("grounding_fix_kv", str(fixed_kv))
+                # Re-verify validator's suggested values against actual DB
+                if db_path:
+                    fixed_kv = self._verify_fixed_values(db_path, fixed_kv, grounding.get("known_values", {}))
+                if fixed_kv:
+                    kv = grounding.get("known_values", {})
+                    kv.update(fixed_kv)
+                    grounding["known_values"] = kv
+                    prev_fixed_kv = fixed_kv
+                    self._log("grounding_fix_kv", str(fixed_kv))
             if fixed_dr:
                 grounding["data_requirements"] = fixed_dr
                 self._log("grounding_fix_dr", str(fixed_dr))
@@ -960,6 +1084,24 @@ class QuestionDrivenAgent:
                                       f"{col_name}: '{val}' not found, "
                                       f"using {known_values[col_name]}")
                             break
+                        # Time format mismatch: try stripping HH: prefix or converting
+                        # e.g., '0:01:54' → '1:54' or '1:54%'
+                        time_match = re.match(r'^(\d+):(\d+):(\d+)$', str(val))
+                        if time_match:
+                            mins = int(time_match.group(2))
+                            secs = time_match.group(3)
+                            short_time = f'{mins}:{secs}'
+                            like_result = conn.execute(
+                                f'SELECT DISTINCT "{actual_col}" FROM "{target_table}" '
+                                f'WHERE "{actual_col}" LIKE ? LIMIT 10',
+                                (f'{short_time}%',)
+                            ).fetchall()
+                            if like_result:
+                                known_values[col_name] = [f'{short_time}%']
+                                self._log("filter_fix_time",
+                                          f"{col_name}: '{val}' → LIKE '{short_time}%' "
+                                          f"({len(like_result)} matches)")
+                                break
                     except Exception:
                         pass
         finally:
@@ -967,6 +1109,193 @@ class QuestionDrivenAgent:
 
         grounding["known_values"] = known_values
         return grounding
+
+    def _verify_fixed_values(
+        self, db_path: Path, fixed_kv: dict[str, list], original_kv: dict[str, list]
+    ) -> dict[str, list]:
+        """Re-verify validator-suggested filter values against the DB.
+
+        Rejects fixes where the suggested value doesn't exist in the target column.
+        Falls back to the original value when the fix is invalid.
+        """
+        conn = sqlite3.connect(str(db_path))
+        verified: dict[str, list] = {}
+        try:
+            tables_cols: dict[str, list[str]] = {}
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall():
+                tname = row[0]
+                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                tables_cols[tname] = cols
+
+            for col_name, values in fixed_kv.items():
+                if not values:
+                    continue
+                bare_col = col_name.split(".")[-1] if "." in col_name else col_name
+
+                # Find all tables containing this column
+                candidate_tables: list[tuple[str, str]] = []
+                if "." in col_name:
+                    hint_table = col_name.split(".", 1)[0]
+                    for tname, cols in tables_cols.items():
+                        if tname.lower() == hint_table.lower():
+                            col_match = next(
+                                (c for c in cols if c.lower() == bare_col.lower()), None
+                            )
+                            if col_match:
+                                candidate_tables.append((tname, col_match))
+                            break
+                if not candidate_tables:
+                    for tname, cols in tables_cols.items():
+                        col_match = next(
+                            (c for c in cols if c.lower() == bare_col.lower()), None
+                        )
+                        if col_match:
+                            candidate_tables.append((tname, col_match))
+
+                if not candidate_tables:
+                    verified[col_name] = values
+                    continue
+
+                # Check if value exists in ANY table with this column
+                valid_values = []
+                for val in values:
+                    found_anywhere = False
+                    for tname, actual_col in candidate_tables:
+                        try:
+                            count = conn.execute(
+                                f'SELECT COUNT(*) FROM "{tname}" WHERE "{actual_col}" = ?',
+                                (val,)
+                            ).fetchone()[0]
+                            if count > 0:
+                                found_anywhere = True
+                                self._log("fix_verified", f"{col_name}='{val}' OK in {tname} ({count} rows)")
+                                break
+                        except Exception:
+                            pass
+                    if found_anywhere:
+                        valid_values.append(val)
+                    else:
+                        checked = [f"{t}.{c}" for t, c in candidate_tables]
+                        self._log("fix_rejected",
+                                  f"{col_name}='{val}' does NOT exist in any of {checked}")
+
+                if valid_values:
+                    verified[col_name] = valid_values
+                else:
+                    # Only revert if original value is verified to exist
+                    bare = col_name.split(".")[-1] if "." in col_name else col_name
+                    orig_val = original_kv.get(col_name) or original_kv.get(bare)
+                    if orig_val:
+                        # Verify original value actually exists too
+                        orig_valid = []
+                        for ov in orig_val:
+                            for tname, actual_col in candidate_tables:
+                                try:
+                                    count = conn.execute(
+                                        f'SELECT COUNT(*) FROM "{tname}" WHERE "{actual_col}" = ?',
+                                        (ov,)
+                                    ).fetchone()[0]
+                                    if count > 0:
+                                        orig_valid.append(ov)
+                                        break
+                                except Exception:
+                                    pass
+                        if orig_valid:
+                            self._log("fix_reverted", f"Keeping original {col_name}={orig_valid}")
+                            verified[col_name] = orig_valid
+                        else:
+                            self._log("fix_dropped", f"Both fix and original invalid for {col_name}")
+        finally:
+            conn.close()
+        return verified
+
+    def _diagnose_empty_result(self, db_path: Path, sql: str) -> str:
+        """When SQL returns 0 rows, check each WHERE filter to find the culprit."""
+        if not sql or not db_path.exists():
+            return ""
+        where_match = re.search(r"WHERE\s+(.+?)(?:ORDER|GROUP|LIMIT|$)", sql, re.IGNORECASE | re.DOTALL)
+        if not where_match:
+            return ""
+        where_clause = where_match.group(1)
+
+        conn = sqlite3.connect(str(db_path))
+        bad_filters: list[str] = []
+        try:
+            # Check equality/IN filters: col = 'val' or col IN ('val')
+            conditions = re.findall(
+                r"""(\w+)\.(\w+)\s+(?:=\s*'([^']*)'|IN\s*\('([^']*)'\))""",
+                where_clause
+            )
+            for alias, col, val1, val2 in conditions:
+                val = val1 or val2
+                if not val:
+                    continue
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                    tname = row[0]
+                    cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                    if col in cols:
+                        count = conn.execute(
+                            f'SELECT COUNT(*) FROM "{tname}" WHERE "{col}" = ?', (val,)
+                        ).fetchone()[0]
+                        if count == 0:
+                            distinct = conn.execute(
+                                f'SELECT DISTINCT "{col}" FROM "{tname}" WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 5'
+                            ).fetchall()
+                            actual_vals = [r[0] for r in distinct]
+                            bad_filters.append(
+                                f"WRONG FILTER: {col}='{val}' has 0 matches in {tname}. "
+                                f"Actual values in {tname}.{col}: {actual_vals}"
+                            )
+                        break
+
+            # Check comparison filters on NULL columns: col < N, col > N
+            comparisons = re.findall(
+                r"""(\w+)\.(\w+)\s*([<>]=?)\s*(\d+)""",
+                where_clause
+            )
+            for alias, col, op, val in comparisons:
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                    tname = row[0]
+                    cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                    if col in cols:
+                        null_count = conn.execute(
+                            f'SELECT COUNT(*) FROM "{tname}" WHERE "{col}" IS NULL'
+                        ).fetchone()[0]
+                        total = conn.execute(
+                            f'SELECT COUNT(*) FROM "{tname}"'
+                        ).fetchone()[0]
+                        if total > 0 and null_count / total > 0.5:
+                            # Find numeric columns in other tables that could be the intended filter
+                            alt_cols: list[str] = []
+                            for row2 in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                                t2 = row2[0]
+                                if t2 == tname:
+                                    continue
+                                for c2 in conn.execute(f'PRAGMA table_info("{t2}")').fetchall():
+                                    if c2[2] in ('INTEGER', 'REAL') and c2[1] != col:
+                                        # Check if this column has values in the right range
+                                        try:
+                                            max_v = conn.execute(
+                                                f'SELECT MAX("{c2[1]}") FROM "{t2}"'
+                                            ).fetchone()[0]
+                                            if max_v and int(val) <= max_v * 2:
+                                                alt_cols.append(f"{t2}.{c2[1]}")
+                                        except Exception:
+                                            pass
+                            alt_hint = f" Alternative numeric columns: {alt_cols[:5]}" if alt_cols else ""
+                            bad_filters.append(
+                                f"NULL COLUMN: {tname}.{col} is NULL in {null_count}/{total} rows. "
+                                f"The filter '{col} {op} {val}' matches nothing. "
+                                f"Use a different column for this filter.{alt_hint}"
+                            )
+                        break
+        finally:
+            conn.close()
+        if bad_filters:
+            return " | ".join(bad_filters)
+        return ""
 
     # ------------------------------------------------------------------
     # Helpers
