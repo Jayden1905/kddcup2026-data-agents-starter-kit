@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 120  # seconds per API call
-MAX_RETRIES = 5
+REQUEST_TIMEOUT = 600  # seconds per API call
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,36 +70,18 @@ class OpenAIModelAdapter:
         if "qwen" in self.model.lower():
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = client.chat.completions.create(**kwargs)
-            except APITimeoutError:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise RuntimeError("Model request timed out after retries.")
-            except APIError as exc:
-                if attempt < MAX_RETRIES - 1 and exc.status_code in (429, 502, 503):
-                    backoff = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s
-                    time.sleep(backoff)
-                    continue
-                raise RuntimeError(f"Model request failed: {exc}") from exc
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except (APITimeoutError, APIError) as exc:
+            raise RuntimeError(f"Model API error: {exc}") from exc
 
-            choices = response.choices or []
-            if not choices:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(1)
-                    continue
-                raise RuntimeError("Model response missing choices.")
-            content = choices[0].message.content
-            if not isinstance(content, str):
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(1)
-                    continue
-                raise RuntimeError("Model response missing text content.")
-            return content
-
-        raise RuntimeError("Model request failed after retries.")
+        choices = response.choices or []
+        if not choices:
+            raise RuntimeError("Model response missing choices.")
+        content = choices[0].message.content
+        if not isinstance(content, str):
+            raise RuntimeError("Model response missing text content.")
+        return content
 
 
 def _normalize_azure_endpoint(endpoint: str) -> str:

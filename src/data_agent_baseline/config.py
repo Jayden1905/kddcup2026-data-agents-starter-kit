@@ -45,7 +45,7 @@ class RunConfig:
     output_dir: Path = field(default_factory=_default_run_output_dir)
     run_id: str | None = None
     max_workers: int = 4
-    task_timeout_seconds: int = 600
+    task_timeout_seconds: int = 0
 
 
 @dataclass(frozen=True, slots=True)
