@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 60  # seconds per API call
+REQUEST_TIMEOUT = 120  # seconds per API call
 MAX_RETRIES = 5
 
 
