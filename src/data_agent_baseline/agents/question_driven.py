@@ -536,6 +536,26 @@ class QuestionDrivenAgent:
                 db_path=db_path,
             )
 
+            # Step 5b: Value Discovery — probe DB for actual filter values
+            value_discovery = self._discover_filter_values(
+                question, db_path, kg, grounding_context, ctx.knowledge_text,
+            )
+            if value_discovery:
+                self._log("value_discovery", value_discovery[:300])
+
+            # Step 5c: Threshold inference — infer normal/abnormal ranges if needed
+            threshold_context = self._infer_thresholds(
+                question, db_path, kg, ctx.knowledge_text,
+            )
+            if threshold_context:
+                self._log("threshold_inference", threshold_context[:200])
+
+            # Inject discovered values into grounding context
+            if value_discovery:
+                grounding_context += f"\n\nDISCOVERED VALUES (actual DB values for filter terms):\n{value_discovery}"
+            if threshold_context:
+                grounding_context += f"\n\n{threshold_context}"
+
             # ----------------------------------------------------------
             # Closed loop: PLAN → EXECUTE → EVALUATE (max 4 iterations)
             # ----------------------------------------------------------
@@ -655,6 +675,19 @@ class QuestionDrivenAgent:
                 gaps_text += "\n".join(
                     f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
                 )
+
+            # Multi-hypothesis: if loop failed, try alternative interpretations
+            if not data_result or not data_result.get("rows"):
+                hyp_result, hyp_sql = self._try_multi_hypothesis(
+                    question, db_path, kg_context, sample_data,
+                    ctx.knowledge_text, grounding_context, col_hints,
+                    failed_sqls=failed_sqls,
+                    diagnosis=gaps_text,
+                )
+                if hyp_result and hyp_result.get("rows"):
+                    data_result = hyp_result
+                    sql = hyp_sql
+                    self._log("multi_hypothesis_ok", f"Alternative SQL returned {len(hyp_result['rows'])} rows")
 
             # Deduplicate rows if the question asks for unique items
             if data_result and data_result.get("rows"):
@@ -1541,6 +1574,265 @@ RULES:
             conn.close()
 
         return "\n".join(hints)
+
+    # ------------------------------------------------------------------
+    # Component: Value Discovery
+    # ------------------------------------------------------------------
+
+    def _discover_filter_values(
+        self,
+        question: str,
+        db_path: Path,
+        kg: KnowledgeGraph,
+        grounding_context: str,
+        knowledge_text: str,
+    ) -> str:
+        """Probe DB for actual values that match question filter terms."""
+        if not db_path or not db_path.exists():
+            return ""
+
+        # Extract filter terms from grounding known_values and question keywords
+        # Find quoted terms and meaningful nouns from the question
+        quoted_terms = re.findall(r'"([^"]+)"|\'([^\']+)\'', question)
+        quoted = [t[0] or t[1] for t in quoted_terms]
+
+        # Also extract key terms from grounding
+        grounding_values: list[str] = []
+        if "FILTER VALUES:" in grounding_context:
+            fv_section = grounding_context.split("FILTER VALUES:")[1].split("\n\n")[0]
+            for line in fv_section.strip().split("\n"):
+                vals = re.findall(r":\s*(.+)", line)
+                if vals:
+                    grounding_values.extend(v.strip() for v in vals[0].split(","))
+
+        all_terms = quoted + grounding_values
+        if not all_terms:
+            return ""
+
+        conn = sqlite3.connect(str(db_path))
+        discoveries: list[str] = []
+        try:
+            for table in kg.tables:
+                cols = [c[1] for c in conn.execute(
+                    f'PRAGMA table_info("{table.name}")'
+                ).fetchall()]
+                for col in cols:
+                    for term in all_terms:
+                        term_clean = term.strip("'\"")
+                        if not term_clean or len(term_clean) < 2:
+                            continue
+                        try:
+                            # Check if the exact value exists
+                            exact = conn.execute(
+                                f'SELECT COUNT(*) FROM "{table.name}" WHERE "{col}" = ?',
+                                (term_clean,)
+                            ).fetchone()[0]
+                            if exact > 0:
+                                continue  # Value exists, no problem
+
+                            # Check LIKE match
+                            like_results = conn.execute(
+                                f'SELECT DISTINCT "{col}" FROM "{table.name}" '
+                                f'WHERE "{col}" LIKE ? COLLATE NOCASE LIMIT 5',
+                                (f'%{term_clean}%',)
+                            ).fetchall()
+                            if like_results:
+                                vals = [r[0] for r in like_results if r[0]]
+                                if vals:
+                                    discoveries.append(
+                                        f"  '{term_clean}' not found exactly in {table.name}.{col}, "
+                                        f"but LIKE matches: {vals}"
+                                    )
+                        except Exception:
+                            continue
+        finally:
+            conn.close()
+
+        if discoveries:
+            return "\n".join(discoveries[:10])
+        return ""
+
+    # ------------------------------------------------------------------
+    # Component: Threshold Inference
+    # ------------------------------------------------------------------
+
+    def _infer_thresholds(
+        self,
+        question: str,
+        db_path: Path,
+        kg: KnowledgeGraph,
+        knowledge_text: str,
+    ) -> str:
+        """Infer normal/abnormal thresholds from data distribution when not in knowledge."""
+        q_lower = question.lower()
+        needs_threshold = any(w in q_lower for w in ("normal", "abnormal", "elevated", "low level", "high level"))
+        if not needs_threshold:
+            return ""
+
+        # Check if knowledge already defines thresholds
+        if knowledge_text:
+            k_lower = knowledge_text.lower()
+            # Find which field the question refers to
+            threshold_fields: list[str] = []
+            for word in re.findall(r'\b[a-z]{2,}\b', q_lower):
+                if word in ("normal", "abnormal", "level", "levels", "have", "their", "them"):
+                    continue
+                if word in k_lower:
+                    # Check if threshold is already defined
+                    idx = k_lower.find(word)
+                    context = knowledge_text[max(0, idx-50):idx+200]
+                    if any(t in context.lower() for t in ("range", "above", "below", "between", "normal")):
+                        return ""  # Already defined
+                    threshold_fields.append(word)
+
+        if not db_path or not db_path.exists():
+            return ""
+
+        conn = sqlite3.connect(str(db_path))
+        inferences: list[str] = []
+        try:
+            for table in kg.tables:
+                cols_info = conn.execute(f'PRAGMA table_info("{table.name}")').fetchall()
+                for col_info in cols_info:
+                    col = col_info[1]
+                    col_type = col_info[2].lower()
+                    col_lower = col.lower()
+
+                    # Check if this column is referenced by the question
+                    if not any(w in col_lower for w in re.findall(r'\b[a-z]{3,}\b', q_lower)):
+                        continue
+
+                    # Only for numeric columns
+                    if col_type not in ("real", "integer", "numeric", "float", "double", "int"):
+                        # Check if values are actually numeric
+                        try:
+                            test = conn.execute(
+                                f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
+                                f'WHERE "{col}" IS NOT NULL LIMIT 1'
+                            ).fetchone()
+                            if test is None:
+                                continue
+                        except Exception:
+                            continue
+
+                    try:
+                        stats = conn.execute(
+                            f'SELECT MIN(CAST("{col}" AS REAL)), '
+                            f'MAX(CAST("{col}" AS REAL)), '
+                            f'AVG(CAST("{col}" AS REAL)), '
+                            f'COUNT(*) '
+                            f'FROM "{table.name}" WHERE "{col}" IS NOT NULL'
+                        ).fetchone()
+                        if stats and stats[3] > 0:
+                            inferences.append(
+                                f"  {table.name}.{col}: min={stats[0]}, max={stats[1]}, "
+                                f"avg={stats[2]:.2f}, count={stats[3]}"
+                            )
+                    except Exception:
+                        continue
+        finally:
+            conn.close()
+
+        if inferences:
+            return (
+                "THRESHOLD CONTEXT (data distribution — use with DOMAIN KNOWLEDGE to determine normal ranges):\n"
+                + "\n".join(inferences[:8])
+            )
+        return ""
+
+    # ------------------------------------------------------------------
+    # Component: Multi-Hypothesis SQL
+    # ------------------------------------------------------------------
+
+    def _try_multi_hypothesis(
+        self,
+        question: str,
+        db_path: Path,
+        kg_context: str,
+        sample_data: str,
+        knowledge_text: str,
+        grounding_context: str,
+        column_hints: str,
+        failed_sqls: list[str] | None = None,
+        diagnosis: str = "",
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Generate multiple SQL interpretations and pick the one that returns data."""
+        if not db_path or not db_path.exists():
+            return None, ""
+
+        failed_section = ""
+        if failed_sqls:
+            failed_section = "\nPREVIOUSLY FAILED SQLs (do NOT repeat these patterns):\n"
+            failed_section += "\n".join(f"  - {s[:200]}" for s in failed_sqls[-3:])
+
+        diag_section = ""
+        if diagnosis:
+            diag_section = f"\nDIAGNOSIS OF FAILURES:\n{diagnosis[:1000]}"
+
+        prompt = f"""The previous SQL attempts all returned EMPTY results or failed.
+The question might have ambiguous terms that map to different columns or values.
+
+QUESTION: {question}
+
+DATABASE SCHEMA:
+{kg_context}
+
+SAMPLE DATA:
+{sample_data[:2000]}
+
+{f"DOMAIN KNOWLEDGE: {knowledge_text[:1000]}" if knowledge_text else ""}
+{failed_section}
+{diag_section}
+
+Generate 3 DIFFERENT SQL interpretations of this question. Each should try a DIFFERENT:
+- Column for ambiguous terms (e.g., "number" could be car_number, grid, position, round)
+- Filter value interpretation (e.g., "ranked" could mean position or rank column)
+- Join path or table choice
+- Value format (e.g., time as '1:54.000' vs '0:01:54', date as 20130601 vs '2013-06-01')
+
+Return ONLY a JSON object:
+{{"hypotheses": [{{"reasoning": "why this interpretation", "sql": "SELECT ..."}}, ...]}}
+
+RULES:
+- Each hypothesis MUST be materially different (different WHERE column, different JOIN, or different interpretation)
+- Do NOT repeat any previously failed patterns shown above
+- Use LIKE for text matching when unsure of exact format
+- If DIAGNOSIS shows actual values from the DB, USE them in at least one hypothesis
+- Try both strict and loose interpretations"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if not isinstance(parsed, dict):
+            return None, ""
+
+        hypotheses = parsed.get("hypotheses", [])
+        if not hypotheses:
+            return None, ""
+
+        # Execute each hypothesis and return the first that produces rows
+        best_result = None
+        best_sql = ""
+        best_rows = 0
+
+        for hyp in hypotheses[:3]:
+            hyp_sql = hyp.get("sql", "")
+            if not hyp_sql:
+                continue
+
+            result = self._try_sql(db_path, hyp_sql)
+            if result and result.get("rows"):
+                row_count = len(result["rows"])
+                self._log("hypothesis_tested",
+                          f"{hyp.get('reasoning', '')[:60]} → {row_count} rows")
+                # Prefer the result with most rows (but not too many — likely wrong)
+                if row_count > best_rows and row_count <= 100:
+                    best_result = result
+                    best_sql = hyp_sql
+                    best_rows = row_count
+
+        return best_result, best_sql
 
     # ------------------------------------------------------------------
     # Helpers
