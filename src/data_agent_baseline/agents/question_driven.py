@@ -59,6 +59,13 @@ SQL_RULES = [
     "For COUNT/SUM/aggregations: the column being aggregated must semantically match what the question asks about. Re-read the question to determine the correct column.",
     "When the question says 'per unit/per item/each/per person', compute a ratio (total ÷ count) — do NOT compare a total column directly.",
     "Do NOT use GROUP BY + aggregate (SUM/AVG) unless the question explicitly asks for totals or averages. 'lowest/highest X' means MIN/MAX of individual rows, not grouped sums.",
+    # Scope/population rules
+    "POPULATION vs METRIC: 'In X, what is Y?' or 'Among X, what is Y?' → X defines the WHERE filter (population/denominator), Y is what you compute ON that filtered set. Example: 'In heroes with height 150-180, what % are Marvel?' → WHERE height BETWEEN 150 AND 180, then compute COUNT(Marvel)/COUNT(*)*100.",
+    "RATIO LANGUAGE: 'How many times X more than Y' or 'how many times was X more than Y' = X/Y (division producing a ratio). It does NOT mean X-Y (subtraction) or COUNT.",
+    # Aggregation grain
+    "AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attribute (e.g., user age, user upvotes), query that entity table DIRECTLY with a subquery filter. Do NOT join to detail tables — joining users to posts duplicates user rows and corrupts the average. Correct: SELECT AVG(age) FROM users WHERE id IN (SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*)>N).",
+    # Domain column mapping
+    "DOMAIN KNOWLEDGE COLUMN MAPPING: If DOMAIN KNOWLEDGE defines what a column means (e.g., 'rank = fastest lap ranking', 'position = race finish order'), use the EXACT column that matches the question's intent. 'ranked second' with rank defined as fastest lap → WHERE rank=2, NOT WHERE position=2.",
 ]
 
 
@@ -167,7 +174,10 @@ Return ONLY a JSON object:
 - Only mark "incomplete" if: the result is EMPTY, has an error, has wrong columns, or the data clearly does NOT answer the question.
 - The SQL may use different arithmetic/expressions than the FORMULA if it better matches the QUESTION's semantics. Do NOT reject a query just because its expression differs from FORMULA.
 - MULTIPLE ROWS ARE VALID: If the query returns multiple rows, that means there are ties or multiple matches — this is CORRECT. Do NOT mark as incomplete just because there are multiple results.
-- suggested_sql should try to fix the actual problem. Never repeat the same failing query.""")
+- suggested_sql should try to fix the actual problem. Never repeat the same failing query.
+- LOGIC CHECK for percentages/ratios: Re-read the QUESTION's sentence structure. "In X, what % of Y?" means the WHERE should filter for X (the population), and the percentage numerator should count Y within X. If the SQL has it backwards (filtering Y and computing % of X), mark incomplete and provide corrected SQL.
+- LOGIC CHECK for "how many times more": This means division (X/Y), NOT subtraction. If the SQL uses subtraction, mark incomplete.
+- LOGIC CHECK for aggregation: If the question asks "average [attribute] of [entities] who..." and the SQL JOINs entities to a detail table before computing AVG, the average is WRONG (inflated by duplicate entity rows). Mark incomplete with correct approach.""")
 
     return "\n".join(parts)
 
@@ -180,11 +190,16 @@ DOMAIN KNOWLEDGE:
 {knowledge_text}
 
 Return ONLY a JSON object:
-{{"anchors": ["exact quote of each relevant definition — include the exact numeric values/mappings"], "use_case_sql": "the complete SQL from a USE CASE that answers the same or very similar question, or null if none match"}}
+{{"anchors": ["exact quote of each relevant definition — include the exact numeric values/mappings"], "column_mappings": {{"question_term": "actual_column_name — meaning"}}, "use_case_sql": "the complete SQL from a USE CASE that answers the same or very similar question, or null if none match"}}
 
 RULES:
 - For anchors: quote the EXACT definition including numeric mappings (e.g., "'severe' corresponds to value 2").
 - CRITICAL: If ANY word from the question matches a column/field name defined in DOMAIN KNOWLEDGE, you MUST include that definition. For example, if the question mentions "type" and the knowledge defines a "type" field, include it.
+- For column_mappings: identify terms in the QUESTION that could map to specific columns. If the knowledge defines what a column represents (e.g., "rank: ranking based on fastest lap time"), and the question uses a related word ("ranked"), record the mapping. This prevents using the wrong column.
+- CRITICAL column_mappings cases:
+  * "ranked/ranking" → check if knowledge defines a 'rank' column vs 'position' column with different meanings
+  * "normal/abnormal" → check if knowledge defines numeric thresholds for that field
+  * "time/finish time" → check if knowledge distinguishes different time-related columns
 - For use_case_sql: if the domain knowledge has a USE CASE whose question matches or is very similar to the user's question, copy its SQL EXACTLY. This SQL is the authoritative answer pattern.
 - If a definition distinguishes between similar terms (e.g., "most severe = 1" vs "severe = 2"), quote BOTH so the distinction is clear.
 - Be precise and complete — these anchors will be used as immutable ground truth.
@@ -222,6 +237,14 @@ RULES:
 - For data_requirements: list ONLY columns needed for output + filters. Do NOT include extra columns.
 - Do NOT invent output columns the question didn't ask for. If the question says "list all X", SELECT only the column that identifies X — do NOT add properties (like amount, date) unless the question explicitly asks for them.
 - If GROUND TRUTH includes a USE CASE SQL, follow its structure but ensure the selected/aggregated column semantically matches what the question asks about.
+- POPULATION vs METRIC (critical for percentages/counts): Parse sentence structure carefully:
+  * "In X, what is the percentage/count of Y?" → X is the population (WHERE filter = denominator), Y is what you measure.
+  * "Among X, how many have Y?" → X is the population, Y is the condition being counted.
+  * "Of X, what percentage are Y?" → denominator = COUNT(X), numerator = COUNT(X where Y).
+  * WRONG: "In heroes with height 150-180, % of Marvel" → filtering by Marvel and computing % with height. CORRECT: filter by height, compute % that are Marvel.
+- RATIO LANGUAGE: "How many times is X more than Y?" or "How many times was X more than Y?" = X divided by Y (a ratio). NOT subtraction, NOT a count. Result is a decimal number (e.g., 2.73).
+- AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attributes (e.g., "average age of users who..."), aggregate FROM the entity table with a WHERE/IN filter. Do NOT join to a detail table — that duplicates entity rows per detail record and corrupts the average. Example: AVG(users.age) for users with >10 posts → SELECT AVG(age) FROM users WHERE id IN (subquery on posts).
+- COLUMN SEMANTICS: If GROUND TRUTH defines column meanings (e.g., "rank = based on fastest lap time", "position = race finish order"), map the question's wording to the CORRECT column. "ranked second" → use the column defined as "ranking", not "position".
 """.strip()
 
 GROUNDING_VALIDATE_PROMPT = """You are a strict validator. Check if this plan EXACTLY answers the user's question.
@@ -248,9 +271,23 @@ VALIDATE EACH:
    - GROUND TRUTH defines the calculation structure (what to divide by, what columns to use), but the QUESTION determines the aggregation type.
    - Do NOT change AVG to SUM or SUM to AVG. Only check that the arithmetic and columns are correct.
 4. JOIN PATHS: Complete? No missing intermediate tables?
+5. POPULATION vs METRIC (critical for percentages):
+   - Re-read the question: "In X, what % of Y?" means X=WHERE filter, Y=numerator condition.
+   - Check: is the plan filtering by the correct population (denominator)?
+   - WRONG: "In heroes height 150-180, % Marvel" with WHERE publisher='Marvel' and CASE on height.
+   - CORRECT: WHERE height BETWEEN 150 AND 180, then COUNT(Marvel)/COUNT(*).
+6. RATIO vs DIFFERENCE:
+   - "How many times X more than Y" = X/Y (division), NOT X-Y.
+   - Check if the formula uses division when the question asks "how many times".
+7. AGGREGATION GRAIN:
+   - If the plan computes AVG of entity attributes via JOIN to detail table, it's WRONG — the join duplicates rows.
+   - AVG(user.age) for "users with >10 posts" must query users table directly, not join through posts.
+8. COLUMN SEMANTICS:
+   - If GROUND TRUTH COLUMN MAPPINGS exist, verify the plan uses the correct column for each term.
+   - E.g., "ranked second" must use the column defined as "ranking" not "position" if they differ.
 
 Return ONLY a JSON object:
-{{"verdict": "correct"/"needs_fix", "fixed_known_values": {{"column_name": ["corrected_values"]}}, "fixed_data_requirements": ["table.column", ...], "fixed_join_paths": ["tableA.col -> tableB.col"], "reasoning": "one sentence explaining what was wrong"}}
+{{"verdict": "correct"/"needs_fix", "fixed_known_values": {{"column_name": ["corrected_values"]}}, "fixed_data_requirements": ["table.column", ...], "fixed_join_paths": ["tableA.col -> tableB.col"], "fixed_formula": "corrected formula if wrong", "reasoning": "one sentence explaining what was wrong"}}
 
 - "correct" = ALL filter values, formula, columns, and joins match GROUND TRUTH and the question's intent.
 - "needs_fix" = ANY mismatch with GROUND TRUTH found. You MUST provide the corrected values.
@@ -862,6 +899,13 @@ RULES:
         anchors = parsed.get("anchors", [])
         for a in anchors:
             parts.append(f"- {a}")
+
+        column_mappings = parsed.get("column_mappings", {})
+        if column_mappings:
+            parts.append("\nCOLUMN MAPPINGS (use the correct column for each question term):")
+            for term, mapping in column_mappings.items():
+                parts.append(f"  \"{term}\" → {mapping}")
+
         use_case_sql = parsed.get("use_case_sql")
         if use_case_sql:
             parts.append(f"\nMATCHING USE CASE SQL (follow this exactly):\n  {use_case_sql}")
@@ -987,6 +1031,7 @@ RULES:
             fixed_kv = val_result.get("fixed_known_values", {})
             fixed_dr = val_result.get("fixed_data_requirements", [])
             fixed_jp = val_result.get("fixed_join_paths", [])
+            fixed_formula = val_result.get("fixed_formula", "")
 
             # Detect oscillation: if validator reverses a previous fix, stop
             if fixed_kv and prev_fixed_kv:
@@ -1020,9 +1065,12 @@ RULES:
             if fixed_jp:
                 grounding["join_paths"] = fixed_jp
                 self._log("grounding_fix_jp", str(fixed_jp))
+            if fixed_formula:
+                grounding["formula"] = fixed_formula
+                self._log("grounding_fix_formula", fixed_formula)
 
             # If validator didn't suggest any usable fixes, no point looping
-            if not fixed_kv and not fixed_dr and not fixed_jp:
+            if not fixed_kv and not fixed_dr and not fixed_jp and not fixed_formula:
                 if not rejected_fixes:
                     break
                 # Validator tried fixes but they were all invalid — feed back what

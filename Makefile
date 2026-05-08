@@ -1,6 +1,6 @@
 CONFIG ?= configs/react_baseline.local.yaml
 TASK   ?= task_11
-LIMIT  ?= 0
+LIMIT  ?= 50
 TEAM   ?= 1347
 VERSION ?= v1
 IMAGE  ?= $(TEAM):$(VERSION)
