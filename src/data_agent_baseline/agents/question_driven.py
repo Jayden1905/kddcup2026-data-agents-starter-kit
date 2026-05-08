@@ -66,6 +66,9 @@ SQL_RULES = [
     "AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attribute (e.g., user age, user upvotes), query that entity table DIRECTLY with a subquery filter. Do NOT join to detail tables — joining users to posts duplicates user rows and corrupts the average. Correct: SELECT AVG(age) FROM users WHERE id IN (SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*)>N).",
     # Domain column mapping
     "DOMAIN KNOWLEDGE COLUMN MAPPING: If DOMAIN KNOWLEDGE defines what a column means (e.g., 'rank = fastest lap ranking', 'position = race finish order'), use the EXACT column that matches the question's intent. 'ranked second' with rank defined as fastest lap → WHERE rank=2, NOT WHERE position=2.",
+    # Format matching
+    "VALUE FORMAT: Check SAMPLE DATA for the EXACT format of values before filtering. Time might be '1:54.123' not '0:01:54'. Dates might be integers (20130601) not strings ('2013-06-01'). Names might be 'DisplayName' not 'username'. Always match the exact format shown in SAMPLE DATA.",
+    "EMPTY RESULT RECOVERY: If the PREVIOUS ATTEMPT FAILED section shows actual values from the DB, use THOSE exact values in your query — do not guess differently.",
 ]
 
 
@@ -543,6 +546,7 @@ class QuestionDrivenAgent:
             extra_context = ""  # info from exploratory queries
             all_gaps: set[str] = set()  # dedup gaps across iterations
             failed_sqls: list[str] = []
+            seen_sql_normalized: set[str] = set()
 
             for iteration in range(1, max_iterations + 1):
                 self._log("iteration", f"--- Iteration {iteration}/{max_iterations} ---")
@@ -557,18 +561,19 @@ class QuestionDrivenAgent:
                 )
                 self._log("sql_generated", sql)
 
+                # Detect duplicate SQL BEFORE execution — save time
+                sql_normalized = " ".join(sql.split()).strip().upper()
+                if sql_normalized in seen_sql_normalized:
+                    self._log("evaluate", "Verdict: duplicate SQL — stopping iterations")
+                    break
+                seen_sql_normalized.add(sql_normalized)
+
                 # EXECUTE: Run the SQL
                 sql_error = ""
                 data_result = self._try_sql(db_path, sql)
                 if data_result is None:
                     sql_error = self.steps[-1].get("detail", "") if self.steps else ""
                     data_result = {"columns": [], "rows": []}
-
-                # Detect duplicate SQL — if model generated the same query, force break
-                sql_normalized = " ".join(sql.split()).strip().upper()
-                if sql_normalized in {" ".join(s.split()).strip().upper() for s in failed_sqls}:
-                    self._log("evaluate", "Verdict: duplicate SQL — stopping iterations")
-                    break
 
                 # Force-incomplete on empty results (skip LLM eval)
                 if not data_result.get("rows"):
@@ -593,7 +598,7 @@ class QuestionDrivenAgent:
                     )
                     continue
 
-                # Skip evaluate on last iteration or low time — just use what we have
+                # Skip evaluate on last iteration — just use what we have
                 if iteration == max_iterations:
                     break
 
@@ -645,7 +650,7 @@ class QuestionDrivenAgent:
                 for g in new_gaps:
                     self._log("gap", g)
 
-                failed_sqls.append(sql[:200])
+                failed_sqls.append(sql)
                 gaps_text = "\n".join(f"- {g}" for g in all_gaps)
                 gaps_text += "\n".join(
                     f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
@@ -1351,86 +1356,140 @@ RULES:
         conn = sqlite3.connect(str(db_path))
         diagnostics: list[str] = []
         try:
-            # Try running the query without each WHERE condition to find the blocker
             sql_upper = sql.upper()
-            if "WHERE" in sql_upper:
-                # Extract the FROM...WHERE...portion and try subsets
-                # Run the full query without WHERE to see if base join works
-                where_idx = sql.upper().find("WHERE")
-                base_sql = sql[:where_idx].strip()
-                # Check if base query (no filters) returns rows
+            if "WHERE" not in sql_upper:
+                return ""
+
+            where_idx = sql.upper().find("WHERE")
+            base_sql = sql[:where_idx].strip()
+
+            # Check if base query (no filters) returns rows
+            try:
+                base_count = conn.execute(
+                    f"SELECT COUNT(*) FROM ({base_sql})"
+                ).fetchone()[0]
+                if base_count == 0:
+                    diagnostics.append(
+                        "JOIN itself returns 0 rows — check JOIN conditions and table relationships."
+                    )
+                    # Show available tables and their columns
+                    tables = [r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()]
+                    for tname in tables:
+                        if tname.lower() in sql.lower() or tname.startswith("_"):
+                            continue
+                        cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                        diagnostics.append(f"  Available table '{tname}': columns={cols}")
+                    return "EMPTY RESULT DIAGNOSIS:\n" + "\n".join(diagnostics)
+            except Exception:
+                pass
+
+            # Extract individual WHERE conditions and test each removal
+            where_clause = sql[where_idx + 5:].strip()
+            for keyword in ["ORDER BY", "GROUP BY", "LIMIT", "HAVING"]:
+                kw_idx = where_clause.upper().find(keyword)
+                if kw_idx > 0:
+                    where_clause = where_clause[:kw_idx].strip()
+
+            conditions = [c.strip() for c in re.split(r'\bAND\b', where_clause, flags=re.IGNORECASE) if c.strip()]
+
+            if len(conditions) >= 1:
+                for i, cond in enumerate(conditions):
+                    remaining = [c for j, c in enumerate(conditions) if j != i]
+                    test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}" if remaining else base_sql
+                    try:
+                        count = conn.execute(
+                            f"SELECT COUNT(*) FROM ({test_sql})"
+                        ).fetchone()[0]
+                        if count > 0:
+                            diagnostics.append(
+                                f"BLOCKER: filter '{cond.strip()}' eliminates all rows. Without it: {count} rows."
+                            )
+                            # Extract the column and value from the condition
+                            # Try to find table.col or col references
+                            col_found = False
+                            for part in cond.replace("(", " ").replace(")", " ").split():
+                                col_ref = part.strip("\"'`=<>!,")
+                                if not col_ref or col_ref.upper() in ("AND", "OR", "NOT", "IN", "LIKE", "IS", "NULL", "BETWEEN"):
+                                    continue
+                                if "." in col_ref:
+                                    _, col = col_ref.split(".", 1)
+                                    col = col.strip("\"'`")
+                                else:
+                                    col = col_ref
+                                try:
+                                    actual = conn.execute(
+                                        f'SELECT DISTINCT "{col}" FROM ({test_sql}) WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 15'
+                                    ).fetchall()
+                                    vals = [r[0] for r in actual]
+                                    if vals:
+                                        diagnostics.append(
+                                            f"  ACTUAL values for '{col}': {vals}"
+                                        )
+                                        # Extract what value was used in the filter
+                                        str_match = re.findall(r"'([^']*)'", cond)
+                                        if str_match:
+                                            used_val = str_match[0]
+                                            # Check for close matches (LIKE pattern)
+                                            close = [v for v in vals if isinstance(v, str) and (
+                                                used_val.lower() in v.lower() or v.lower() in used_val.lower()
+                                            )]
+                                            if close:
+                                                diagnostics.append(f"  SUGGESTION: Use LIKE '%{used_val}%' or exact match '{close[0]}'")
+                                            else:
+                                                diagnostics.append(f"  Your filter used '{used_val}' but it does NOT exist. Use one of the actual values above.")
+                                        col_found = True
+                                        break
+                                except Exception:
+                                    continue
+                            if not col_found:
+                                # Show all columns of tables in the base query
+                                diagnostics.append(f"  Could not identify column. Check if the column name is correct.")
+                    except Exception:
+                        pass
+
+            # If single condition and no diagnosis yet, show what exists
+            if not diagnostics and len(conditions) == 1:
                 try:
-                    base_count = conn.execute(
-                        f"SELECT COUNT(*) FROM ({base_sql})"
-                    ).fetchone()[0]
-                    if base_count == 0:
-                        diagnostics.append(
-                            "JOIN itself returns 0 rows — check JOIN conditions and table relationships."
-                        )
+                    count = conn.execute(f"SELECT COUNT(*) FROM ({base_sql})").fetchone()[0]
+                    if count > 0:
+                        diagnostics.append(f"Base query has {count} rows but the single filter eliminates all.")
+                        # Show column values from tables in the query
+                        tables = [r[0] for r in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()]
+                        for tname in tables:
+                            if tname.lower() in sql.lower():
+                                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                                for col in cols:
+                                    if col.lower() in conditions[0].lower():
+                                        sample = conn.execute(
+                                            f'SELECT DISTINCT "{col}" FROM "{tname}" WHERE "{col}" IS NOT NULL LIMIT 10'
+                                        ).fetchall()
+                                        vals = [r[0] for r in sample]
+                                        diagnostics.append(f"  {tname}.{col} actual values: {vals}")
                 except Exception:
                     pass
 
-                # Extract individual WHERE conditions and test each removal
-                where_clause = sql[where_idx + 5:].strip()
-                # Remove ORDER BY, GROUP BY, LIMIT from where_clause
-                for keyword in ["ORDER BY", "GROUP BY", "LIMIT", "HAVING"]:
-                    kw_idx = where_clause.upper().find(keyword)
-                    if kw_idx > 0:
-                        where_clause = where_clause[:kw_idx].strip()
-
-                # Split on AND (simple heuristic)
-                conditions = [c.strip() for c in re.split(r'\bAND\b', where_clause, flags=re.IGNORECASE) if c.strip()]
-
-                if len(conditions) > 1:
-                    for i, cond in enumerate(conditions):
-                        remaining = [c for j, c in enumerate(conditions) if j != i]
-                        test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}"
-                        try:
-                            count = conn.execute(
-                                f"SELECT COUNT(*) FROM ({test_sql})"
-                            ).fetchone()[0]
-                            if count > 0:
-                                diagnostics.append(
-                                    f"Removing filter '{cond.strip()}' gives {count} rows — this filter is the blocker."
-                                )
-                                # Show what values actually exist for this column
-                                # in the context of the other filters
-                                for part in cond.split():
-                                    if "." in part:
-                                        tbl, col = part.split(".", 1)
-                                        col = col.strip("\"'`")
-                                        tbl = tbl.strip("\"'`")
-                                        try:
-                                            actual = conn.execute(
-                                                f'SELECT DISTINCT "{col}" FROM ({test_sql}) LIMIT 10'
-                                            ).fetchall()
-                                            vals = [r[0] for r in actual if r[0] is not None]
-                                            if vals:
-                                                diagnostics.append(
-                                                    f"Actual values for '{col}' with other filters applied: {vals}"
-                                                )
-                                        except Exception:
-                                            pass
-                                        break
-                        except Exception:
-                            pass
-
-            # Fallback: show sample values for columns used in the SQL
+            # Fallback: show sample values for columns that appear in WHERE clause
             if not diagnostics:
                 tables = [r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()]
                 for tname in tables:
+                    if tname.lower() not in sql.lower():
+                        continue
                     cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
                     for col in cols:
-                        if col.lower() in sql.lower():
+                        if col.lower() in where_clause.lower():
                             try:
                                 sample = conn.execute(
                                     f'SELECT DISTINCT "{col}" FROM "{tname}" '
-                                    f'WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 5'
+                                    f'WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 10'
                                 ).fetchall()
                                 vals = [r[0] for r in sample]
-                                diagnostics.append(f"{tname}.{col}: sample={vals}")
+                                diagnostics.append(f"{tname}.{col}: actual values={vals}")
                             except Exception:
                                 pass
         finally:
@@ -1453,22 +1512,30 @@ RULES:
             ).fetchall()]
 
             if "no such column" in error:
-                # Extract the bad column reference from error
-                # e.g. "no such column: e.event_name" or "no such column: format"
                 bad_col = error.split("no such column:")[-1].strip()
-                # If it has a table alias prefix, extract just the column name
                 bare_col = bad_col.split(".")[-1] if "." in bad_col else bad_col
+                bare_col = bare_col.strip("\"'`")
 
                 # Find tables referenced in the SQL and show their actual columns
+                # Also suggest close matches
                 for tname in tables:
                     if tname.lower() in sql.lower():
                         cols = [c[1] for c in conn.execute(
                             f'PRAGMA table_info("{tname}")'
                         ).fetchall()]
                         hints.append(f"Table '{tname}' has columns: {cols}")
+                        # Find close matches for the bad column
+                        close = [c for c in cols if bare_col.lower() in c.lower() or c.lower() in bare_col.lower()]
+                        if close:
+                            hints.append(f"  Did you mean: {close}?")
 
             elif "no such table" in error:
+                bad_table = error.split("no such table:")[-1].strip() if "no such table:" in error else ""
                 hints.append(f"Available tables: {tables}")
+                if bad_table:
+                    close = [t for t in tables if bad_table.lower() in t.lower() or t.lower() in bad_table.lower()]
+                    if close:
+                        hints.append(f"  Did you mean: {close}?")
 
         finally:
             conn.close()
@@ -1644,14 +1711,22 @@ RULES:
         """Map words from the question to actual column names in the schema."""
         q_words = set(re.findall(r"[a-z]{3,}", question.lower()))
         hints: list[str] = []
+        matched_words: dict[str, list[str]] = {}
         for table in kg.tables:
             for col in table.columns:
                 col_lower = col.name.lower()
-                # Check if any question word matches (or is substring of) a column name
                 for word in q_words:
                     if word == col_lower or (len(word) >= 4 and word in col_lower):
-                        hints.append(f"  \"{word}\" → {table.name}.{col.name}")
+                        match_str = f"{table.name}.{col.name}"
+                        matched_words.setdefault(word, []).append(match_str)
                         break
+
+        for word, cols in matched_words.items():
+            if len(cols) == 1:
+                hints.append(f"  \"{word}\" → {cols[0]}")
+            else:
+                hints.append(f"  \"{word}\" → AMBIGUOUS: {cols} — check DOMAIN KNOWLEDGE to pick the right one")
+
         if hints:
             return "COLUMN HINTS (question words matching schema columns):\n" + "\n".join(hints)
         return ""
