@@ -3,7 +3,7 @@ TASK   ?= task_11
 LIMIT  ?= 0
 TEAM   ?= 1347
 VERSION ?= v1
-IMAGE  ?= $(TEAM)_$(VERSION):latest
+IMAGE  ?= $(TEAM):$(VERSION)
 
 .PHONY: install tui run run-bench status inspect lint fmt test docker-build docker-test docker-save
 
