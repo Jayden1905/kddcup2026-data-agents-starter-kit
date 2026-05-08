@@ -163,14 +163,11 @@ Return ONLY a JSON object:
 {"verdict": "complete"/"incomplete", "reasoning": "why", "gaps": [], "info_queries": [], "suggested_sql": "..."}
 
 - Re-read the QUESTION. Does the data ACTUALLY answer what was asked?
-- TRUST the VALIDATED PLAN's FILTER VALUES — those literal values are verified.
-- FIRST CHECK: Does the SQL use the EXACT literal values from FILTER VALUES? If not → "incomplete".
-- The SQL may use different arithmetic/expressions than the FORMULA if it better matches the QUESTION's semantics. Do NOT reject a query just because its expression differs from FORMULA — only reject if FILTER VALUES are wrong.
-- "complete" = SQL uses correct filter values AND data has rows AND answers the question.
-- "incomplete" = SQL uses wrong filter values, or error, empty, or wrong columns.
-- Do NOT question filter values that match the VALIDATED PLAN — those are correct.
+- PRIORITY: If the query RETURNS DATA and the data answers the QUESTION, verdict is "complete" — even if the SQL deviates from VALIDATED PLAN's filter values. The plan can be wrong; the data doesn't lie.
+- Only mark "incomplete" if: the result is EMPTY, has an error, has wrong columns, or the data clearly does NOT answer the question.
+- The SQL may use different arithmetic/expressions than the FORMULA if it better matches the QUESTION's semantics. Do NOT reject a query just because its expression differs from FORMULA.
 - MULTIPLE ROWS ARE VALID: If the query returns multiple rows, that means there are ties or multiple matches — this is CORRECT. Do NOT mark as incomplete just because there are multiple results.
-- suggested_sql must use the VALIDATED PLAN's filter values. Never repeat the same failing query.""")
+- suggested_sql should try to fix the actual problem. Never repeat the same failing query.""")
 
     return "\n".join(parts)
 
@@ -1299,41 +1296,100 @@ RULES:
         return verified, rejections
 
     def _diagnose_empty_result(self, db_path: Path, sql: str) -> str:
-        """When SQL returns 0 rows, gather DB evidence about what went wrong."""
+        """When SQL returns 0 rows, isolate which filter causes the empty result."""
         if not sql or not db_path.exists():
             return ""
 
         conn = sqlite3.connect(str(db_path))
         diagnostics: list[str] = []
         try:
-            tables = [r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()]
-            for tname in tables:
-                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
-                row_count = conn.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
-                for col in cols:
-                    if col.lower() in sql.lower():
+            # Try running the query without each WHERE condition to find the blocker
+            sql_upper = sql.upper()
+            if "WHERE" in sql_upper:
+                # Extract the FROM...WHERE...portion and try subsets
+                # Run the full query without WHERE to see if base join works
+                where_idx = sql.upper().find("WHERE")
+                base_sql = sql[:where_idx].strip()
+                # Check if base query (no filters) returns rows
+                try:
+                    base_count = conn.execute(
+                        f"SELECT COUNT(*) FROM ({base_sql})"
+                    ).fetchone()[0]
+                    if base_count == 0:
+                        diagnostics.append(
+                            "JOIN itself returns 0 rows — check JOIN conditions and table relationships."
+                        )
+                except Exception:
+                    pass
+
+                # Extract individual WHERE conditions and test each removal
+                where_clause = sql[where_idx + 5:].strip()
+                # Remove ORDER BY, GROUP BY, LIMIT from where_clause
+                for keyword in ["ORDER BY", "GROUP BY", "LIMIT", "HAVING"]:
+                    kw_idx = where_clause.upper().find(keyword)
+                    if kw_idx > 0:
+                        where_clause = where_clause[:kw_idx].strip()
+
+                # Split on AND (simple heuristic)
+                conditions = [c.strip() for c in re.split(r'\bAND\b', where_clause, flags=re.IGNORECASE) if c.strip()]
+
+                if len(conditions) > 1:
+                    for i, cond in enumerate(conditions):
+                        remaining = [c for j, c in enumerate(conditions) if j != i]
+                        test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}"
                         try:
-                            sample = conn.execute(
-                                f'SELECT DISTINCT "{col}" FROM "{tname}" '
-                                f'WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 5'
-                            ).fetchall()
-                            vals = [r[0] for r in sample]
-                            rng = conn.execute(
-                                f'SELECT MIN("{col}"), MAX("{col}") FROM "{tname}"'
-                            ).fetchone()
-                            diagnostics.append(
-                                f"{tname}.{col} ({row_count} rows): "
-                                f"sample={vals}, range=[{rng[0]}..{rng[1]}]"
-                            )
+                            count = conn.execute(
+                                f"SELECT COUNT(*) FROM ({test_sql})"
+                            ).fetchone()[0]
+                            if count > 0:
+                                diagnostics.append(
+                                    f"Removing filter '{cond.strip()}' gives {count} rows — this filter is the blocker."
+                                )
+                                # Show what values actually exist for this column
+                                # in the context of the other filters
+                                for part in cond.split():
+                                    if "." in part:
+                                        tbl, col = part.split(".", 1)
+                                        col = col.strip("\"'`")
+                                        tbl = tbl.strip("\"'`")
+                                        try:
+                                            actual = conn.execute(
+                                                f'SELECT DISTINCT "{col}" FROM ({test_sql}) LIMIT 10'
+                                            ).fetchall()
+                                            vals = [r[0] for r in actual if r[0] is not None]
+                                            if vals:
+                                                diagnostics.append(
+                                                    f"Actual values for '{col}' with other filters applied: {vals}"
+                                                )
+                                        except Exception:
+                                            pass
+                                        break
                         except Exception:
                             pass
+
+            # Fallback: show sample values for columns used in the SQL
+            if not diagnostics:
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()]
+                for tname in tables:
+                    cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                    for col in cols:
+                        if col.lower() in sql.lower():
+                            try:
+                                sample = conn.execute(
+                                    f'SELECT DISTINCT "{col}" FROM "{tname}" '
+                                    f'WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 5'
+                                ).fetchall()
+                                vals = [r[0] for r in sample]
+                                diagnostics.append(f"{tname}.{col}: sample={vals}")
+                            except Exception:
+                                pass
         finally:
             conn.close()
 
         if diagnostics:
-            return "ACTUAL DATA IN DB:\n" + "\n".join(diagnostics)
+            return "EMPTY RESULT DIAGNOSIS:\n" + "\n".join(diagnostics)
         return ""
 
     def _diagnose_sql_error(self, db_path: Path, sql: str, error: str) -> str:

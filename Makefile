@@ -1,8 +1,11 @@
 CONFIG ?= configs/react_baseline.local.yaml
 TASK   ?= task_11
 LIMIT  ?= 0
+TEAM   ?= 1347
+VERSION ?= v1
+IMAGE  ?= $(TEAM)_$(VERSION):latest
 
-.PHONY: install tui run run-bench status inspect lint fmt test
+.PHONY: install tui run run-bench status inspect lint fmt test docker-build docker-test docker-save
 
 install:
 	uv sync
@@ -30,3 +33,19 @@ fmt:
 
 test:
 	uv run pytest
+
+docker-build:
+	podman build --no-cache --platform linux/amd64 -t $(IMAGE) .
+
+docker-test:
+	mkdir -p ./local_output
+	podman run --rm \
+		-e MODEL_API_URL="$$MODEL_API_URL" \
+		-e MODEL_API_KEY="$$MODEL_API_KEY" \
+		-e MODEL_NAME="$$MODEL_NAME" \
+		-v "$$(pwd)/data/public/input:/input:ro" \
+		-v "$$(pwd)/local_output:/output" \
+		$(IMAGE)
+
+docker-save:
+	podman save $(IMAGE) | gzip > $(TEAM)_$(VERSION).tar.gz
