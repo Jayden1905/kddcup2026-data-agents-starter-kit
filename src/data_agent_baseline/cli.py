@@ -1,3 +1,4 @@
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from time import perf_counter
 
@@ -33,24 +34,95 @@ ARTIFACT_RUNS_DIR = ARTIFACTS_DIR / "runs"
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
 
+PENALTY_LAMBDA = 0.2
+NULL_STRINGS = {"", "null", "none", "nan", "nat", "<na>"}
 
-def _rows_match_numeric(rows_a: list[list[str]], rows_b: list[list[str]]) -> bool:
-    """Check if rows match with numeric tolerance for floating point values."""
-    if len(rows_a) != len(rows_b):
-        return False
-    for ra, rb in zip(rows_a, rows_b):
-        if len(ra) != len(rb):
-            return False
-        for va, vb in zip(ra, rb):
-            if va == vb:
-                continue
-            try:
-                if abs(float(va) - float(vb)) < abs(float(vb)) * 1e-6:
-                    continue
-            except (ValueError, ZeroDivisionError):
-                pass
-            return False
-    return True
+
+def _normalize_cell(value: str) -> str:
+    """Normalize a cell value per official eval rules."""
+    stripped = value.strip().replace("\r\n", "\n").replace("\r", "")
+    if stripped.lower() in NULL_STRINGS:
+        return ""
+    # Try numeric
+    try:
+        d = Decimal(stripped)
+        if d.is_finite():
+            return str(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        pass
+    # Try date (YYYY-MM-DD or variants)
+    import re
+    date_match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", stripped)
+    if date_match:
+        y, m, d_val = date_match.groups()
+        return f"{y}-{int(m):02d}-{int(d_val):02d}"
+    # Try datetime with timezone → UTC
+    from datetime import datetime, timezone
+    try:
+        if "T" in stripped:
+            if stripped.endswith("Z"):
+                dt = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+                return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            elif "+" in stripped[10:] or (stripped.count("-") > 2):
+                dt = datetime.fromisoformat(stripped)
+                if dt.tzinfo is not None:
+                    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                return dt.isoformat()
+    except (ValueError, TypeError):
+        pass
+    return stripped
+
+
+def _column_signature(col_values: list[str]) -> tuple[str, ...]:
+    """Build sorted column signature from normalized cell values."""
+    return tuple(sorted(_normalize_cell(v) for v in col_values))
+
+
+def _score_prediction(
+    pred_cols: list[str], pred_rows: list[list[str]],
+    gold_cols: list[str], gold_rows: list[list[str]],
+) -> tuple[float, int, int, int]:
+    """Score prediction against gold using official column-signature matching.
+
+    Returns (score, matched, gold_count, pred_count).
+    """
+    if not gold_cols:
+        return 0.0, 0, 0, len(pred_cols)
+    if not pred_cols:
+        return 0.0, 0, len(gold_cols), 0
+
+    # Build column signatures for gold
+    gold_sigs: list[tuple[str, ...]] = []
+    for ci in range(len(gold_cols)):
+        col_vals = [row[ci] if ci < len(row) else "" for row in gold_rows]
+        gold_sigs.append(_column_signature(col_vals))
+
+    # Build column signatures for prediction
+    pred_sigs: list[tuple[str, ...]] = []
+    for ci in range(len(pred_cols)):
+        col_vals = [row[ci] if ci < len(row) else "" for row in pred_rows]
+        pred_sigs.append(_column_signature(col_vals))
+
+    # Count occurrences of each signature
+    from collections import Counter
+    gold_counter: Counter[tuple[str, ...]] = Counter(gold_sigs)
+    pred_counter: Counter[tuple[str, ...]] = Counter(pred_sigs)
+
+    # Match: for each signature, matched count = min(gold_count, pred_count)
+    matched = 0
+    for sig, g_count in gold_counter.items():
+        p_count = pred_counter.get(sig, 0)
+        matched += min(g_count, p_count)
+
+    gold_count = len(gold_cols)
+    pred_count = len(pred_cols)
+    extra = pred_count - matched
+
+    recall = matched / gold_count if gold_count > 0 else 0.0
+    penalty = PENALTY_LAMBDA * (extra / pred_count) if pred_count > 0 else 0.0
+    score = max(0.0, recall - penalty)
+
+    return score, matched, gold_count, pred_count
 
 
 def _status_value(path: Path) -> str:
@@ -231,31 +303,26 @@ def run_task_command(
     else:
         console.print("[dim](no gold answer available)[/dim]")
 
-    # Compare
+    # Score using official metric
     if gold_cols:
-        if pred_cols == gold_cols and pred_rows == gold_rows:
-            console.print("\n[bold green]✓ EXACT MATCH[/bold green]")
-        elif pred_cols == gold_cols and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
-            console.print("\n[bold green]✓ MATCH (row order differs)[/bold green]")
-        elif pred_cols == gold_cols and _rows_match_numeric(pred_rows, gold_rows):
-            console.print("\n[bold green]✓ MATCH (numeric tolerance)[/bold green]")
-        elif len(pred_cols) == len(gold_cols) and pred_rows == gold_rows:
-            console.print("\n[bold yellow]~ VALUES CORRECT (column names differ)[/bold yellow]")
-        elif len(pred_cols) == len(gold_cols) and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
-            console.print("\n[bold yellow]~ VALUES CORRECT (column names + row order differ)[/bold yellow]")
-        elif len(pred_cols) == len(gold_cols) and _rows_match_numeric(pred_rows, gold_rows):
-            console.print("\n[bold yellow]~ VALUES CORRECT (column names differ, numeric tolerance)[/bold yellow]")
+        score, matched, gold_count, pred_count = _score_prediction(
+            pred_cols, pred_rows, gold_cols, gold_rows
+        )
+        extra = pred_count - matched
+        if score == 1.0:
+            console.print(f"\n[bold green]✓ PERFECT SCORE: {score:.4f}[/bold green]")
+        elif score > 0.0:
+            console.print(
+                f"\n[bold yellow]~ PARTIAL SCORE: {score:.4f} "
+                f"(matched={matched}/{gold_count}, extra={extra})[/bold yellow]"
+            )
         elif not pred_cols:
-            console.print("\n[bold red]✗ NO PREDICTION produced[/bold red]")
+            console.print("\n[bold red]✗ NO PREDICTION produced (score=0)[/bold red]")
         else:
-            diffs: list[str] = []
-            if pred_cols != gold_cols:
-                diffs.append(f"columns: pred={pred_cols} vs gold={gold_cols}")
-            if len(pred_rows) != len(gold_rows):
-                diffs.append(f"row count: pred={len(pred_rows)} vs gold={len(gold_rows)}")
-            if not diffs:
-                diffs.append("values differ")
-            console.print(f"\n[bold red]✗ MISMATCH: {'; '.join(diffs)}[/bold red]")
+            console.print(
+                f"\n[bold red]✗ SCORE: {score:.4f} "
+                f"(matched={matched}/{gold_count}, extra={extra})[/bold red]"
+            )
 
 
 @app.command("run-benchmark")
@@ -360,6 +427,58 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+    # Score all tasks against gold
+    import csv as csv_mod
+    scores: list[tuple[str, float]] = []
+    for artifact in artifacts:
+        task_id_str = artifact.task_id
+        pred_c: list[str] = []
+        pred_r: list[list[str]] = []
+        if artifact.prediction_csv_path and artifact.prediction_csv_path.exists():
+            with open(artifact.prediction_csv_path, newline="") as f:
+                rows_all = list(csv_mod.reader(f))
+            if rows_all:
+                pred_c = rows_all[0]
+                pred_r = [r for r in rows_all[1:] if r]
+
+        gold_p = PROJECT_ROOT / "data" / "public" / "output" / task_id_str / "gold.csv"
+        gold_c: list[str] = []
+        gold_r: list[list[str]] = []
+        if gold_p.exists():
+            with open(gold_p, newline="") as f:
+                rows_all = list(csv_mod.reader(f))
+            if rows_all:
+                gold_c = rows_all[0]
+                gold_r = [r for r in rows_all[1:] if r]
+
+        if gold_c:
+            s, _, _, _ = _score_prediction(pred_c, pred_r, gold_c, gold_r)
+            scores.append((task_id_str, s))
+
+    if scores:
+        total_score = sum(s for _, s in scores)
+        avg_score = total_score / len(scores)
+        perfect_count = sum(1 for _, s in scores if s == 1.0)
+        partial_count = sum(1 for _, s in scores if 0.0 < s < 1.0)
+        zero_count = sum(1 for _, s in scores if s == 0.0)
+
+        console.print(f"\n[bold]━━━ Official Scoring ━━━[/bold]")
+        console.print(f"  Tasks scored: {len(scores)}")
+        console.print(f"  [green]Perfect (1.0): {perfect_count}[/green]")
+        console.print(f"  [yellow]Partial (>0): {partial_count}[/yellow]")
+        console.print(f"  [red]Zero: {zero_count}[/red]")
+        console.print(f"  [bold]Average Score: {avg_score:.4f}[/bold]")
+
+        # Per-task breakdown sorted by score
+        console.print(f"\n  [dim]Per-task scores:[/dim]")
+        for tid, s in sorted(scores, key=lambda x: x[1]):
+            if s == 1.0:
+                console.print(f"    [green]✓ {tid}: {s:.4f}[/green]")
+            elif s > 0.0:
+                console.print(f"    [yellow]~ {tid}: {s:.4f}[/yellow]")
+            else:
+                console.print(f"    [red]✗ {tid}: {s:.4f}[/red]")
 
 
 @app.command()
@@ -490,68 +609,59 @@ def tui(
         else:
             console.print("[dim](no gold answer available)[/dim]")
 
-        # Compare and track verdict
+        # Score using official metric
         verdict = "no_gold"
+        task_score = 0.0
         if gold_cols:
-            if pred_cols == gold_cols and pred_rows == gold_rows:
-                console.print("\n[bold green]✓ EXACT MATCH[/bold green]")
-                verdict = "exact"
-            elif pred_cols == gold_cols and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
-                console.print("\n[bold green]✓ MATCH (row order differs)[/bold green]")
-                verdict = "exact"
-            elif pred_cols == gold_cols and _rows_match_numeric(pred_rows, gold_rows):
-                console.print("\n[bold green]✓ MATCH (numeric tolerance)[/bold green]")
-                verdict = "exact"
-            elif len(pred_cols) == len(gold_cols) and pred_rows == gold_rows:
-                console.print("\n[bold yellow]~ VALUES CORRECT (column names differ)[/bold yellow]")
-                verdict = "values_ok"
-            elif len(pred_cols) == len(gold_cols) and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
-                console.print("\n[bold yellow]~ VALUES CORRECT (column names + row order differ)[/bold yellow]")
-                verdict = "values_ok"
-            elif len(pred_cols) == len(gold_cols) and _rows_match_numeric(pred_rows, gold_rows):
-                console.print("\n[bold yellow]~ VALUES CORRECT (column names differ, numeric tolerance)[/bold yellow]")
-                verdict = "values_ok"
+            task_score, matched, gold_count, pred_count = _score_prediction(
+                pred_cols, pred_rows, gold_cols, gold_rows
+            )
+            extra = pred_count - matched
+            if task_score == 1.0:
+                console.print(f"\n[bold green]✓ PERFECT SCORE: {task_score:.4f}[/bold green]")
+                verdict = "perfect"
+            elif task_score > 0.0:
+                console.print(
+                    f"\n[bold yellow]~ PARTIAL SCORE: {task_score:.4f} "
+                    f"(matched={matched}/{gold_count}, extra={extra})[/bold yellow]"
+                )
+                verdict = "partial"
             elif not pred_cols:
-                console.print("\n[bold red]✗ NO PREDICTION produced[/bold red]")
+                console.print("\n[bold red]✗ NO PREDICTION produced (score=0)[/bold red]")
                 verdict = "no_pred"
             else:
-                diffs: list[str] = []
-                if pred_cols != gold_cols:
-                    diffs.append(f"columns: pred={pred_cols} vs gold={gold_cols}")
-                if len(pred_rows) != len(gold_rows):
-                    diffs.append(f"row count: pred={len(pred_rows)} vs gold={len(gold_rows)}")
-                if not diffs:
-                    diffs.append("values differ")
-                console.print(f"\n[bold red]✗ MISMATCH: {'; '.join(diffs)}[/bold red]")
+                console.print(
+                    f"\n[bold red]✗ SCORE: {task_score:.4f} "
+                    f"(matched={matched}/{gold_count}, extra={extra})[/bold red]"
+                )
                 verdict = "wrong"
 
-        results.append((task.task_id, verdict))
+        results.append((task.task_id, verdict, task_score))
         console.print(f"\n[dim]n=next, p=prev, number=jump, q=quit[/dim]")
 
     # Summary report
     if results:
         console.print("\n[bold]━━━ Session Summary ━━━[/bold]")
         total = len(results)
-        exact = sum(1 for _, v in results if v == "exact")
-        values_ok = sum(1 for _, v in results if v == "values_ok")
-        wrong = sum(1 for _, v in results if v == "wrong")
-        no_pred = sum(1 for _, v in results if v == "no_pred")
+        perfect = sum(1 for _, v, _ in results if v == "perfect")
+        partial = sum(1 for _, v, _ in results if v == "partial")
+        wrong = sum(1 for _, v, _ in results if v == "wrong")
+        no_pred = sum(1 for _, v, _ in results if v == "no_pred")
+        total_score = sum(s for _, _, s in results)
+        avg_score = total_score / total if total > 0 else 0.0
 
         console.print(f"  Tasks run: {total}")
-        console.print(f"  [green]Exact match: {exact}[/green]")
-        console.print(f"  [yellow]Values correct: {values_ok}[/yellow]")
-        console.print(f"  [red]Wrong: {wrong}[/red]")
-        if no_pred:
-            console.print(f"  [red]No prediction: {no_pred}[/red]")
-        accuracy = (exact + values_ok) / total * 100
-        console.print(f"  [bold]Accuracy: {accuracy:.0f}% ({exact + values_ok}/{total})[/bold]")
+        console.print(f"  [green]Perfect (1.0): {perfect}[/green]")
+        console.print(f"  [yellow]Partial (>0): {partial}[/yellow]")
+        console.print(f"  [red]Zero score: {wrong + no_pred}[/red]")
+        console.print(f"  [bold]Average Score: {avg_score:.4f} (total={total_score:.4f}/{total})[/bold]")
 
         # Per-task breakdown
         console.print("\n  [dim]Breakdown:[/dim]")
-        for tid, v in results:
-            icon = {"exact": "✓", "values_ok": "~", "wrong": "✗", "no_pred": "✗", "no_gold": "?"}[v]
-            color = {"exact": "green", "values_ok": "yellow", "wrong": "red", "no_pred": "red", "no_gold": "dim"}[v]
-            console.print(f"    [{color}]{icon} {tid}[/{color}]")
+        for tid, v, s in results:
+            icon = {"perfect": "✓", "partial": "~", "wrong": "✗", "no_pred": "✗", "no_gold": "?"}[v]
+            color = {"perfect": "green", "partial": "yellow", "wrong": "red", "no_pred": "red", "no_gold": "dim"}[v]
+            console.print(f"    [{color}]{icon} {tid} (score={s:.4f})[/{color}]")
 
 
 def main() -> None:

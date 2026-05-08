@@ -45,7 +45,8 @@ SQL_RULES = [
     "Use only tables and columns shown in the schema.",
     "SELECT only columns that answer the question. Never SELECT *.",
     "Check SAMPLE DATA for date ranges and formats before writing WHERE clauses.",
-    "If a table's date range doesn't cover the period, start from a different table.",
+    "If a table's date range doesn't cover the period, start from a DIFFERENT table that has the needed dates and JOIN back.",
+    "The same column name in different tables may have DIFFERENT formats (e.g., 'YYYYMM' vs 'YYYY-MM-DD'). Always filter the table that actually contains the target value.",
     "JOIN through the full FK path. Never skip intermediate linking tables.",
     "\"X containing Y\" means filter X itself (WHERE X.prop = Y).",
     "Use LIKE '%keyword%' COLLATE NOCASE for text. Use CAST(x AS REAL) for division.",
@@ -99,7 +100,10 @@ def _build_sql_prompt(
     rules = "\n".join(f"- {r}" for r in SQL_RULES)
     if grounding_context:
         if "FORMULA" in grounding_context:
-            rules += "\n- Follow the FORMULA in SEMANTIC GROUNDING exactly."
+            if "WRONG TABLE" in grounding_context or "Filter on" in grounding_context:
+                rules += "\n- Use the FORMULA as a starting point but CONSTRAINTS override it — if a constraint says to filter a different table, do so."
+            else:
+                rules += "\n- Follow the FORMULA in SEMANTIC GROUNDING exactly."
         if "FILTER VALUES" in grounding_context:
             rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use EXACTLY the values from FILTER VALUES above. Do NOT substitute other values."
         if "SELECT THESE COLUMNS" in grounding_context:
@@ -1043,10 +1047,13 @@ RULES:
         """Check that filter values in grounding actually exist in the DB.
 
         If a value doesn't exist, try to find the closest match.
+        Also detects table mismatches: value exists in table A but formula queries table B.
         """
         known_values = grounding.get("known_values", {})
         if not known_values:
             return grounding
+
+        formula = grounding.get("formula", "")
 
         conn = sqlite3.connect(str(db_path))
         try:
@@ -1061,30 +1068,61 @@ RULES:
             for col_name, values in list(known_values.items()):
                 if not values:
                     continue
-                # Find which table has this column
-                target_table = None
+                # Find ALL tables that have this column
+                candidate_tables: list[tuple[str, str]] = []
                 for tname, cols in tables_cols.items():
-                    if col_name in cols or col_name.lower() in [c.lower() for c in cols]:
-                        target_table = tname
-                        actual_col = next(
-                            c for c in cols if c.lower() == col_name.lower()
-                        )
-                        break
-                if not target_table:
+                    col_match = next(
+                        (c for c in cols if c.lower() == col_name.lower()), None
+                    )
+                    if col_match:
+                        candidate_tables.append((tname, col_match))
+
+                if not candidate_tables:
                     continue
 
-                # Check if values exist
+                # Check each value against all candidate tables
                 for val in values:
+                    found_in: list[tuple[str, int]] = []
+                    not_found_in: list[str] = []
+                    for tname, actual_col in candidate_tables:
+                        try:
+                            result = conn.execute(
+                                f'SELECT COUNT(*) FROM "{tname}" '
+                                f'WHERE "{actual_col}" = ?', (val,)
+                            ).fetchone()
+                            if result and result[0] > 0:
+                                found_in.append((tname, result[0]))
+                            else:
+                                not_found_in.append(tname)
+                        except Exception:
+                            pass
+
+                    if found_in:
+                        self._log("filter_verified",
+                                  f"{col_name}='{val}' exists in {found_in[0][0]} ({found_in[0][1]} rows)")
+                        # Check for table mismatch: value exists in one table but
+                        # formula references a different table
+                        if not_found_in and formula:
+                            formula_tables = set()
+                            for nf_table in not_found_in:
+                                if nf_table.lower() in formula.lower():
+                                    formula_tables.add(nf_table)
+                            if formula_tables:
+                                correct_table = found_in[0][0]
+                                wrong_tables = formula_tables
+                                rule = (
+                                    f"{col_name}='{val}' exists in {correct_table}, "
+                                    f"NOT in {', '.join(wrong_tables)}. "
+                                    f"Filter on {correct_table}.{col_name} and JOIN to get needed data."
+                                )
+                                domain_rules = grounding.setdefault("domain_rules", [])
+                                domain_rules.append(rule)
+                                self._log("filter_table_mismatch", rule)
+                        continue
+
+                    # Value not found in any table — try fuzzy matching on first candidate
+                    target_table, actual_col = candidate_tables[0]
                     try:
-                        result = conn.execute(
-                            f'SELECT COUNT(*) FROM "{target_table}" '
-                            f'WHERE "{actual_col}" = ?', (val,)
-                        ).fetchone()
-                        if result and result[0] > 0:
-                            self._log("filter_verified",
-                                      f"{col_name}='{val}' exists in {target_table} ({result[0]} rows)")
-                            continue
-                        # Value not found — try LIKE search for close match
                         like_result = conn.execute(
                             f'SELECT DISTINCT "{actual_col}" FROM "{target_table}" '
                             f'WHERE "{actual_col}" LIKE ? LIMIT 5',
@@ -1097,7 +1135,6 @@ RULES:
                                       f"using {known_values[col_name]}")
                             break
                         # Time format mismatch: try stripping HH: prefix or converting
-                        # e.g., '0:01:54' → '1:54' or '1:54%'
                         time_match = re.match(r'^(\d+):(\d+):(\d+)$', str(val))
                         if time_match:
                             mins = int(time_match.group(2))
@@ -1240,27 +1277,58 @@ RULES:
                 r"""(\w+)\.(\w+)\s+(?:=\s*'([^']*)'|IN\s*\('([^']*)'\))""",
                 where_clause
             )
+            all_tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+            all_tables_cols: dict[str, list[str]] = {}
+            for row in all_tables:
+                t = row[0]
+                all_tables_cols[t] = [c[1] for c in conn.execute(f'PRAGMA table_info("{t}")').fetchall()]
+
             for alias, col, val1, val2 in conditions:
                 val = val1 or val2
                 if not val:
                     continue
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
-                    tname = row[0]
-                    cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                # Find the table the SQL is actually querying (by alias match or first match)
+                queried_table = None
+                for tname, cols in all_tables_cols.items():
                     if col in cols:
-                        count = conn.execute(
+                        queried_table = tname
+                        break
+                if not queried_table:
+                    continue
+
+                count = conn.execute(
+                    f'SELECT COUNT(*) FROM "{queried_table}" WHERE "{col}" = ?', (val,)
+                ).fetchone()[0]
+                if count == 0:
+                    distinct = conn.execute(
+                        f'SELECT DISTINCT "{col}" FROM "{queried_table}" WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 5'
+                    ).fetchall()
+                    actual_vals = [r[0] for r in distinct]
+                    # Check if value exists in a DIFFERENT table with the same column
+                    alt_table = None
+                    for tname, cols in all_tables_cols.items():
+                        if tname == queried_table or col not in cols:
+                            continue
+                        alt_count = conn.execute(
                             f'SELECT COUNT(*) FROM "{tname}" WHERE "{col}" = ?', (val,)
                         ).fetchone()[0]
-                        if count == 0:
-                            distinct = conn.execute(
-                                f'SELECT DISTINCT "{col}" FROM "{tname}" WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 5'
-                            ).fetchall()
-                            actual_vals = [r[0] for r in distinct]
-                            bad_filters.append(
-                                f"WRONG FILTER: {col}='{val}' has 0 matches in {tname}. "
-                                f"Actual values in {tname}.{col}: {actual_vals}"
-                            )
-                        break
+                        if alt_count > 0:
+                            alt_table = tname
+                            break
+                    if alt_table:
+                        bad_filters.append(
+                            f"WRONG TABLE: {col}='{val}' has 0 matches in {queried_table} "
+                            f"(actual values: {actual_vals}), but EXISTS in {alt_table} "
+                            f"({alt_count} rows). Filter on {alt_table}.{col} instead and "
+                            f"JOIN {alt_table} to get the rows you need."
+                        )
+                    else:
+                        bad_filters.append(
+                            f"WRONG FILTER: {col}='{val}' has 0 matches in {queried_table}. "
+                            f"Actual values in {queried_table}.{col}: {actual_vals}"
+                        )
 
             # Check comparison filters on NULL columns: col < N, col > N
             comparisons = re.findall(
