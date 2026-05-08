@@ -100,15 +100,16 @@ def _build_sql_prompt(
     rules = "\n".join(f"- {r}" for r in SQL_RULES)
     has_gaps = bool(gaps)
     if grounding_context:
-        if "FORMULA" in grounding_context:
-            if "WRONG TABLE" in grounding_context or "Filter on" in grounding_context:
-                rules += "\n- Use the FORMULA as a starting point but CONSTRAINTS override it — if a constraint says to filter a different table, do so."
-            else:
-                rules += "\n- Follow the FORMULA in SEMANTIC GROUNDING exactly."
-        if "FILTER VALUES" in grounding_context:
-            if has_gaps:
-                rules += "\n- Use FILTER VALUES as guidance, but if PREVIOUS ATTEMPT FAILED mentions wrong filters or ranges, fix them accordingly."
-            else:
+        if has_gaps:
+            rules += "\n- PREVIOUS ATTEMPT FAILED feedback takes PRIORITY over SEMANTIC GROUNDING. If the feedback contradicts the grounding (formula, filter values, columns), follow the feedback."
+            rules += "\n- Use SEMANTIC GROUNDING as general context, but fix what the feedback says is wrong."
+        else:
+            if "FORMULA" in grounding_context:
+                if "WRONG TABLE" in grounding_context or "Filter on" in grounding_context:
+                    rules += "\n- Use the FORMULA as a starting point but CONSTRAINTS override it — if a constraint says to filter a different table, do so."
+                else:
+                    rules += "\n- Follow the FORMULA in SEMANTIC GROUNDING exactly."
+            if "FILTER VALUES" in grounding_context:
                 rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use EXACTLY the values from FILTER VALUES above. Do NOT substitute other values."
         if "SELECT THESE COLUMNS" in grounding_context:
             rules += "\n- SELECT the columns listed in SELECT THESE COLUMNS."
@@ -529,14 +530,20 @@ class QuestionDrivenAgent:
                     sql_error = self.steps[-1].get("detail", "") if self.steps else ""
                     data_result = {"columns": [], "rows": []}
 
+                # Detect duplicate SQL — if model generated the same query, force break
+                sql_normalized = " ".join(sql.split()).strip().upper()
+                if sql_normalized in {" ".join(s.split()).strip().upper() for s in failed_sqls}:
+                    self._log("evaluate", "Verdict: duplicate SQL — stopping iterations")
+                    break
+
                 # Force-incomplete on empty results (skip LLM eval)
                 if not data_result.get("rows"):
                     if sql_error:
                         self._log("evaluate", f"Verdict: incomplete (SQL error: {sql_error})")
-                        all_gaps.add(f"SQL ERROR: {sql_error}. Fix the syntax.")
+                        error_hint = self._diagnose_sql_error(db_path, sql, sql_error)
+                        all_gaps.add(f"SQL ERROR: {sql_error}. {error_hint}")
                     else:
                         self._log("evaluate", "Verdict: incomplete (empty result)")
-                        # Diagnose which filters are wrong
                         diag = self._diagnose_empty_result(db_path, sql)
                         if diag:
                             all_gaps.add(diag)
@@ -545,7 +552,7 @@ class QuestionDrivenAgent:
                                 "Query returned 0 rows — check table names, "
                                 "join columns, and filter values against SAMPLE DATA"
                             )
-                    failed_sqls.append(sql[:200])
+                    failed_sqls.append(sql)
                     gaps_text = "\n".join(f"- {g}" for g in all_gaps)
                     gaps_text += "\n".join(
                         f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
@@ -1328,6 +1335,41 @@ RULES:
         if diagnostics:
             return "ACTUAL DATA IN DB:\n" + "\n".join(diagnostics)
         return ""
+
+    def _diagnose_sql_error(self, db_path: Path, sql: str, error: str) -> str:
+        """When SQL has a column/table error, show what actually exists."""
+        if not db_path.exists():
+            return ""
+
+        conn = sqlite3.connect(str(db_path))
+        hints: list[str] = []
+        try:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+
+            if "no such column" in error:
+                # Extract the bad column reference from error
+                # e.g. "no such column: e.event_name" or "no such column: format"
+                bad_col = error.split("no such column:")[-1].strip()
+                # If it has a table alias prefix, extract just the column name
+                bare_col = bad_col.split(".")[-1] if "." in bad_col else bad_col
+
+                # Find tables referenced in the SQL and show their actual columns
+                for tname in tables:
+                    if tname.lower() in sql.lower():
+                        cols = [c[1] for c in conn.execute(
+                            f'PRAGMA table_info("{tname}")'
+                        ).fetchall()]
+                        hints.append(f"Table '{tname}' has columns: {cols}")
+
+            elif "no such table" in error:
+                hints.append(f"Available tables: {tables}")
+
+        finally:
+            conn.close()
+
+        return "\n".join(hints)
 
     # ------------------------------------------------------------------
     # Helpers
