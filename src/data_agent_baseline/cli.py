@@ -34,6 +34,25 @@ app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
 
 
+def _rows_match_numeric(rows_a: list[list[str]], rows_b: list[list[str]]) -> bool:
+    """Check if rows match with numeric tolerance for floating point values."""
+    if len(rows_a) != len(rows_b):
+        return False
+    for ra, rb in zip(rows_a, rows_b):
+        if len(ra) != len(rb):
+            return False
+        for va, vb in zip(ra, rb):
+            if va == vb:
+                continue
+            try:
+                if abs(float(va) - float(vb)) < abs(float(vb)) * 1e-6:
+                    continue
+            except (ValueError, ZeroDivisionError):
+                pass
+            return False
+    return True
+
+
 def _status_value(path: Path) -> str:
     return "present" if path.exists() else "missing"
 
@@ -218,10 +237,14 @@ def run_task_command(
             console.print("\n[bold green]✓ EXACT MATCH[/bold green]")
         elif pred_cols == gold_cols and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
             console.print("\n[bold green]✓ MATCH (row order differs)[/bold green]")
+        elif pred_cols == gold_cols and _rows_match_numeric(pred_rows, gold_rows):
+            console.print("\n[bold green]✓ MATCH (numeric tolerance)[/bold green]")
         elif len(pred_cols) == len(gold_cols) and pred_rows == gold_rows:
             console.print("\n[bold yellow]~ VALUES CORRECT (column names differ)[/bold yellow]")
         elif len(pred_cols) == len(gold_cols) and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
             console.print("\n[bold yellow]~ VALUES CORRECT (column names + row order differ)[/bold yellow]")
+        elif len(pred_cols) == len(gold_cols) and _rows_match_numeric(pred_rows, gold_rows):
+            console.print("\n[bold yellow]~ VALUES CORRECT (column names differ, numeric tolerance)[/bold yellow]")
         elif not pred_cols:
             console.print("\n[bold red]✗ NO PREDICTION produced[/bold red]")
         else:
@@ -476,11 +499,17 @@ def tui(
             elif pred_cols == gold_cols and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
                 console.print("\n[bold green]✓ MATCH (row order differs)[/bold green]")
                 verdict = "exact"
+            elif pred_cols == gold_cols and _rows_match_numeric(pred_rows, gold_rows):
+                console.print("\n[bold green]✓ MATCH (numeric tolerance)[/bold green]")
+                verdict = "exact"
             elif len(pred_cols) == len(gold_cols) and pred_rows == gold_rows:
                 console.print("\n[bold yellow]~ VALUES CORRECT (column names differ)[/bold yellow]")
                 verdict = "values_ok"
             elif len(pred_cols) == len(gold_cols) and {tuple(r) for r in pred_rows} == {tuple(r) for r in gold_rows}:
                 console.print("\n[bold yellow]~ VALUES CORRECT (column names + row order differ)[/bold yellow]")
+                verdict = "values_ok"
+            elif len(pred_cols) == len(gold_cols) and _rows_match_numeric(pred_rows, gold_rows):
+                console.print("\n[bold yellow]~ VALUES CORRECT (column names differ, numeric tolerance)[/bold yellow]")
                 verdict = "values_ok"
             elif not pred_cols:
                 console.print("\n[bold red]✗ NO PREDICTION produced[/bold red]")

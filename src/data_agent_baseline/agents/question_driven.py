@@ -868,6 +868,18 @@ RULES:
         if not parts:
             return knowledge_text[:2000]
 
+        # Deterministic: find field definitions in knowledge_text that match question words
+        q_words = set(re.findall(r'\b[a-z_]{3,}\b', question.lower()))
+        # Match lines like "- **field_name**: description" or "- field_name: description"
+        field_defs = re.findall(
+            r'-\s+\*{0,2}(\w+)\*{0,2}\s*:\s*(.+)',
+            knowledge_text,
+        )
+        anchor_lower = "\n".join(parts).lower()
+        for field_name, definition in field_defs:
+            if field_name.lower() in q_words and field_name.lower() not in anchor_lower:
+                parts.append(f"- {field_name}: {definition.strip()}")
+
         anchor_text = "\n".join(parts)
 
         # Translate formula anchors to SQL-ready form based on question intent
