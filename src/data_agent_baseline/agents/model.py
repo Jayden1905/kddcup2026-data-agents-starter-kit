@@ -71,7 +71,7 @@ class OpenAIModelAdapter:
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
         try:
-            response = client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs, timeout=REQUEST_TIMEOUT)
         except (APITimeoutError, APIError) as exc:
             raise RuntimeError(f"Model API error: {exc}") from exc
 
@@ -129,8 +129,9 @@ class AzureOpenAIModelAdapter:
                     {"role": message.role, "content": message.content} for message in messages
                 ],
                 temperature=self.temperature,
+                timeout=REQUEST_TIMEOUT,
             )
-        except APIError as exc:
+        except (APITimeoutError, APIError) as exc:
             raise RuntimeError(f"Azure OpenAI request failed: {exc}") from exc
 
         choices = response.choices or []

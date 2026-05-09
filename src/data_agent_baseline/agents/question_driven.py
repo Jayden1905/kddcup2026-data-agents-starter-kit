@@ -104,16 +104,15 @@ def _build_sql_prompt(
     parts.append(f"\nDATABASE SCHEMA:\n{kg_context}")
 
     if sample_data:
-        parts.append(f"\nSAMPLE DATA:\n{sample_data[:4000]}")
+        parts.append(f"\nSAMPLE DATA:\n{sample_data[:1500]}")
 
     if grounding_context:
         parts.append(f"\n{grounding_context}")
+    elif knowledge_text:
+        parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1000]}")
 
     if column_hints:
         parts.append(f"\n{column_hints}")
-
-    if knowledge_text:
-        parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:2000]}")
 
     if gaps:
         parts.append(f"\nPREVIOUS ATTEMPT FAILED — fix these issues:\n{gaps}")
@@ -129,13 +128,11 @@ def _build_sql_prompt(
             rules += "\n- Use GROUNDING CONTEXT for filter values and join paths, but fix what the feedback says is wrong."
         else:
             if "FILTER VALUES" in grounding_context:
-                rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use EXACTLY the values from FILTER VALUES above. Do NOT substitute other values."
+                rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use the values from FILTER VALUES above. Do NOT substitute other values. If CONSTRAINTS say to use LIKE for a value, use LIKE with that value as prefix."
         if "DATA FORMAT WARNINGS" in grounding_context:
             rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully. Handle time strings, relative values, and encoded formats as described."
         if "IMPORTANT" in grounding_context and "RE-READ THE QUESTION" in grounding_context:
             rules += "\n- ⚠️ Read the IMPORTANT section carefully. It flags a potential column mismatch — verify your SELECT/GROUP BY uses the column the question actually refers to."
-    elif knowledge_text and "formula" in knowledge_text.lower():
-        rules += "\n- If DOMAIN KNOWLEDGE defines a formula, follow it exactly."
     parts.append(f"\nRULES:\n{rules}")
 
     # Put mandatory filter constraint LAST so it's freshest in model's context (only if no gaps)
@@ -573,9 +570,9 @@ class QuestionDrivenAgent:
                         all_gaps.add(f"SQL ERROR: {sql_error}. Check column names and table names against the DATABASE SCHEMA.")
                     else:
                         self._log("evaluate", "Verdict: incomplete (empty result)")
-                        # Extract WHERE values from the failed SQL and flag them
                         where_hint = self._diagnose_empty_from_sql(sql, sql_sample_data)
                         if where_hint:
+                            self._log("diagnosis", where_hint)
                             all_gaps.add(where_hint)
                         else:
                             all_gaps.add(
@@ -584,9 +581,8 @@ class QuestionDrivenAgent:
                             )
                     failed_sqls.append(sql)
                     gaps_text = "\n".join(f"- {g}" for g in all_gaps)
-                    gaps_text += "\n".join(
-                        f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
-                    )
+                    # Only include last failed SQL (truncated) to limit prompt size
+                    gaps_text += f"\n- LAST FAILED SQL (do not repeat): {sql[:150]}"
                     continue
 
                 # Skip evaluate on last iteration — just use what we have
@@ -605,9 +601,8 @@ class QuestionDrivenAgent:
                 all_gaps.add(feedback)
                 failed_sqls.append(sql)
                 gaps_text = "\n".join(f"- {g}" for g in all_gaps)
-                gaps_text += "\n".join(
-                    f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
-                )
+                # Only include last failed SQL (truncated) to limit prompt size
+                gaps_text += f"\n- LAST FAILED SQL (do not repeat): {sql[:150]}"
 
             # Reject results where all values are NULL/None
             if data_result and data_result.get("rows"):
@@ -640,7 +635,9 @@ class QuestionDrivenAgent:
                     if not all_null:
                         data_result = hyp_result
                         sql = hyp_sql
-                        self._log("multi_hypothesis_ok", f"Alternative SQL returned {len(hyp_result['rows'])} rows")
+                        self._log("multi_hypothesis_ok",
+                                  f"cols={hyp_result.get('columns')}, rows={len(hyp_result['rows'])}, "
+                                  f"SQL: {hyp_sql[:150]}")
                     else:
                         self._log("multi_hypothesis_null", "Multi-hypothesis also returned NULL — skipping")
 
@@ -1548,9 +1545,31 @@ RULES:
                                               f"Moved filter from {col_name} to {correct_key}")
                         continue
 
-                    # Value not found in any table — try fuzzy matching on first candidate
+                    # Value not found — reformat based on actual column data
                     target_table, actual_col = candidate_tables[0]
                     try:
+                        # Get sample values from the column to understand its format
+                        sample_vals = conn.execute(
+                            f'SELECT DISTINCT "{actual_col}" FROM "{target_table}" '
+                            f'WHERE "{actual_col}" IS NOT NULL AND "{actual_col}" != \'\' '
+                            f'LIMIT 10',
+                        ).fetchall()
+                        sample_strs = [str(r[0]) for r in sample_vals if r[0]]
+
+                        reformatted = self._reformat_filter_value(val, sample_strs)
+                        if reformatted and reformatted != val:
+                            known_values[col_name] = [reformatted]
+                            # Add a domain rule about how to use this value
+                            domain_rules = grounding.setdefault("domain_rules", [])
+                            domain_rules.append(
+                                f"Value '{val}' reformatted to '{reformatted}' to match "
+                                f"actual {target_table}.{actual_col} format. Use LIKE '{reformatted}%' for matching."
+                            )
+                            self._log("filter_reformat",
+                                      f"{col_name}: '{val}' → '{reformatted}' (matched column format)")
+                            break
+
+                        # Fallback: simple LIKE match
                         like_result = conn.execute(
                             f'SELECT DISTINCT "{actual_col}" FROM "{target_table}" '
                             f'WHERE "{actual_col}" LIKE ? LIMIT 5',
@@ -1569,6 +1588,51 @@ RULES:
 
         grounding["known_values"] = known_values
         return grounding
+
+    def _reformat_filter_value(self, val: str, sample_strs: list[str]) -> str:
+        """Reformat a filter value to match the column's actual data format.
+
+        Handles time format conversions like:
+          '0:01:54' (h:mm:ss) → '1:54' (m:ss) when column has 'm:ss.ms' format
+          '1:54' (m:ss) → '1:54' when column has 'm:ss.ms' format (use as LIKE prefix)
+          Integer dates ↔ string dates
+        """
+        if not val or not sample_strs:
+            return ""
+
+        # Detect column format from samples
+        time_ms_pattern = re.compile(r'^\d{1,2}:\d{2}\.\d+$')  # m:ss.ms (e.g., '1:26.714')
+        time_hms_pattern = re.compile(r'^\d{1,2}:\d{2}:\d{2}$')  # h:mm:ss (e.g., '0:01:54')
+        time_ms_short = re.compile(r'^\d{1,2}:\d{2}$')  # m:ss (e.g., '1:54')
+
+        col_has_ms_format = any(time_ms_pattern.match(s) for s in sample_strs[:5])
+
+        # Case 1: value is h:mm:ss ('0:01:54') but column uses m:ss.ms ('1:54.xxx')
+        if time_hms_pattern.match(val) and col_has_ms_format:
+            parts = val.split(":")
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+            total_minutes = hours * 60 + minutes
+            # Convert to m:ss format for LIKE prefix matching
+            return f"{total_minutes}:{seconds:02d}"
+
+        # Case 2: value is m:ss ('1:54') but column uses m:ss.ms — already compatible as LIKE prefix
+        if time_ms_short.match(val) and col_has_ms_format:
+            return val
+
+        # Case 3: integer date (20130601) vs string date ('2013-06-01')
+        if re.match(r'^\d{8}$', val):
+            # Check if column has 'YYYY-MM-DD' format
+            if any(re.match(r'^\d{4}-\d{2}-\d{2}', s) for s in sample_strs[:5]):
+                return f"{val[:4]}-{val[4:6]}-{val[6:8]}"
+
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', val):
+            # Check if column has integer date format
+            if any(re.match(r'^\d{8}$', s) for s in sample_strs[:5]):
+                return val.replace("-", "")
+
+        return ""
 
 
     def _diagnose_empty_from_sql(self, sql: str, sample_data: str) -> str:
@@ -1782,64 +1846,83 @@ RULES:
         grounding_context: str,
         knowledge_text: str,
     ) -> str:
-        """Probe DB for actual values that match question filter terms."""
+        """Probe DB for actual values that match question filter terms.
+        Only checks each value against its designated column (from grounding)."""
         if not db_path or not db_path.exists():
             return ""
 
-        # Extract filter terms from grounding known_values and question keywords
-        # Find quoted terms and meaningful nouns from the question
-        quoted_terms = re.findall(r'"([^"]+)"|\'([^\']+)\'', question)
-        quoted = [t[0] or t[1] for t in quoted_terms]
-
-        # Also extract key terms from grounding
-        grounding_values: list[str] = []
+        # Parse grounding filter values WITH their column names: {table.col: [values]}
+        targeted: dict[str, list[str]] = {}
         if "FILTER VALUES:" in grounding_context:
             fv_section = grounding_context.split("FILTER VALUES:")[1].split("\n\n")[0]
             for line in fv_section.strip().split("\n"):
-                vals = re.findall(r":\s*(.+)", line)
-                if vals:
-                    grounding_values.extend(v.strip() for v in vals[0].split(","))
+                match = re.match(r"\s*(\S+):\s*(.+)", line)
+                if match:
+                    col_key = match.group(1).strip()
+                    vals = [v.strip().strip("'\"") for v in match.group(2).split(",")]
+                    targeted[col_key] = [v for v in vals if v and len(v) >= 2]
 
-        all_terms = quoted + grounding_values
-        if not all_terms:
+        if not targeted:
             return ""
 
         conn = sqlite3.connect(str(db_path))
         discoveries: list[str] = []
         try:
-            for table in kg.tables:
-                cols = [c[1] for c in conn.execute(
-                    f'PRAGMA table_info("{table.name}")'
-                ).fetchall()]
-                for col in cols:
-                    for term in all_terms:
-                        term_clean = term.strip("'\"")
-                        if not term_clean or len(term_clean) < 2:
-                            continue
-                        try:
-                            # Check if the exact value exists
-                            exact = conn.execute(
-                                f'SELECT COUNT(*) FROM "{table.name}" WHERE "{col}" = ?',
-                                (term_clean,)
-                            ).fetchone()[0]
-                            if exact > 0:
-                                continue  # Value exists, no problem
+            for col_key, terms in targeted.items():
+                # Parse table.col format
+                if "." in col_key:
+                    table_name, col_name = col_key.split(".", 1)
+                else:
+                    continue
 
-                            # Check LIKE match
-                            like_results = conn.execute(
-                                f'SELECT DISTINCT "{col}" FROM "{table.name}" '
-                                f'WHERE "{col}" LIKE ? COLLATE NOCASE LIMIT 5',
-                                (f'%{term_clean}%',)
-                            ).fetchall()
-                            if like_results:
-                                vals = [r[0] for r in like_results if r[0]]
-                                if vals:
-                                    discoveries.append(
-                                        f"  '{term_clean}' not found exactly in {table.name}.{col}, "
-                                        f"but LIKE matches: {vals}"
-                                    )
-                        except Exception:
+                # Verify table exists
+                table_exists = conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                    (table_name,)
+                ).fetchone()[0]
+                if not table_exists:
+                    continue
+
+                # Verify column exists
+                col_info = conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+                actual_cols = [c[1] for c in col_info]
+                actual_col = next((c for c in actual_cols if c.lower() == col_name.lower()), None)
+                if not actual_col:
+                    continue
+
+                for term in terms:
+                    try:
+                        exact = conn.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}" WHERE "{actual_col}" = ?',
+                            (term,)
+                        ).fetchone()[0]
+                        if exact > 0:
                             continue
+
+                        # Try numeric match for ID-like columns
+                        if term.isdigit():
+                            exact_num = conn.execute(
+                                f'SELECT COUNT(*) FROM "{table_name}" WHERE "{actual_col}" = ?',
+                                (int(term),)
+                            ).fetchone()[0]
+                            if exact_num > 0:
+                                continue
+
+                        # LIKE match only on the designated column
+                        like_results = conn.execute(
+                            f'SELECT DISTINCT "{actual_col}" FROM "{table_name}" '
+                            f'WHERE CAST("{actual_col}" AS TEXT) LIKE ? COLLATE NOCASE LIMIT 5',
+                            (f'%{term}%',)
+                        ).fetchall()
+                        if like_results:
+                            vals = [r[0] for r in like_results if r[0]]
+                            if vals:
+                                discoveries.append(
+                                    f"  '{term}' not found exactly in {table_name}.{actual_col}, "
+                                    f"but LIKE matches: {vals}"
+                                )
+                    except Exception:
+                        continue
         finally:
             conn.close()
 
@@ -2010,28 +2093,85 @@ RULES:
         if not hypotheses:
             return None, ""
 
-        # Execute each hypothesis and return the first that produces rows
-        best_result = None
-        best_sql = ""
-        best_rows = 0
+        # Filter to valid hypotheses with SQL
+        valid_hyps = [h for h in hypotheses[:3] if h.get("sql", "").strip()]
+        if not valid_hyps:
+            return None, ""
 
-        for hyp in hypotheses[:3]:
-            hyp_sql = hyp.get("sql", "")
-            if not hyp_sql:
+        # Log all hypotheses for debugging
+        for i, hyp in enumerate(valid_hyps):
+            self._log("hypothesis_generated",
+                      f"Option {i}: {hyp.get('reasoning', '')[:100]} | SQL: {hyp['sql'][:150]}")
+
+        # LLM picks the best hypothesis by reasoning — NO execution yet
+        if len(valid_hyps) == 1:
+            pick_idx = 0
+        else:
+            options_text = ""
+            for i, hyp in enumerate(valid_hyps):
+                options_text += f"\nOPTION {i}:\n  Reasoning: {hyp.get('reasoning', '')[:150]}\n  SQL: {hyp['sql'][:200]}\n"
+
+            pick_prompt = f"""QUESTION: {question}
+
+Multiple SQL interpretations were generated. Which one BEST answers the question?
+
+{options_text}
+
+Return ONLY: {{"pick": 0}}  (the index of the best option)
+
+RULES:
+- Pick the option whose SQL columns and filters most directly answer what the question asks.
+- "list all X" → prefer the option that SELECTs identifiers of X.
+- If the question asks for a specific value, prefer the more focused interpretation.
+- If the question asks for "all" or "list", prefer the broader interpretation."""
+
+            messages = [ModelMessage(role="user", content=pick_prompt)]
+            raw = self._model_call_with_retry(messages)
+            pick_parsed = self._parse_json(raw)
+
+            pick_idx = 0
+            if isinstance(pick_parsed, dict) and "pick" in pick_parsed:
+                idx = pick_parsed["pick"]
+                if isinstance(idx, int) and 0 <= idx < len(valid_hyps):
+                    pick_idx = idx
+
+        # Execute ONLY the chosen hypothesis
+        chosen = valid_hyps[pick_idx]
+        self._log("hypothesis_picked", f"Option {pick_idx}: {chosen.get('reasoning', '')[:80]}")
+        self._log("hypothesis_sql", chosen["sql"])
+        result = self._try_sql(db_path, chosen["sql"])
+
+        if result and result.get("rows"):
+            all_null = all(
+                all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                for row in result["rows"]
+            )
+            if not all_null:
+                self._log("hypothesis_result",
+                          f"cols={result['columns']}, rows={len(result['rows'])}, "
+                          f"sample={result['rows'][:3]}")
+                return result, chosen["sql"]
+
+        self._log("hypothesis_empty", f"Option {pick_idx} returned no data — trying others")
+
+        # If chosen one failed, try the others in order
+        for i, hyp in enumerate(valid_hyps):
+            if i == pick_idx:
                 continue
-
-            result = self._try_sql(db_path, hyp_sql)
+            self._log("hypothesis_fallback_try", f"Option {i}: {hyp['sql'][:150]}")
+            result = self._try_sql(db_path, hyp["sql"])
             if result and result.get("rows"):
-                row_count = len(result["rows"])
-                self._log("hypothesis_tested",
-                          f"{hyp.get('reasoning', '')[:60]} → {row_count} rows")
-                # Prefer the result with most rows (but not too many — likely wrong)
-                if row_count > best_rows and row_count <= 100:
-                    best_result = result
-                    best_sql = hyp_sql
-                    best_rows = row_count
+                all_null = all(
+                    all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                    for row in result["rows"]
+                )
+                if not all_null:
+                    self._log("hypothesis_fallback",
+                              f"Option {i} succeeded: cols={result['columns']}, "
+                              f"rows={len(result['rows'])}, sample={result['rows'][:3]}")
+                    return result, hyp["sql"]
 
-        return best_result, best_sql
+        return None, ""
 
     # ------------------------------------------------------------------
     # Python fallback: when SQL can't solve it, write Python
