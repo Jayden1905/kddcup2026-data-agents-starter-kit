@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 600  # seconds per API call
+REQUEST_TIMEOUT = 60  # seconds per API call
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,10 +114,12 @@ class AzureOpenAIModelAdapter:
         if not self.api_key:
             raise RuntimeError("Missing Azure OpenAI API key in config.agent.api_key.")
 
+        from httpx import Timeout
         client = AzureOpenAI(
             api_key=self.api_key,
             api_version=self.api_version,
             azure_endpoint=self.endpoint,
+            timeout=Timeout(REQUEST_TIMEOUT, connect=10.0),
         )
 
         try:

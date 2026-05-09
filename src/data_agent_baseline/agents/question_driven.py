@@ -544,6 +544,12 @@ class QuestionDrivenAgent:
                     column_hints=col_hints,
                     grounding_context=grounding_context,
                 )
+
+                if not sql:
+                    self._log("sql_generated", "(empty — LLM timeout or parse failure)")
+                    all_gaps.add("SQL generation failed (timeout). Retry.")
+                    continue
+
                 self._log("sql_generated", sql)
 
                 # Detect duplicate SQL BEFORE execution — save time
@@ -2544,8 +2550,16 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
         return {}
 
     def _model_call_with_retry(self, messages: list[ModelMessage]) -> str:
-        """Call model. Raises on API failure to stop the task."""
-        return self.model.complete(messages)
+        """Call model with 60s timeout. Returns empty string on timeout/API error."""
+        try:
+            result = self.model.complete(messages)
+            return result if result else ""
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if "timeout" in err_msg or "connection" in err_msg or "api" in err_msg:
+                self._log("llm_error", f"LLM call failed: {str(e)[:100]}")
+                return ""
+            raise
 
     def _log(self, action: str, detail: str) -> None:
         """Log a pipeline step."""
