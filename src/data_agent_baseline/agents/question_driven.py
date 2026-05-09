@@ -2347,8 +2347,8 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             return None
         conn = None
         try:
-            conn = sqlite3.connect(str(db_path), timeout=10)
-            conn.execute("PRAGMA busy_timeout = 10000")
+            conn = sqlite3.connect(str(db_path), timeout=30)
+            conn.execute("PRAGMA busy_timeout = 30000")
             tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
             if not tables:
                 self._log("sql_error", f"DB empty (0 tables): {db_path}")
