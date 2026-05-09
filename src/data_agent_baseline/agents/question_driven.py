@@ -412,8 +412,13 @@ class QuestionDrivenAgent:
         self._start_time = time.monotonic()
         context_dir = task.context_dir
         question = task.question
-        self._log_file = context_dir / "_agent.log"
-        self._log_file.write_text(f"=== {task.task_id} ===\nQ: {question}\n\n")
+        self._log_file: Path | None = None
+        try:
+            log_path = context_dir / "_agent.log"
+            log_path.write_text(f"=== {task.task_id} ===\nQ: {question}\n\n")
+            self._log_file = log_path
+        except OSError:
+            pass
 
         # Clean up stale DB
         stale_db = context_dir / CONSOLIDATED_DB_NAME
@@ -438,8 +443,14 @@ class QuestionDrivenAgent:
                     pass
             db_path = consolidate_to_sqlite(context_dir)
             if not db_path or not db_path.exists():
+                # Fallback: try context_dir, then /tmp
+                import tempfile as _tf
                 db_path = context_dir / CONSOLIDATED_DB_NAME
-                sqlite3.connect(str(db_path)).close()
+                try:
+                    sqlite3.connect(str(db_path)).close()
+                except OSError:
+                    db_path = Path(_tf.gettempdir()) / f"_consolidated_{context_dir.name}.db"
+                    sqlite3.connect(str(db_path)).close()
 
             # Track which tables came from structured data (CSV/JSON)
             structured_tables: list[str] = []

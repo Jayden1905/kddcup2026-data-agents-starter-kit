@@ -549,7 +549,7 @@ def _attach_sqlite_db(conn: sqlite3.Connection, db_path: Path, alias: str) -> li
         return []
 
 
-def consolidate_to_sqlite(context_dir: Path) -> Path | None:
+def consolidate_to_sqlite(context_dir: Path, output_dir: Path | None = None) -> Path | None:
     csv_files = sorted(
         p for p in context_dir.rglob("*.csv") if not p.name.startswith("_")
     )
@@ -564,14 +564,28 @@ def consolidate_to_sqlite(context_dir: Path) -> Path | None:
     if source_count == 0:
         return None
 
-    db_path = context_dir / CONSOLIDATED_DB_NAME
-    if db_path.exists():
-        db_path.unlink()
+    # Try output_dir first, then context_dir, then /tmp
+    target_dir = output_dir or context_dir
+    db_path = target_dir / CONSOLIDATED_DB_NAME
+    try:
+        if db_path.exists():
+            db_path.unlink()
+    except OSError:
+        pass
     try:
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA journal_mode=DELETE")
     except Exception:
-        return None
+        # context_dir is read-only — fall back to /tmp
+        import tempfile
+        db_path = Path(tempfile.gettempdir()) / f"_consolidated_{context_dir.name}.db"
+        if db_path.exists():
+            db_path.unlink()
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except Exception:
+            return None
 
     loaded_tables: list[str] = []
     try:
