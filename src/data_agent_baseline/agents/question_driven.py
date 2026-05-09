@@ -60,7 +60,7 @@ SQL_RULES = [
     "When the question says 'per unit/per item/each/per person', compute a ratio (total ÷ count) — do NOT compare a total column directly.",
     "Do NOT use GROUP BY + aggregate (SUM/AVG) unless the question explicitly asks for totals or averages. 'lowest/highest X' means MIN/MAX of individual rows, not grouped sums.",
     # Scope/population rules
-    "POPULATION vs METRIC: 'In X, what is Y?' or 'Among X, what is Y?' → X defines the WHERE filter (population/denominator), Y is what you compute ON that filtered set. Example: 'In heroes with height 150-180, what % are Marvel?' → WHERE height BETWEEN 150 AND 180, then compute COUNT(Marvel)/COUNT(*)*100.",
+    "POPULATION vs METRIC: 'In X, what is Y?' or 'Among X, what is Y?' → X defines the WHERE filter (population/denominator), Y is what you compute ON that filtered set. Example: 'In employees with salary > 50000, what % are managers?' → WHERE salary > 50000, then compute COUNT(managers)/COUNT(*)*100.",
     "RATIO LANGUAGE: 'How many times X more than Y' or 'how many times was X more than Y' = X/Y (division producing a ratio). It does NOT mean X-Y (subtraction) or COUNT.",
     # Aggregation grain
     "AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attribute (e.g., user age, user upvotes), query that entity table DIRECTLY with a subquery filter. Do NOT join to detail tables — joining users to posts duplicates user rows and corrupts the average. Correct: SELECT AVG(age) FROM users WHERE id IN (SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*)>N).",
@@ -79,6 +79,11 @@ SQL_RULES = [
     "TIME STRING PARSING: For time columns like '1:36.483' (mm:ss.ms), convert to seconds for comparison: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL). Always handle this when computing time differences or percentages.",
     # NULL rejection
     "NEVER RETURN NULL: If your computation might produce NULL (e.g., division by zero, no matching rows in subquery), wrap with COALESCE or add WHERE col IS NOT NULL. A NULL answer is ALWAYS wrong — the question expects a real value.",
+    # Aggregation scope
+    "HAVING vs WHERE: 'where the average/total X exceeds/is greater than N' across a GROUP = GROUP BY + HAVING AVG(X) > N. This is NOT a per-row WHERE filter. 'average across schools' = group schools by district, compute avg per district, filter with HAVING.",
+    "PER-GROUP POSITIONAL: 'the Nth item of EACH group' = use ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY position_col) then filter WHERE rn = N. Do NOT use a global OFFSET.",
+    "INTERSECTION LOGIC: 'X with Y containing Z' means: find entities where BOTH conditions hold. Use: WHERE id IN (SELECT id WHERE condition1) AND id IN (SELECT id WHERE condition2). Two separate subqueries intersected, NOT one combined WHERE clause.",
+    "SUPERLATIVE WITH TIES: 'which X has the lowest/highest Y' — if multiple X share the same min/max Y, return ALL of them. Use: WHERE Y = (SELECT MIN/MAX(Y) FROM ...). Never use ORDER BY + LIMIT 1 for superlatives unless the question says 'the one' or 'top 1'.",
 ]
 
 
@@ -133,6 +138,10 @@ def _build_sql_prompt(
                 rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use EXACTLY the values from FILTER VALUES above. Do NOT substitute other values."
         if "SELECT THESE COLUMNS" in grounding_context:
             rules += "\n- SELECT the columns listed in SELECT THESE COLUMNS."
+        if "EXPECTED OUTPUT" in grounding_context:
+            rules += "\n- Your query's output shape MUST match EXPECTED OUTPUT. If it says columns=2, your SELECT must have exactly 2 columns. If rows=single, ensure only 1 row is returned."
+        if "DATA FORMAT WARNINGS" in grounding_context:
+            rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully. Handle time strings, relative values, and encoded formats as described."
     elif knowledge_text and "formula" in knowledge_text.lower():
         rules += "\n- If DOMAIN KNOWLEDGE defines a formula, follow it exactly."
     parts.append(f"\nRULES:\n{rules}")
@@ -193,7 +202,9 @@ Return ONLY a JSON object:
 - LOGIC CHECK for aggregation: If the question asks "average [attribute] of [entities] who..." and the SQL JOINs entities to a detail table before computing AVG, the average is WRONG (inflated by duplicate entity rows). Mark incomplete with correct approach.
 - NULL CHECK: If any result value is None/NULL, the query is WRONG. A NULL means the computation failed (missing JOIN, wrong column, empty subquery). Mark incomplete and suggest a fix.
 - COLUMN COUNT CHECK: If the question asks for "X and Y" (two distinct values), the result MUST have 2+ columns. If it has only 1 column that sums/concatenates X and Y, mark incomplete.
-- TEMPORAL CHECK: If the question says "last" or "most recent", verify the SQL uses ORDER BY ... DESC LIMIT 1 (or equivalent). If it returns the first/any match instead, mark incomplete.""")
+- TEMPORAL CHECK: If the question says "last" or "most recent", verify the SQL uses ORDER BY ... DESC LIMIT 1 (or equivalent). If it returns the first/any match instead, mark incomplete.
+- HAVING CHECK: If the question says "where the average/total exceeds N" referring to a group aggregate, verify the SQL uses GROUP BY + HAVING (not just WHERE). A per-row filter on a column that needs averaging across a group is WRONG.
+- SCOPE CHECK: If the question uses "the" (singular definite) and the result has many rows, consider whether additional filters from the question context were missed. If the expected answer is clearly 1 row but you got many, mark incomplete.""")
 
     return "\n".join(parts)
 
@@ -233,9 +244,11 @@ DATABASE SCHEMA:
 Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
   "what_user_wants": "restate EXACTLY what output the user expects — only columns the question EXPLICITLY mentions",
+  "expected_output": {{"columns": "number of output columns", "rows": "single/multiple/all-matching", "description": "e.g., one row with two values: avg_upvotes and avg_age"}},
   "formula": "the EXACT SQL expression to compute the answer — if GROUND TRUTH defines a metric formula, translate it literally to SQL without simplifying or removing any operations",
   "computation_steps": ["step1: find X", "step2: calculate Y from X"],
   "data_requirements": ["table.column needed for output", "table2.column2 for filter"],
+  "data_format_notes": ["any unusual formats from SAMPLE DATA that need handling, e.g., time strings need parsing, relative values with + prefix, integer-encoded dates"],
   "reasoning": "brief HOW to get the answer — must trace back to what_user_wants",
   "domain_rules": ["constraints from DOMAIN KNOWLEDGE that affect the query"],
   "known_values": {{"table.column": ["filter values or expressions verified against SAMPLE DATA"]}},
@@ -245,25 +258,31 @@ Decompose the question into a structured plan. Return ONLY a JSON object:
 RULES:
 - Start by understanding what_user_wants — every other field must serve that goal.
 - GROUND TRUTH section contains immutable facts extracted from domain knowledge. You MUST follow them exactly.
-- For known_values: always include the TABLE name (e.g., "yearmonth.Date" not just "Date"). Only use values that exist within that table's SAMPLE DATA range.
+- For known_values: always include the TABLE name (e.g., "orders.order_date" not just "order_date"). Only use values that exist within that table's SAMPLE DATA range.
 - CRITICAL: Check SAMPLE DATA to decide WHICH TABLE to filter. The same column name in different tables may have different formats or data coverage. Always filter the table that actually contains the data you need.
 - For formula: if GROUND TRUTH defines a metric formula (e.g., "Metric = X / N"), translate it literally to SQL. Keep ALL parts — do NOT remove operations even if you think the data makes them redundant. The aggregation function must match the question intent ("average" → AVG, "total" → SUM).
 - "per unit/per item/each" in the question means a RATIO (total ÷ quantity). Check SAMPLE DATA to determine which column is a total vs a quantity, then use division in the formula.
 - For join_paths: trace the FULL FK path shown in DATABASE SCHEMA. Never skip intermediate tables.
 - For data_requirements: list ONLY columns needed for output + filters. Do NOT include extra columns.
 - Do NOT invent output columns the question didn't ask for. If the question says "list all X", SELECT only the column that identifies X — do NOT add properties (like amount, date) unless the question explicitly asks for them.
-- If GROUND TRUTH includes a USE CASE SQL, follow its structure but ensure the selected/aggregated column semantically matches what the question asks about.
+- If GROUND TRUTH includes a USE CASE SQL marked as AUTHORITATIVE, follow it EXACTLY — same WHERE values, same columns, same logic. Do NOT override its filter values even if they seem counterintuitive. The use case is the definitive answer pattern.
+- If GROUND TRUTH includes a non-authoritative USE CASE SQL, follow its structure but ensure the selected/aggregated column semantically matches what the question asks about.
 - POPULATION vs METRIC (critical for percentages/counts): Parse sentence structure carefully:
   * "In X, what is the percentage/count of Y?" → X is the population (WHERE filter = denominator), Y is what you measure.
   * "Among X, how many have Y?" → X is the population, Y is the condition being counted.
   * "Of X, what percentage are Y?" → denominator = COUNT(X), numerator = COUNT(X where Y).
-  * WRONG: "In heroes with height 150-180, % of Marvel" → filtering by Marvel and computing % with height. CORRECT: filter by height, compute % that are Marvel.
+  * WRONG: "In employees with salary > 50000, % managers" → filtering by role='manager' and computing % with salary. CORRECT: filter by salary > 50000, compute % that are managers.
 - RATIO LANGUAGE: "How many times is X more than Y?" or "How many times was X more than Y?" = X divided by Y (a ratio). NOT subtraction, NOT a count. Result is a decimal number (e.g., 2.73).
 - AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attributes (e.g., "average age of users who..."), aggregate FROM the entity table with a WHERE/IN filter. Do NOT join to a detail table — that duplicates entity rows per detail record and corrupts the average. Example: AVG(users.age) for users with >10 posts → SELECT AVG(age) FROM users WHERE id IN (subquery on posts).
 - COLUMN SEMANTICS: If GROUND TRUTH defines column meanings (e.g., "rank = based on fastest lap time", "position = race finish order"), map the question's wording to the CORRECT column. "ranked second" → use the column defined as "ranking", not "position".
 - OUTPUT FORMAT: "What is the X and the Y?" or "average X and average Y" = formula must produce TWO SEPARATE columns. The formula should be "SELECT col1, col2 FROM ..." not "SELECT col1 + col2". Each distinct requested value = one column.
 - TEMPORAL: "last time" / "most recent" / "latest" → ORDER BY date/time DESC LIMIT 1. "posted it last time" means the most recent poster, not any poster. Include ORDER BY in formula.
-- MONTHLY vs YEARLY: If data stores one row PER MONTH (e.g., yearmonth table with 12 rows per year per entity), "average monthly consumption" = AVG(value). If data stores ANNUAL totals (one row per year), "average monthly" = AVG(value) / 12. Check SAMPLE DATA row count vs time range to determine granularity.
+- MONTHLY vs YEARLY: If data stores one row PER MONTH (e.g., monthly_stats table with 12 rows per year per entity), "average monthly X" = AVG(value). If data stores ANNUAL totals (one row per year), "average monthly" = AVG(value) / 12. Check SAMPLE DATA row count vs time range to determine granularity.
+- DATA FORMAT INSPECTION: Look at SAMPLE DATA's "distinct values" annotations. If values have FORMAT tags (e.g., [FORMAT: time string mm:ss.ms]), record this in data_format_notes. Your formula must handle these formats (e.g., convert time strings to seconds before doing math).
+- GRANULARITY: Check SAMPLE DATA's GRANULARITY annotations. "~12 rows/entity" with monthly dates = monthly data. "~1 row/entity" with yearly = annual data. This determines whether to divide by 12 or not.
+- HAVING vs WHERE: "where the average X exceeds N" or "schools where the average exceeds N" = this is a GROUP-level filter. The formula must use GROUP BY + HAVING, NOT a per-row WHERE clause. The GROUP BY groups by the entity (school, district, etc.), and HAVING filters groups by their aggregate.
+- PER-GROUP POSITIONAL: "the Nth item of EACH group" needs ROW_NUMBER() OVER (PARTITION BY group ORDER BY position). Do NOT use global LIMIT/OFFSET.
+- SUPERLATIVE TIES: "which has the lowest/highest" → use WHERE col = (SELECT MIN/MAX...) to get ALL ties. Do NOT use ORDER BY + LIMIT 1 unless question explicitly says "one" or "top 1".
 """.strip()
 
 GROUNDING_VALIDATE_PROMPT = """You are a strict validator. Check if this plan EXACTLY answers the user's question.
@@ -277,7 +296,7 @@ PLAN:
 VALIDATE EACH:
 1. FILTER VALUES — CRITICAL:
    - GROUND TRUTH is the FINAL AUTHORITY. If the plan's filter values contradict GROUND TRUTH, fix them.
-   - If GROUND TRUTH has a USE CASE SQL, the plan's known_values MUST match that SQL's WHERE clause.
+   - If GROUND TRUTH has an AUTHORITATIVE USE CASE SQL, the plan's known_values MUST match that SQL's WHERE clause EXACTLY. Do NOT change them. The use case defines the correct values even if they seem wrong.
    - If a filter value comes directly from the QUESTION (e.g., a name, title, or specific term the user mentioned), keep it even if it's not in SAMPLE DATA. SAMPLE DATA is only a small subset.
    - Only reject values that contradict GROUND TRUTH definitions, NOT values that are simply absent from the sample.
 2. OUTPUT GRAIN: What shape does the user expect?
@@ -293,8 +312,8 @@ VALIDATE EACH:
 5. POPULATION vs METRIC (critical for percentages):
    - Re-read the question: "In X, what % of Y?" means X=WHERE filter, Y=numerator condition.
    - Check: is the plan filtering by the correct population (denominator)?
-   - WRONG: "In heroes height 150-180, % Marvel" with WHERE publisher='Marvel' and CASE on height.
-   - CORRECT: WHERE height BETWEEN 150 AND 180, then COUNT(Marvel)/COUNT(*).
+   - WRONG: "In employees salary > 50000, % managers" with WHERE role='manager' and CASE on salary.
+   - CORRECT: WHERE salary > 50000, then COUNT(managers)/COUNT(*).
 6. RATIO vs DIFFERENCE:
    - "How many times X more than Y" = X/Y (division), NOT X-Y.
    - Check if the formula uses division when the question asks "how many times".
@@ -309,6 +328,12 @@ VALIDATE EACH:
    - "last time" / "most recent" → formula must ORDER BY date/time DESC.
    - If data is monthly rows and question asks "average monthly", formula should be AVG(col) not AVG(col)/12.
    - If data is yearly totals and question asks "average monthly", formula should divide by 12.
+10. HAVING vs WHERE:
+   - "where the average X exceeds N" = GROUP BY + HAVING AVG(X) > N, NOT per-row WHERE X > N.
+   - Verify: does the formula use GROUP BY + HAVING for group-level aggregation filters?
+11. SUPERLATIVE TIES:
+   - "lowest/highest" → formula must use WHERE col = (SELECT MIN/MAX(...)) to return ALL ties.
+   - If formula uses ORDER BY + LIMIT 1, it will miss ties — mark as needs_fix.
 
 Return ONLY a JSON object:
 {{"verdict": "correct"/"needs_fix", "fixed_known_values": {{"column_name": ["corrected_values"]}}, "fixed_data_requirements": ["table.column", ...], "fixed_join_paths": ["tableA.col -> tableB.col"], "fixed_formula": "corrected formula if wrong", "reasoning": "one sentence explaining what was wrong"}}
@@ -414,6 +439,27 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     if domain_rules:
         parts.append("CONSTRAINTS:\n" + "\n".join(f"  - {r}" for r in domain_rules))
 
+    # Expected output shape
+    expected_output = grounding.get("expected_output", {})
+    if expected_output:
+        shape_desc = expected_output.get("description", "")
+        n_cols = expected_output.get("columns", "")
+        n_rows = expected_output.get("rows", "")
+        shape_parts = []
+        if n_cols:
+            shape_parts.append(f"columns={n_cols}")
+        if n_rows:
+            shape_parts.append(f"rows={n_rows}")
+        if shape_desc:
+            shape_parts.append(shape_desc)
+        if shape_parts:
+            parts.append(f"EXPECTED OUTPUT: {', '.join(shape_parts)}")
+
+    # Data format notes
+    format_notes = grounding.get("data_format_notes", [])
+    if format_notes:
+        parts.append("DATA FORMAT WARNINGS:\n" + "\n".join(f"  ⚠️ {n}" for n in format_notes))
+
     reasoning = grounding.get("reasoning", "")
     if reasoning:
         parts.append(f"APPROACH: {reasoning}")
@@ -448,7 +494,8 @@ RULES:
 - Return EVERY row from SQL OUTPUT — never drop or truncate rows.
 - Drop columns that are NOT needed to answer the question (e.g., intermediate IDs used only for joining).
 - NEVER merge multiple columns into one (e.g., don't combine first_name + last_name into full_name).
-- If a column contains a "full name" (e.g., "John Smith") and the question asks for "full name", split it into first_name and last_name columns. "Write the full name" = two columns (first_name, last_name).
+- If a column contains a "full name" (e.g., "John Smith") and the question asks for "full name" or "first name and last name", split it into first_name and last_name columns.
+- If a name column contains "Firstname Lastname" as a single string, split on space: first word = first_name, rest = last_name.
 - NEVER rename columns — use the exact SQL column names (except for name splitting above).
 - Do NOT transform values — keep them exactly as in SQL OUTPUT.
 - Do NOT add rows that aren't in SQL OUTPUT.
@@ -500,7 +547,6 @@ class QuestionDrivenAgent:
                       f"{len(ctx.doc_sources)} docs")
 
             # Step 2: Consolidate structured data → SQLite (deterministic)
-            # Force-remove any stale DB that might block consolidation
             for stale in context_dir.glob("_consolidated*.db"):
                 try:
                     stale.unlink()
@@ -546,8 +592,8 @@ class QuestionDrivenAgent:
             self._log("kg_built", f"KG: {len(kg.tables)} tables, "
                       f"{len(kg.inferred_fks)} inferred FKs")
 
-            # Get sample data for each table
-            sample_data = self._get_sample_data(db_path, kg)
+            # Get sample data for each table (question-aware probing)
+            sample_data = self._get_sample_data(db_path, kg, question)
 
             # Build column hints: map question words to actual column names
             col_hints = self._build_column_hints(question, kg)
@@ -753,6 +799,16 @@ class QuestionDrivenAgent:
                     question, data_result, db_path, kg_context, sample_data,
                     ctx.knowledge_text, grounding_context, col_hints,
                 )
+
+            # Python fallback: when SQL fails entirely, let LLM write Python
+            if not data_result or not data_result.get("rows"):
+                py_result = self._try_python_fallback(
+                    question, db_path, kg_context, sample_data,
+                    ctx.knowledge_text, grounding_context,
+                    failed_sqls=failed_sqls,
+                )
+                if py_result and py_result.get("rows"):
+                    data_result = py_result
 
             # Fallback if loop exhausted without good data
             if not data_result or not data_result.get("rows"):
@@ -968,11 +1024,58 @@ RULES:
     def _extract_domain_anchors(self, question: str, knowledge_text: str) -> str:
         """Extract relevant domain definitions as immutable ground truth.
 
-        Uses LLM to identify which definitions and use cases are relevant,
-        then formats them as clear, unambiguous anchors.
+        Two-phase approach:
+        1. Deterministic: extract USE CASE SQLs, field definitions, and verify against schema
+        2. LLM: identify which definitions are relevant and map question terms to columns
         """
         if not knowledge_text:
             return ""
+
+        # Phase 1: Deterministic extraction of use cases and field definitions
+        deterministic_parts: list[str] = []
+
+        # Extract all USE CASE SQL blocks
+        use_case_pattern = re.compile(
+            r'###\s*Use Case[^:]*:\s*(.+?)\n.*?```sql\s*\n(.+?)```\s*\n.*?Explanation[:\s]*(.+?)(?:\n\n|\Z)',
+            re.DOTALL | re.IGNORECASE,
+        )
+        use_cases = use_case_pattern.findall(knowledge_text)
+
+        # Score each use case by keyword overlap with question
+        q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
+        best_use_case = None
+        best_score = 0
+        for uc_title, uc_sql, uc_explanation in use_cases:
+            uc_words = set(re.findall(r'\b[a-z]{3,}\b', uc_title.lower() + " " + uc_explanation.lower()))
+            overlap = len(q_words & uc_words)
+            if overlap > best_score:
+                best_score = overlap
+                best_use_case = (uc_title.strip(), uc_sql.strip(), uc_explanation.strip())
+
+        if best_use_case and best_score >= 3:
+            deterministic_parts.append(
+                f"MATCHING USE CASE (high confidence, score={best_score}):\n"
+                f"  Title: {best_use_case[0]}\n"
+                f"  SQL: {best_use_case[1]}\n"
+                f"  Explanation: {best_use_case[2]}\n"
+                f"  ⚠️ THIS SQL IS AUTHORITATIVE — follow its WHERE clause values exactly."
+            )
+
+        # Extract all field definitions with their exact values/meanings
+        field_defs = re.findall(
+            r'-\s+\*{0,2}(\w[\w\s]*?)\*{0,2}\s*(?:\([\w\s]+\))?\s*:\s*(.+)',
+            knowledge_text,
+        )
+        relevant_fields: list[str] = []
+        for field_name, definition in field_defs:
+            field_words = set(re.findall(r'\b[a-z]{3,}\b', field_name.lower() + " " + definition.lower()))
+            if q_words & field_words:
+                relevant_fields.append(f"- {field_name.strip()}: {definition.strip()}")
+
+        if relevant_fields:
+            deterministic_parts.append("FIELD DEFINITIONS:\n" + "\n".join(relevant_fields))
+
+        # Phase 2: LLM extraction for nuanced mapping
         prompt = DOMAIN_ANCHOR_PROMPT.format(
             question=question,
             knowledge_text=knowledge_text[:4000],
@@ -981,47 +1084,33 @@ RULES:
         raw = self._model_call_with_retry(messages)
         parsed = self._parse_json(raw)
 
-        if not isinstance(parsed, dict):
+        llm_parts: list[str] = []
+        if isinstance(parsed, dict):
+            anchors = parsed.get("anchors", [])
+            for a in anchors:
+                llm_parts.append(f"- {a}")
+
+            column_mappings = parsed.get("column_mappings", {})
+            if column_mappings:
+                llm_parts.append("\nCOLUMN MAPPINGS (use the correct column for each question term):")
+                for term, mapping in column_mappings.items():
+                    llm_parts.append(f"  \"{term}\" → {mapping}")
+
+            use_case_sql = parsed.get("use_case_sql")
+            if use_case_sql and not best_use_case:
+                llm_parts.append(f"\nMATCHING USE CASE SQL (follow this exactly):\n  {use_case_sql}")
+
+        # Combine: deterministic parts take priority (placed first = fresher in context)
+        all_parts = deterministic_parts + llm_parts
+        if not all_parts:
             return knowledge_text[:2000]
 
-        parts: list[str] = []
-        anchors = parsed.get("anchors", [])
-        for a in anchors:
-            parts.append(f"- {a}")
-
-        column_mappings = parsed.get("column_mappings", {})
-        if column_mappings:
-            parts.append("\nCOLUMN MAPPINGS (use the correct column for each question term):")
-            for term, mapping in column_mappings.items():
-                parts.append(f"  \"{term}\" → {mapping}")
-
-        use_case_sql = parsed.get("use_case_sql")
-        if use_case_sql:
-            parts.append(f"\nMATCHING USE CASE SQL (follow this exactly):\n  {use_case_sql}")
-
-        if not parts:
-            return knowledge_text[:2000]
-
-        # Deterministic: find field definitions in knowledge_text that match question words
-        q_words = set(re.findall(r'\b[a-z_]{3,}\b', question.lower()))
-        # Match lines like "- **field_name**: description" or "- field_name: description"
-        field_defs = re.findall(
-            r'-\s+\*{0,2}(\w+)\*{0,2}\s*:\s*(.+)',
-            knowledge_text,
-        )
-        anchor_lower = "\n".join(parts).lower()
-        for field_name, definition in field_defs:
-            if field_name.lower() in q_words and field_name.lower() not in anchor_lower:
-                parts.append(f"- {field_name}: {definition.strip()}")
-
-        anchor_text = "\n".join(parts)
+        anchor_text = "\n".join(all_parts)
 
         # Translate formula anchors to SQL-ready form based on question intent
-        # Replace "[Total ... X] / N" with "AVG(X) / N" when question asks for average
         q_lower = question.lower()
         if "average" in q_lower or "avg" in q_lower:
             def _rewrite_formula(m: re.Match) -> str:
-                # Extract the last word before / as the column name
                 before_div = m.group(1).strip().rstrip("]")
                 col = before_div.split()[-1]
                 n = m.group(2)
@@ -1919,6 +2008,138 @@ RULES:
         return best_result, best_sql
 
     # ------------------------------------------------------------------
+    # Python fallback: when SQL can't solve it, write Python
+    # ------------------------------------------------------------------
+
+    def _try_python_fallback(
+        self,
+        question: str,
+        db_path: Path,
+        kg_context: str,
+        sample_data: str,
+        knowledge_text: str,
+        grounding_context: str,
+        failed_sqls: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Last resort: LLM writes Python to query DB and compute the answer."""
+        if not db_path or not db_path.exists():
+            return None
+
+        from data_agent_baseline.tools.python_exec import execute_python_code
+
+        failed_section = ""
+        if failed_sqls:
+            failed_section = "FAILED SQL ATTEMPTS (these all returned empty/NULL — Python must take a different approach):\n"
+            failed_section += "\n".join(f"  {s[:150]}" for s in failed_sqls[-3:])
+
+        prompt = f"""SQL failed to answer this question. Write a Python script that queries the SQLite database and computes the answer.
+
+QUESTION: {question}
+
+DATABASE SCHEMA:
+{kg_context[:2000]}
+
+SAMPLE DATA:
+{sample_data[:1500]}
+
+{f"DOMAIN KNOWLEDGE: {knowledge_text[:1000]}" if knowledge_text else ""}
+
+{f"GROUNDING: {grounding_context[:1000]}" if grounding_context else ""}
+
+{failed_section}
+
+Write a Python script that:
+1. Connects to the SQLite database at "_consolidated.db" (already in working directory)
+2. Queries the data needed
+3. Performs any computation (string parsing, time conversion, multi-step logic)
+4. Prints the FINAL ANSWER as a single line in CSV format: col1,col2\\nval1,val2
+   (first line = column names, subsequent lines = data rows)
+
+Return ONLY a JSON object:
+{{"reasoning": "step-by-step plan", "python": "import sqlite3\\n..."}}
+
+RULES:
+- The DB file is "_consolidated.db" in the current working directory
+- Print ONLY the final CSV output (header + data rows). No other prints.
+- Handle string time formats like "1:36.483" (minutes:seconds.ms) — convert to seconds for math
+- Handle relative time formats like "+16.445" (seconds behind leader)
+- Use try/except for robustness
+- If a value might be NULL, filter it out or provide a default
+- Keep it simple — under 30 lines"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if not isinstance(parsed, dict) or not parsed.get("python"):
+            return None
+
+        code = parsed["python"]
+        self._log("python_fallback", f"Executing Python ({len(code)} chars): {parsed.get('reasoning', '')[:100]}")
+
+        result = execute_python_code(
+            context_root=db_path.parent,
+            code=code,
+            timeout_seconds=30,
+        )
+
+        if not result.get("success"):
+            self._log("python_error", f"Failed: {result.get('error', '')[:200]}")
+            # Try once more with the error context
+            retry_prompt = f"""The Python script failed with this error:
+{result.get('error', '')}
+{result.get('stderr', '')[:500]}
+
+Fix the script and try again. The DB is at "_consolidated.db".
+Return ONLY: {{"python": "import sqlite3\\n..."}}"""
+            messages = [ModelMessage(role="user", content=retry_prompt)]
+            raw = self._model_call_with_retry(messages)
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict) and parsed.get("python"):
+                result = execute_python_code(
+                    context_root=db_path.parent,
+                    code=parsed["python"],
+                    timeout_seconds=30,
+                )
+                if not result.get("success"):
+                    self._log("python_retry_error", f"Still failed: {result.get('error', '')[:200]}")
+                    return None
+
+        output = result.get("output", "").strip()
+        if not output:
+            self._log("python_empty", "No output produced")
+            return None
+
+        self._log("python_output", output[:300])
+
+        # Parse CSV output into result dict
+        lines = [l.strip() for l in output.split("\n") if l.strip()]
+        if len(lines) < 2:
+            # Single value — wrap as 1-col table
+            if len(lines) == 1:
+                # Could be just a value or a header
+                return {"columns": ["result"], "rows": [[lines[0]]]}
+            return None
+
+        import csv as csv_mod
+        try:
+            reader = csv_mod.reader(lines)
+            columns = next(reader)
+            rows = [list(row) for row in reader]
+            if rows:
+                # Filter out None/NULL rows
+                valid_rows = [r for r in rows if not all(
+                    v.strip().lower() in ("none", "null", "") for v in r
+                )]
+                if valid_rows:
+                    self._log("python_success", f"Got {len(valid_rows)} rows, {len(columns)} cols")
+                    return {"columns": columns, "rows": valid_rows}
+        except Exception as e:
+            self._log("python_parse_error", str(e))
+
+        return None
+
+    # ------------------------------------------------------------------
     # Post-execution result shape validation
     # ------------------------------------------------------------------
 
@@ -1972,20 +2193,37 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                     return fix_result
 
         # Check: singular question ("what was THE score") but got many rows
-        # Only trigger when we have way more rows than expected for a singular question
         singular_patterns = [
             r"what (?:is|was|were) the .+? (?:for|of|in) the ",
             r"what is the .+? of the ",
             r"identify the .+? (?:for|of) the ",
         ]
         expects_singular = any(re.search(p, q_lower) for p in singular_patterns)
-        # But NOT if question uses plural indicators
         plural_indicators = ["list", "all", "each", "every", "which", "how many"]
         has_plural = any(p in q_lower for p in plural_indicators)
 
         if expects_singular and not has_plural and len(rows) > 5:
-            self._log("shape_warning", f"Singular question but got {len(rows)} rows — may need tighter filters")
-            # Don't auto-fix (risky) — just log for awareness
+            self._log("shape_fix_singular", f"Singular question but got {len(rows)} rows — attempting fix")
+            fix_prompt = f"""The SQL returned {len(rows)} rows but the question expects a SINGLE result (it uses "the" indicating one specific item).
+
+QUESTION: {question}
+CURRENT SQL RETURNED: {len(rows)} rows with columns {cols}
+FIRST FEW ROWS: {rows[:3]}
+
+The question likely needs additional filters from its context that were missed. Re-read the question and add the missing WHERE conditions to narrow to exactly 1 row.
+
+DATABASE SCHEMA:
+{kg_context[:1500]}
+
+Return ONLY: {{"sql": "SELECT ..."}}"""
+            messages = [ModelMessage(role="user", content=fix_prompt)]
+            raw = self._model_call_with_retry(messages)
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict) and parsed.get("sql"):
+                fix_result = self._try_sql(db_path, parsed["sql"])
+                if fix_result and fix_result.get("rows") and 0 < len(fix_result["rows"]) < len(rows):
+                    self._log("shape_fixed_singular", f"Narrowed from {len(rows)} to {len(fix_result['rows'])} rows")
+                    return fix_result
 
         return data_result
 
@@ -1993,9 +2231,10 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
     # Helpers
     # ------------------------------------------------------------------
 
-    def _get_sample_data(self, db_path: Path, kg: KnowledgeGraph) -> str:
-        """Get sample rows + date ranges + value ranges for each table."""
+    def _get_sample_data(self, db_path: Path, kg: KnowledgeGraph, question: str = "") -> str:
+        """Get sample rows + date ranges + value ranges + question-aware probing."""
         parts: list[str] = []
+        q_words = set(re.findall(r"[a-z]{3,}", question.lower())) if question else set()
         conn = sqlite3.connect(str(db_path))
         for table in kg.tables:
             try:
@@ -2006,9 +2245,10 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                 parts.append(f"  Columns: {columns}")
                 for row in rows:
                     parts.append(f"  {list(row)}")
-                # Detect date/time columns and show their range
+
                 for col in columns:
                     col_lower = col.lower()
+                    # Date/time column ranges
                     if any(kw in col_lower for kw in ("date", "time", "year", "month", "period")):
                         try:
                             rng = conn.execute(
@@ -2018,10 +2258,8 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                                 parts.append(f"  >> {col} range: {rng[0]} to {rng[1]}")
                         except Exception:
                             pass
-                # Show key column lengths when they look like IDs (for JOIN alignment)
-                for col in columns:
-                    col_lower = col.lower()
-                    if any(kw in col_lower for kw in ("id", "code", "key", "cds")):
+                    # ID column lengths
+                    if any(kw in col_lower for kw in ("id", "code", "key")):
                         try:
                             lens = conn.execute(
                                 f'SELECT MIN(LENGTH("{col}")), MAX(LENGTH("{col}")) '
@@ -2033,10 +2271,83 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                                 parts.append(f"  >> {col} length: {lens[0]} chars")
                         except Exception:
                             pass
+
+                # Question-aware probing: show distinct values for columns matching question terms
+                for col in columns:
+                    col_lower = col.lower()
+                    is_relevant = any(w in col_lower or col_lower in w for w in q_words if len(w) >= 3)
+                    if not is_relevant:
+                        continue
+                    try:
+                        distinct = conn.execute(
+                            f'SELECT DISTINCT "{col}" FROM "{table.name}" '
+                            f'WHERE "{col}" IS NOT NULL AND "{col}" != \'\' '
+                            f'ORDER BY "{col}" LIMIT 8'
+                        ).fetchall()
+                        vals = [r[0] for r in distinct]
+                        if vals:
+                            # Detect format patterns
+                            format_note = self._detect_value_format(vals)
+                            parts.append(f"  >> {col} distinct values: {vals}{format_note}")
+                    except Exception:
+                        pass
+
+                # Show row count per granularity for tables that look temporal
+                if table.row_count > 10 and any(
+                    any(kw in c.lower() for kw in ("date", "month", "year"))
+                    for c in columns
+                ):
+                    # Count distinct entities to infer granularity
+                    id_cols = [c for c in columns if "id" in c.lower()]
+                    date_cols = [c for c in columns if any(kw in c.lower() for kw in ("date", "month", "year"))]
+                    if id_cols and date_cols:
+                        try:
+                            n_entities = conn.execute(
+                                f'SELECT COUNT(DISTINCT "{id_cols[0]}") FROM "{table.name}"'
+                            ).fetchone()[0]
+                            n_dates = conn.execute(
+                                f'SELECT COUNT(DISTINCT "{date_cols[0]}") FROM "{table.name}"'
+                            ).fetchone()[0]
+                            if n_entities and n_dates:
+                                rows_per_entity = table.row_count / n_entities
+                                parts.append(
+                                    f"  >> GRANULARITY: {n_entities} entities × {n_dates} dates, "
+                                    f"~{rows_per_entity:.1f} rows/entity"
+                                )
+                        except Exception:
+                            pass
+
             except Exception:
                 continue
         conn.close()
         return "\n".join(parts)
+
+    def _detect_value_format(self, vals: list[Any]) -> str:
+        """Detect unusual value formats and return an annotation."""
+        if not vals:
+            return ""
+        str_vals = [str(v) for v in vals if v is not None]
+        if not str_vals:
+            return ""
+
+        # Time format: "1:36.483" or "01:54:23"
+        time_pattern = re.compile(r'^\d{1,2}:\d{2}[\.:]\d{2,3}$')
+        if sum(1 for v in str_vals if time_pattern.match(v)) > len(str_vals) * 0.5:
+            return " [FORMAT: time string mm:ss.ms — convert to seconds for math]"
+
+        # Relative time: "+16.445" or "+1:02.345"
+        if sum(1 for v in str_vals if v.startswith("+")) > len(str_vals) * 0.3:
+            return " [FORMAT: relative values with '+' prefix — these are offsets from a reference]"
+
+        # Integer-encoded dates: 201301, 201302
+        if all(re.match(r'^\d{6}$', str(v)) for v in str_vals[:5]):
+            return " [FORMAT: YYYYMM integer — use range comparison, not string matching]"
+
+        # Status codes: single characters or short codes
+        if all(len(str(v)) <= 2 for v in str_vals) and len(set(str_vals)) <= 5:
+            return " [FORMAT: categorical/status codes]"
+
+        return ""
 
     def _try_sql(self, db_path: Path, sql: str) -> dict[str, Any] | None:
         """Execute SQL and return results."""

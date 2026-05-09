@@ -43,7 +43,7 @@ docker-test:
 		-e MODEL_API_URL="$$MODEL_API_URL" \
 		-e MODEL_API_KEY="$$MODEL_API_KEY" \
 		-e MODEL_NAME="$$MODEL_NAME" \
-		-v "$$(pwd)/data/public/input:/input:ro" \
+		-v "$$(pwd)/data/public/input:/input" \
 		-v "$$(pwd)/local_output:/output" \
 		$(IMAGE)
 
