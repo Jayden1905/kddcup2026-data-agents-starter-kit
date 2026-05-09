@@ -132,8 +132,8 @@ def _build_sql_prompt(
                 rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use EXACTLY the values from FILTER VALUES above. Do NOT substitute other values."
         if "DATA FORMAT WARNINGS" in grounding_context:
             rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully. Handle time strings, relative values, and encoded formats as described."
-        if "CORRECTION" in grounding_context and "MANDATORY" in grounding_context:
-            rules += "\n- ⚠️ The CORRECTION section is MANDATORY. Follow it exactly — it overrides any other interpretation from grounding."
+        if "IMPORTANT" in grounding_context and "RE-READ THE QUESTION" in grounding_context:
+            rules += "\n- ⚠️ Read the IMPORTANT section carefully. It flags a potential column mismatch — verify your SELECT/GROUP BY uses the column the question actually refers to."
     elif knowledge_text and "formula" in knowledge_text.lower():
         rules += "\n- If DOMAIN KNOWLEDGE defines a formula, follow it exactly."
     parts.append(f"\nRULES:\n{rules}")
@@ -330,7 +330,7 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
 
     # Semantic overrides go last and marked as mandatory
     if override_rules:
-        parts.append("⚠️ CORRECTION (MANDATORY — your SQL MUST follow this):\n" + "\n".join(f"  - {r}" for r in override_rules))
+        parts.append("⚠️ IMPORTANT — RE-READ THE QUESTION and consider this:\n" + "\n".join(f"  - {r}" for r in override_rules))
 
     if not parts:
         return ""
@@ -560,54 +560,16 @@ class QuestionDrivenAgent:
                 if iteration == max_iterations:
                     break
 
-                # EVALUATE: Check if result answers the question
-                eval_result = self._call_evaluate(
-                    question, sql, sql_error, data_result, kg_context,
-                    knowledge_text=ctx.knowledge_text,
-                    grounding_context=grounding_context,
+                # EVALUATE: lightweight LLM feedback (OK or one-sentence issue)
+                feedback = self._evaluate_result_feedback(
+                    question, sql, data_result, grounding_context,
                 )
-                verdict = eval_result.get("verdict", "complete")
-                self._log("evaluate", f"Verdict: {verdict}")
-
-                if verdict == "complete":
+                if not feedback:
+                    self._log("evaluate", "Verdict: complete")
                     break
 
-                # Gaps found — collect feedback for next iteration
-                gaps = eval_result.get("gaps", [])
-                suggested = eval_result.get("suggested_sql")
-
-                # Try suggested SQL — if it works, use it as the current best
-                if suggested and suggested.strip().upper() != sql.strip().upper():
-                    suggested_result = self._try_sql(db_path, suggested)
-                    if suggested_result and suggested_result["rows"]:
-                        data_result = suggested_result
-                        sql = suggested
-                        self._log("suggested_sql_ok", "Suggested SQL returned data")
-
-                # Run info queries to gather more context about the data
-                info_queries = eval_result.get("info_queries", [])
-                info_parts: list[str] = []
-                for iq in info_queries[:3]:
-                    iq_result = self._try_sql(db_path, iq)
-                    if iq_result and iq_result.get("rows"):
-                        info_parts.append(
-                            f"Query: {iq}\n"
-                            f"Result: {self._format_data_as_table(iq_result)}"
-                        )
-                        self._log("info_query", f"{iq} → {len(iq_result['rows'])} rows")
-
-                if info_parts:
-                    extra_context = "\n\n".join(info_parts)
-
-                if not gaps and not info_parts and not suggested:
-                    break
-
-                # Deduplicate gaps
-                new_gaps = [g for g in gaps if g not in all_gaps]
-                all_gaps.update(new_gaps)
-                for g in new_gaps:
-                    self._log("gap", g)
-
+                self._log("evaluate", f"Verdict: incomplete — {feedback}")
+                all_gaps.add(feedback)
                 failed_sqls.append(sql)
                 gaps_text = "\n".join(f"- {g}" for g in all_gaps)
                 gaps_text += "\n".join(
@@ -786,6 +748,47 @@ class QuestionDrivenAgent:
         if isinstance(parsed, dict):
             return parsed
         return {"verdict": "complete", "reasoning": "Could not parse evaluation.", "gaps": []}
+
+    # ------------------------------------------------------------------
+    # Lightweight result feedback (replaces heavy LLM evaluator)
+    # ------------------------------------------------------------------
+
+    def _evaluate_result_feedback(
+        self,
+        question: str,
+        sql: str,
+        data_result: dict[str, Any],
+        grounding_context: str = "",
+    ) -> str:
+        """Lightweight feedback: returns empty string if OK, one-sentence issue otherwise."""
+        data_text = self._format_data_as_table(data_result)
+
+        prompt = f"""QUESTION: {question}
+
+SQL: {sql}
+
+RESULTS:
+{data_text}
+
+Does this result correctly answer the QUESTION?
+
+If YES, respond with exactly: OK
+If NO, respond with ONE sentence describing what's wrong (wrong column, wrong filter, missing data, NULL values, etc.)
+
+RULES:
+- If the result has data and the columns match what the question asks → OK.
+- Multiple rows are VALID — do NOT reject just because there are multiple results.
+- Do NOT question filter values — those are verified.
+- Only flag real problems: NULL values, clearly wrong columns, empty where data should exist, wrong aggregation type."""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        raw = raw.strip()
+
+        raw_upper = raw.upper()
+        if raw_upper == "OK" or raw_upper.startswith("OK\n") or raw_upper.startswith("OK.") or raw_upper.endswith(" OK") or raw_upper.endswith(" OK.") or "is correct" in raw.lower():
+            return ""
+        return raw
 
     # ------------------------------------------------------------------
     # LLM Call 2: Answer Formatting
@@ -1096,6 +1099,13 @@ RULES:
             if feedback:
                 self._log("grounding_feedback", feedback)
                 grounding["_semantic_overrides"] = [feedback]
+            else:
+                # Deterministic override: if question word matches an exact column name
+                # not used in formula SELECT, inject as override for the SQL planner
+                override = self._check_missing_select_columns(question, grounding, kg_context)
+                if override:
+                    self._log("grounding_deterministic_override", override)
+                    grounding["_semantic_overrides"] = [override]
 
         # Deterministic enrichment: add any schema columns whose name matches a question word
         if db_path:
@@ -1256,6 +1266,61 @@ RULES:
 
         except Exception:
             return ""
+
+    def _check_missing_select_columns(self, question: str, grounding: dict[str, Any], kg_context: str) -> str:
+        """Deterministic: if a question word EXACTLY matches a column name not in the formula SELECT, flag it.
+
+        Only triggers when:
+        1. A question word is an exact column name in the schema
+        2. That column is NOT referenced in the formula
+        3. The formula SELECTs a different column from a different table for grouping/output
+
+        Returns override string or empty.
+        """
+        formula = grounding.get("formula", "")
+        if not formula:
+            return ""
+
+        q_lower = question.lower()
+        q_words = set(re.findall(r'\b[a-z]{3,}\b', q_lower))
+        formula_lower = formula.lower()
+
+        # Parse SELECT columns from formula
+        select_match = re.match(r'select\s+(.+?)\s+from\s', formula_lower, re.DOTALL)
+        if not select_match:
+            return ""
+        select_clause = select_match.group(1)
+
+        # Find columns from schema whose exact name matches a question word
+        # but aren't in the formula at all
+        missing_exact = []
+        current_table = ""
+        for line in kg_context.split("\n"):
+            if line.startswith("TABLE: "):
+                current_table = line.split("TABLE: ")[1].split(" ")[0].strip()
+            elif line.strip().startswith("- ") and current_table:
+                col_name = line.strip()[2:].split(" ")[0].strip()
+                # Exact match: column name IS a question word
+                if col_name.lower() in q_words:
+                    # Not in formula at all
+                    if col_name.lower() not in formula_lower:
+                        missing_exact.append((current_table, col_name))
+
+        if not missing_exact:
+            return ""
+
+        # Check if the formula already has a GROUP BY on a different column
+        # (suggesting the missing column should replace it)
+        has_group_by = "group by" in formula_lower
+        if not has_group_by and len(missing_exact) == 1:
+            t, c = missing_exact[0]
+            return f"The question mentions '{c}' which is an actual column in {t} table. Consider whether SELECT should include {t}.{c}."
+
+        if has_group_by:
+            t, c = missing_exact[0]
+            return f"The question asks for '{c}' which is an actual column in the {t} table — use {t}.{c} in SELECT/GROUP BY instead of a different categorical column."
+
+        return ""
 
     def _semantic_feedback(self, question: str, grounding: dict[str, Any], kg_context: str) -> str:
         """Lightweight semantic check: does the plan answer the exact question?
