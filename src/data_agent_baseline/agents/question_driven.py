@@ -69,15 +69,15 @@ SQL_RULES = [
     # Format matching
     "VALUE FORMAT: Check SAMPLE DATA for the EXACT format of values before filtering. Time might be '1:54.123' not '0:01:54'. Dates might be integers (20130601) not strings ('2013-06-01'). Names might be 'DisplayName' not 'username'. Always match the exact format shown in SAMPLE DATA.",
     "EMPTY RESULT RECOVERY: If the PREVIOUS ATTEMPT FAILED section shows actual values from the DB, use THOSE exact values in your query — do not guess differently.",
-    # Output shape rules (Fix 2)
+    # Output shape rules
     "OUTPUT COLUMNS: 'What is the X and the Y?' or 'the average X and the average Y' = TWO SEPARATE columns in SELECT (one for X, one for Y). Do NOT combine them with + or concatenation.",
     "SINGULAR vs PLURAL: If the question uses 'the X' (singular/definite article) expecting one specific entity, add additional filters or use LIMIT 1 to narrow to exactly one row. 'What was THE score for THE match...' = 1 row expected.",
     "TIED VALUES: When using MIN/MAX for superlatives, multiple rows sharing that min/max value are ALL correct. Return all ties, do not arbitrarily pick one.",
-    # Temporal/ordering rules (Fix 3)
+    # Temporal/ordering rules
     "TEMPORAL ORDERING: 'last time' / 'most recent' / 'latest' = ORDER BY date/time DESC LIMIT 1. 'first time' / 'earliest' = ORDER BY date/time ASC LIMIT 1. Check which column represents chronological order.",
     "MONTHLY from YEARLY: If the data stores YEARLY/ANNUAL totals and the question asks for 'monthly average' or 'per month', DIVIDE by 12. If data stores MONTHLY values, just use AVG directly. Check SAMPLE DATA to determine the granularity.",
     "TIME STRING PARSING: For time columns like '1:36.483' (mm:ss.ms), convert to seconds for comparison: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL). Always handle this when computing time differences or percentages.",
-    # NULL rejection (Fix 4)
+    # NULL rejection
     "NEVER RETURN NULL: If your computation might produce NULL (e.g., division by zero, no matching rows in subquery), wrap with COALESCE or add WHERE col IS NOT NULL. A NULL answer is ALWAYS wrong — the question expects a real value.",
 ]
 
@@ -698,7 +698,7 @@ class QuestionDrivenAgent:
                     f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
                 )
 
-            # Fix 4: NULL result rejection — treat None/NULL-only results as empty
+            # Reject results where all values are NULL/None
             if data_result and data_result.get("rows"):
                 rows = data_result["rows"]
                 all_null = all(
@@ -747,7 +747,7 @@ class QuestionDrivenAgent:
                     self._log("dedup", f"Removed {len(rows) - len(unique_rows)} duplicate rows")
                     data_result["rows"] = unique_rows
 
-            # Fix 5: Post-execution shape validation
+            # Validate result shape matches question expectations
             if data_result and data_result.get("rows"):
                 data_result = self._validate_result_shape(
                     question, data_result, db_path, kg_context, sample_data,
@@ -1919,7 +1919,7 @@ RULES:
         return best_result, best_sql
 
     # ------------------------------------------------------------------
-    # Fix 5: Post-execution result shape validation
+    # Post-execution result shape validation
     # ------------------------------------------------------------------
 
     def _validate_result_shape(
