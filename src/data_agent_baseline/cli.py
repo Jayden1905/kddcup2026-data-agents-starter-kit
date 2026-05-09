@@ -151,6 +151,7 @@ def _build_compact_progress_fields(
     max_workers: int,
     elapsed_seconds: float,
     last_artifact: TaskRunArtifacts | None,
+    score_avg: float = 0.0,
 ) -> dict[str, str]:
     remaining_count = max(task_total - completed_count, 0)
     running_count = min(max_workers, remaining_count)
@@ -162,6 +163,7 @@ def _build_compact_progress_fields(
         "queue": str(queued_count),
         "speed": _format_compact_rate(completed_count, elapsed_seconds),
         "last": _format_last_task(last_artifact),
+        "score": f"score={score_avg:.3f}" if completed_count > 0 else "score=—",
     }
 
 
@@ -344,6 +346,8 @@ def run_benchmark_command(
         BarColumn(),
         TaskProgressColumn(),
         TextColumn("[dim]|[/dim]"),
+        TextColumn("[bold magenta]{task.fields[score]}[/bold magenta]"),
+        TextColumn("[dim]|[/dim]"),
         TextColumn("[green]ok={task.fields[ok]}[/green]"),
         TextColumn("[red]fail={task.fields[fail]}[/red]"),
         TextColumn("[cyan]run={task.fields[run]}[/cyan]"),
@@ -376,15 +380,43 @@ def run_benchmark_command(
         completion_count = 0
         succeeded_count = 0
         failed_count = 0
+        running_score_sum = 0.0
+        scored_count = 0
         start_time = perf_counter()
+
+        import csv as _csv_progress
 
         def on_task_complete(artifact) -> None:
             nonlocal completion_count, succeeded_count, failed_count
+            nonlocal running_score_sum, scored_count
             completion_count += 1
             if artifact.succeeded:
                 succeeded_count += 1
             else:
                 failed_count += 1
+
+            # Score this task immediately
+            pred_c: list[str] = []
+            pred_r: list[list[str]] = []
+            if artifact.prediction_csv_path and artifact.prediction_csv_path.exists():
+                with open(artifact.prediction_csv_path, newline="") as f:
+                    rows_all = list(_csv_progress.reader(f))
+                if rows_all:
+                    pred_c = rows_all[0]
+                    pred_r = [r for r in rows_all[1:] if r]
+
+            gold_p = PROJECT_ROOT / "data" / "public" / "output" / artifact.task_id / "gold.csv"
+            if gold_p.exists():
+                with open(gold_p, newline="") as f:
+                    rows_all = list(_csv_progress.reader(f))
+                if rows_all:
+                    gold_c = rows_all[0]
+                    gold_r = [r for r in rows_all[1:] if r]
+                    s, _, _, _ = _score_prediction(pred_c, pred_r, gold_c, gold_r)
+                    running_score_sum += s
+                    scored_count += 1
+
+            score_avg = running_score_sum / scored_count if scored_count > 0 else 0.0
             progress.update(
                 progress_task_id,
                 completed=completion_count,
@@ -398,6 +430,7 @@ def run_benchmark_command(
                     max_workers=effective_workers,
                     elapsed_seconds=perf_counter() - start_time,
                     last_artifact=artifact,
+                    score_avg=score_avg,
                 ),
             )
 
@@ -409,6 +442,7 @@ def run_benchmark_command(
             )
         except (ValueError, FileExistsError) as exc:
             raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
+        final_score_avg = running_score_sum / scored_count if scored_count > 0 else 0.0
         progress.update(
             progress_task_id,
             completed=task_total,
@@ -422,6 +456,7 @@ def run_benchmark_command(
                 max_workers=effective_workers,
                 elapsed_seconds=perf_counter() - start_time,
                 last_artifact=artifacts[-1] if artifacts else None,
+                score_avg=final_score_avg,
             ),
         )
     console.print(f"Run output: {run_output_dir}")
