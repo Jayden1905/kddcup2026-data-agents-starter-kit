@@ -71,8 +71,8 @@ SQL_RULES = [
     "EMPTY RESULT RECOVERY: If the PREVIOUS ATTEMPT FAILED section shows actual values from the DB, use THOSE exact values in your query — do not guess differently.",
     # Output shape rules
     "OUTPUT COLUMNS: 'What is the X and the Y?' or 'the average X and the average Y' = TWO SEPARATE columns in SELECT (one for X, one for Y). Do NOT combine them with + or concatenation.",
-    "SINGULAR vs PLURAL: If the question uses 'the X' (singular/definite article) expecting one specific entity, add additional filters or use LIMIT 1 to narrow to exactly one row. 'What was THE score for THE match...' = 1 row expected.",
-    "TIED VALUES: When using MIN/MAX for superlatives, multiple rows sharing that min/max value are ALL correct. Return all ties, do not arbitrarily pick one.",
+    "SINGULAR vs PLURAL: If the question uses 'the X' (singular/definite) AND provides enough filters to uniquely identify one row, expect 1 row. But NEVER add LIMIT 1 just because the grammar sounds singular — a person can have multiple payments, an entity can appear multiple times. Only LIMIT 1 if the question explicitly says 'the most recent' or 'the first'.",
+    "TIED VALUES / NO LIMIT ON SUPERLATIVES: For 'which/what has the lowest/highest/most/least', ALWAYS use WHERE col = (SELECT MIN/MAX(col) ...) without LIMIT. Multiple rows may share the same min/max — return ALL of them. NEVER use ORDER BY + LIMIT 1 for superlatives.",
     # Temporal/ordering rules
     "TEMPORAL ORDERING: 'last time' / 'most recent' / 'latest' = ORDER BY date/time DESC LIMIT 1. 'first time' / 'earliest' = ORDER BY date/time ASC LIMIT 1. Check which column represents chronological order.",
     "MONTHLY from YEARLY: If the data stores YEARLY/ANNUAL totals and the question asks for 'monthly average' or 'per month', DIVIDE by 12. If data stores MONTHLY values, just use AVG directly. Check SAMPLE DATA to determine the granularity.",
@@ -83,7 +83,7 @@ SQL_RULES = [
     "HAVING vs WHERE: 'where the average/total X exceeds/is greater than N' across a GROUP = GROUP BY + HAVING AVG(X) > N. This is NOT a per-row WHERE filter. 'average across schools' = group schools by district, compute avg per district, filter with HAVING.",
     "PER-GROUP POSITIONAL: 'the Nth item of EACH group' = use ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY position_col) then filter WHERE rn = N. Do NOT use a global OFFSET.",
     "INTERSECTION LOGIC: 'X with Y containing Z' means: find entities where BOTH conditions hold. Use: WHERE id IN (SELECT id WHERE condition1) AND id IN (SELECT id WHERE condition2). Two separate subqueries intersected, NOT one combined WHERE clause.",
-    "SUPERLATIVE WITH TIES: 'which X has the lowest/highest Y' — if multiple X share the same min/max Y, return ALL of them. Use: WHERE Y = (SELECT MIN/MAX(Y) FROM ...). Never use ORDER BY + LIMIT 1 for superlatives unless the question says 'the one' or 'top 1'.",
+    "SUPERLATIVE WITH TIES (reinforcement): WHERE col = (SELECT MIN/MAX(col)...) is the ONLY correct pattern for superlatives. LIMIT 1 is FORBIDDEN for any question with lowest/highest/most/least/best/worst.",
 ]
 
 
@@ -137,7 +137,7 @@ def _build_sql_prompt(
         if "SELECT THESE COLUMNS" in grounding_context:
             rules += "\n- SELECT the columns listed in SELECT THESE COLUMNS."
         if "EXPECTED OUTPUT" in grounding_context:
-            rules += "\n- Your query's output shape MUST match EXPECTED OUTPUT. If it says columns=2, your SELECT must have exactly 2 columns. If rows=single, ensure only 1 row is returned."
+            rules += "\n- Your query's output shape MUST match EXPECTED OUTPUT for column count. But NEVER use LIMIT 1 just because rows=single — there may be ties or multiple valid matches. Only use LIMIT 1 when combined with ORDER BY for temporal queries (most recent/first)."
         if "DATA FORMAT WARNINGS" in grounding_context:
             rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully. Handle time strings, relative values, and encoded formats as described."
     elif knowledge_text and "formula" in knowledge_text.lower():
@@ -239,7 +239,7 @@ DATABASE SCHEMA:
 Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
   "what_user_wants": "restate EXACTLY what output the user expects — only columns the question EXPLICITLY mentions",
-  "expected_output": {{"columns": "number of output columns", "rows": "single/multiple/all-matching", "description": "e.g., one row with two values: avg_upvotes and avg_age"}},
+  "expected_output": {{"columns": "number of output columns", "rows": "single/multiple/all-matching (use 'all-matching' unless a COUNT/SUM/AVG guarantees exactly 1 row; superlatives and lookups by name may return multiple)", "description": "brief description"}},
   "formula": "the EXACT SQL expression to compute the answer — if GROUND TRUTH defines a metric formula, translate it literally to SQL without simplifying or removing any operations",
   "computation_steps": ["step1: find X", "step2: calculate Y from X"],
   "data_requirements": ["table.column needed for output", "table2.column2 for filter"],
@@ -279,7 +279,7 @@ RULES:
 - GRANULARITY: Check SAMPLE DATA's GRANULARITY annotations. "~12 rows/entity" with monthly dates = monthly data. "~1 row/entity" with yearly = annual data. This determines whether to divide by 12 or not.
 - HAVING vs WHERE: "where the average X exceeds N" or "schools where the average exceeds N" = this is a GROUP-level filter. The formula must use GROUP BY + HAVING, NOT a per-row WHERE clause. The GROUP BY groups by the entity (school, district, etc.), and HAVING filters groups by their aggregate.
 - PER-GROUP POSITIONAL: "the Nth item of EACH group" needs ROW_NUMBER() OVER (PARTITION BY group ORDER BY position). Do NOT use global LIMIT/OFFSET.
-- SUPERLATIVE TIES: "which has the lowest/highest" → use WHERE col = (SELECT MIN/MAX...) to get ALL ties. Do NOT use ORDER BY + LIMIT 1 unless question explicitly says "one" or "top 1".
+- SUPERLATIVE TIES: "which has the lowest/highest" → set expected_output.rows = "all-matching" (NOT "single"). Use WHERE col = (SELECT MIN/MAX...) to get ALL ties. NEVER use LIMIT 1 for superlatives. Multiple rows sharing the same min/max are ALL correct answers.
 """.strip()
 
 GROUNDING_VALIDATE_PROMPT = """You are a strict validator. Check if this plan EXACTLY answers the user's question.
@@ -2213,7 +2213,8 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             r"identify the .+? (?:for|of) the ",
         ]
         expects_singular = any(re.search(p, q_lower) for p in singular_patterns)
-        plural_indicators = ["list", "all", "each", "every", "which", "how many"]
+        plural_indicators = ["list", "all", "each", "every", "which", "how many",
+                             "lowest", "highest", "most", "least", "best", "worst"]
         has_plural = any(p in q_lower for p in plural_indicators)
 
         if expects_singular and not has_plural and len(rows) > 5:
