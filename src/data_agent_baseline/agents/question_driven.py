@@ -120,8 +120,23 @@ def _build_sql_prompt(
     if extra_context:
         parts.append(f"\nEXPLORATORY RESULTS:\n{extra_context}")
 
-    rules = "\n".join(f"- {r}" for r in SQL_RULES)
+    # Decide rule set size based on prompt length so far
+    base_len = sum(len(p) for p in parts)
     has_gaps = bool(gaps)
+
+    if base_len > 4000:
+        # Compact rules for large schemas — keep only essentials
+        rules = """- Answer the EXACT question. SELECT only asked columns. No SELECT *.
+- Use FILTER VALUES exactly as given. Do NOT substitute.
+- If CONSTRAINTS has arithmetic (/ 12, * 100), include it EXACTLY in your SQL.
+- For superlatives (lowest/highest), use WHERE col = (SELECT MIN/MAX(col)...) — no LIMIT.
+- JOIN through FK paths shown in schema. Use LIKE '%X%' COLLATE NOCASE for text.
+- Check SAMPLE DATA for value formats before filtering.
+- Use CAST(x AS REAL) for division. Escape apostrophes with ''.
+- If IMPORTANT section flags a column mismatch, use the column it specifies."""
+    else:
+        rules = "\n".join(f"- {r}" for r in SQL_RULES)
+
     if grounding_context:
         if has_gaps:
             rules += "\n- PREVIOUS ATTEMPT FAILED feedback takes PRIORITY over GROUNDING CONTEXT. If the feedback contradicts the grounding, follow the feedback."
@@ -133,6 +148,8 @@ def _build_sql_prompt(
             rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully. Handle time strings, relative values, and encoded formats as described."
         if "IMPORTANT" in grounding_context and "RE-READ THE QUESTION" in grounding_context:
             rules += "\n- ⚠️ Read the IMPORTANT section carefully. It flags a potential column mismatch — verify your SELECT/GROUP BY uses the column the question actually refers to."
+        if "CONSTRAINTS" in grounding_context and "/" in grounding_context:
+            rules += "\n- ⚠️ FORMULA AUTHORITY: If CONSTRAINTS defines a formula with arithmetic (e.g., AVG(X) / 12, SUM(Y) * 100), your SQL MUST include that EXACT arithmetic. Do NOT simplify or remove operations — the formula is authoritative even if it seems redundant."
     parts.append(f"\nRULES:\n{rules}")
 
     # Put mandatory filter constraint LAST so it's freshest in model's context (only if no gaps)
@@ -244,7 +261,7 @@ RULES:
 - USE CASE AUTHORITY: If DOMAIN KNOWLEDGE includes a MATCHING USE CASE whose title/explanation directly addresses the same condition as the question, copy its WHERE clause EXACTLY. The use case IS the answer — do not second-guess its filter values.
 - For known_values: always include the TABLE name (e.g., "orders.order_date" not just "order_date"). Only use values that exist within that table's SAMPLE DATA range.
 - CRITICAL: Check SAMPLE DATA to decide WHICH TABLE to filter. The same column name in different tables may have different formats or data coverage. Always filter the table that actually contains the data you need.
-- For formula: if DOMAIN KNOWLEDGE defines a metric formula (e.g., "Metric = X / N"), translate it literally to SQL. Keep ALL parts — do NOT remove operations even if you think the data makes them redundant. The aggregation function must match the question intent ("average" → AVG, "total" → SUM).
+- FORMULA AUTHORITY (CRITICAL): If DOMAIN KNOWLEDGE defines a metric formula (e.g., "Average Monthly Consumption = AVG(Consumption) / 12"), translate it LITERALLY to SQL. Keep ALL operations — do NOT remove divisions, multiplications, or other arithmetic even if you think the data granularity makes them redundant. You MUST NOT override the formula with your own reasoning about data frequency. The formula IS the answer. If it says divide by 12, DIVIDE BY 12.
 - "per unit/per item/each" in the question means a RATIO (total ÷ quantity). Check SAMPLE DATA to determine which column is a total vs a quantity, then use division in the formula.
 - For join_paths: trace the FULL FK path shown in DATABASE SCHEMA. Never skip intermediate tables.
 - For data_requirements: be INCLUSIVE. List every table.column that could help answer the question — if a word in the question matches a column name in the schema, INCLUDE that column. Also include columns for joins and filters. The SQL planner will decide which to actually SELECT.
@@ -258,7 +275,7 @@ RULES:
   * WRONG: "In employees with salary > 50000, % managers" → filtering by role='manager' and computing % with salary. CORRECT: filter by salary > 50000, compute % that are managers.
 - RATIO LANGUAGE: "How many times is X more than Y?" or "How many times was X more than Y?" = X divided by Y (a ratio). NOT subtraction, NOT a count. Result is a decimal number (e.g., 2.73).
 - AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attributes (e.g., "average age of users who..."), aggregate FROM the entity table with a WHERE/IN filter. Do NOT join to a detail table — that duplicates entity rows per detail record and corrupts the average. Example: AVG(users.age) for users with >10 posts → SELECT AVG(age) FROM users WHERE id IN (subquery on posts).
-- COLUMN SEMANTICS: If DOMAIN KNOWLEDGE defines column meanings (e.g., "rank = based on fastest lap time", "position = race finish order"), map the question's wording to the CORRECT column. "ranked second" → use the column defined as "ranking", not "position".
+- COLUMN SEMANTICS (CRITICAL): If DOMAIN KNOWLEDGE defines column meanings (e.g., "rank = ranking based on fastestLapTime", "position = race finish order"), you MUST use the column whose DEFINITION matches the question's intent. "ranked second" → use the column DEFINED as "ranking" (rank), NOT "position". Do NOT substitute a different column even if it seems similar. The definition IS authoritative.
 - OUTPUT FORMAT: "What is the X and the Y?" or "average X and average Y" = formula must produce TWO SEPARATE columns. The formula should be "SELECT col1, col2 FROM ..." not "SELECT col1 + col2". Each distinct requested value = one column.
 - TEMPORAL: "last time" / "most recent" / "latest" → ORDER BY date/time DESC LIMIT 1. "posted it last time" means the most recent poster, not any poster. Include ORDER BY in formula.
 - MONTHLY vs YEARLY: If data stores one row PER MONTH (e.g., monthly_stats table with 12 rows per year per entity), "average monthly X" = AVG(value). If data stores ANNUAL totals (one row per year), "average monthly" = AVG(value) / 12. Check SAMPLE DATA row count vs time range to determine granularity.
@@ -270,6 +287,7 @@ RULES:
 - CO-LOCATED MEASURES: When the question mentions a filter condition (e.g., "approved", "active", "completed") AND that filter column exists in a detail table, prefer using the MEASURE column (cost, amount, value) from that SAME detail table rather than a pre-aggregated summary column in a parent table. Detail-level measures with detail-level filters give accurate results; summary columns may double-count or miss the filter.
 - DETAIL vs SUMMARY: If a detail table (more rows, individual records) and a summary table (fewer rows, aggregated totals) BOTH have a value column, use the detail table when the question asks about filtered subsets. Summary tables lose per-record granularity needed for filtering.
 - SUBSET DISCRIMINATION: When multiple similar values exist in the same column (e.g., 'X' and 'X Y'), and the question uses a QUALIFIER that distinguishes them, choose ONLY the value matching the qualifier — do NOT combine them. The SHORT/BASE form typically represents the default unmodified operation, while 'X Y' specifies a VARIANT (e.g., 'VYBER' = cash withdrawal vs 'VYBER KARTOU' = card withdrawal). "cash transactions" = ONLY the base form that means cash, NOT the extended form that specifies a different method. Only use IN(...) with multiple values when the question says "all" without a distinguishing qualifier.
+- PARTIAL MATCH: When the question uses "X-related", "related to X", "X-based", or "from X" with a proper noun, use LIKE '%X%' (not exact =). "Riverside-related school districts" → WHERE district LIKE '%Riverside%'. Only use exact match (=) when the question says "named X", "called X", or "is X" without relational qualifiers.
 """.strip()
 
 def _build_semantic_prompt(
@@ -808,8 +826,9 @@ If NO, respond with ONE sentence describing what's wrong (wrong column, wrong fi
 RULES:
 - If the result has data and the columns match what the question asks → OK.
 - Multiple rows are VALID — do NOT reject just because there are multiple results.
+- NULL/empty values in SOME rows are VALID — the question asks to "list" items, some may legitimately have empty fields. Do NOT reject results just because some cells are NULL or empty.
 - Do NOT question filter values — those are verified.
-- Only flag real problems: NULL values, clearly wrong columns, empty where data should exist, wrong aggregation type."""
+- Only flag REAL problems: clearly wrong columns, wrong aggregation type, or completely empty result where data should exist."""
 
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -1127,8 +1146,22 @@ RULES:
         if grounding:
             feedback = self._semantic_feedback(question, grounding, kg_context)
             if feedback:
-                self._log("grounding_feedback", feedback)
-                grounding["_semantic_overrides"] = [feedback]
+                # Guard: discard feedback that contradicts arithmetic in domain_rules
+                domain_rules = grounding.get("domain_rules", [])
+                feedback_contradicts_formula = False
+                if domain_rules:
+                    domain_text = " ".join(domain_rules).lower()
+                    fb_lower = feedback.lower()
+                    for op in ["/ 12", "/12", "* 100", "*100", "/ 4", "/4", "* 12", "*12"]:
+                        if op.replace(" ", "") in domain_text.replace(" ", ""):
+                            if "divid" in fb_lower or "multiply" in fb_lower or "division" in fb_lower or "without" in fb_lower:
+                                feedback_contradicts_formula = True
+                                break
+                if feedback_contradicts_formula:
+                    self._log("grounding_feedback_discarded", f"Feedback contradicts domain formula: {feedback[:100]}")
+                else:
+                    self._log("grounding_feedback", feedback)
+                    grounding["_semantic_overrides"] = [feedback]
             else:
                 # Deterministic override: if question word matches an exact column name
                 # not used in formula SELECT, inject as override for the SQL planner
@@ -1136,6 +1169,37 @@ RULES:
                 if override:
                     self._log("grounding_deterministic_override", override)
                     grounding["_semantic_overrides"] = [override]
+
+        # Deterministic column-disambiguation: if knowledge defines what a column means
+        # and the question uses a word matching that column, but the formula uses a different column,
+        # fix the known_values and formula to use the correct column.
+        if grounding:
+            col_override, fix_info = self._check_column_disambiguation(question, grounding, kg_context, knowledge_text)
+            if col_override and fix_info:
+                self._log("grounding_col_disambig", col_override)
+                # Fix known_values: rename the wrong column key to the correct one
+                wrong_col = fix_info["wrong_col"]
+                correct_col = fix_info["correct_col"]
+                val = fix_info["val"]
+                known_values = grounding.get("known_values", {})
+                # Find and rename the key
+                for key in list(known_values.keys()):
+                    if key.lower().endswith(f".{wrong_col}"):
+                        table = key.split(".")[0]
+                        known_values[f"{table}.{correct_col}"] = known_values.pop(key)
+                        break
+                # Also fix the formula
+                formula = grounding.get("formula", "")
+                if formula:
+                    grounding["formula"] = re.sub(
+                        rf'\b{re.escape(wrong_col)}\s*=\s*{re.escape(val)}\b',
+                        f'{correct_col} = {val}',
+                        formula,
+                        flags=re.IGNORECASE,
+                    )
+                overrides = grounding.get("_semantic_overrides", [])
+                overrides.append(col_override)
+                grounding["_semantic_overrides"] = overrides
 
         # Deterministic enrichment: add any schema columns whose name matches a question word
         if db_path:
@@ -1369,6 +1433,7 @@ RULES:
         q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
         formula_lower = formula.lower()
         # Find table.column pairs from schema that match question words but aren't in formula
+        # Use prefix matching to handle stemming (e.g., "ranked" matches "rank")
         missing = []
         current_table = ""
         for line in kg_context.split("\n"):
@@ -1376,13 +1441,24 @@ RULES:
                 current_table = line.split("TABLE: ")[1].split(" ")[0].strip()
             elif line.strip().startswith("- ") and current_table:
                 col_name = line.strip()[2:].split(" ")[0].strip()
-                col_parts = set(re.findall(r'[a-z]{3,}', col_name.lower()))
-                if col_parts & q_words:
-                    if col_name.lower() not in formula_lower and f"{current_table}.{col_name}".lower() not in formula_lower:
+                col_lower = col_name.lower()
+                col_parts = set(re.findall(r'[a-z]{3,}', col_lower))
+                # Check exact match OR prefix match (ranked→rank, positions→position)
+                matched = col_parts & q_words
+                if not matched:
+                    for cp in col_parts:
+                        for qw in q_words:
+                            if qw.startswith(cp) or cp.startswith(qw):
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
+                    if col_lower not in formula_lower and f"{current_table}.{col_name}".lower() not in formula_lower:
                         missing.append(f"{current_table}.{col_name}")
 
         if missing:
-            missing_cols_hint = f"\n\nNOTE: The following columns match words in the question but are NOT used in the formula: {', '.join(missing)}. Consider whether any of these should be in the SELECT or GROUP BY instead of/in addition to the current columns."
+            missing_cols_hint = f"\n\nNOTE: The following columns match words in the question but are NOT used in the formula: {', '.join(missing)}. Consider whether any of these should be in the SELECT, GROUP BY, or WHERE clause instead of/in addition to the current columns. If DOMAIN RULES define what a column means (e.g., 'rank = ranking by fastest lap'), and the question uses that word ('ranked'), the formula MUST use that column — not a similar-sounding one."
 
         # Show domain rules so feedback doesn't contradict them
         domain_section = ""
@@ -1408,6 +1484,7 @@ If there's a problem with SELECT columns or GROUP BY, respond with ONE sentence 
 RULES:
 - Do NOT question WHERE filter values — they come from verified domain knowledge.
 - Do NOT suggest different filter values based on column ranges or your assumptions.
+- Do NOT question arithmetic operations (/ 12, * 100, etc.) if DOMAIN RULES define a formula. The formula IS authoritative — do not override it with your reasoning about data granularity.
 - ONLY flag issues with which columns are in SELECT or how results are grouped/aggregated.
 - If a word in the question (e.g., "type", "status", "name") matches an actual column name in the schema, the question likely refers to THAT column directly.
 - "total value" = a single aggregated number per group, not individual line items.
@@ -1422,8 +1499,95 @@ RULES:
             return ""
         return raw
 
+    def _check_column_disambiguation(self, question: str, grounding: dict[str, Any], kg_context: str, knowledge_text: str = "") -> tuple[str, dict[str, str] | None]:
+        """Deterministic check: knowledge defines column semantics but formula uses wrong column.
+
+        Returns (override_text, fix_info_dict) or ("", None) if no mismatch.
+        fix_info has keys: wrong_col, correct_col, val.
+        """
+        formula = grounding.get("formula", "")
+        if not formula or not knowledge_text:
+            return "", None
+
+        q_lower = question.lower()
+        formula_lower = formula.lower()
+        q_words = set(re.findall(r'\b[a-z]{3,}\b', q_lower))
+
+        # Pattern: "- **col**: definition" or "- col: definition"
+        col_definitions: dict[str, str] = {}
+        for m in re.finditer(
+            r'[-*]\s*\*?\*?(\w+)\*?\*?\s*:\s*(.+?)(?:\n|$)',
+            knowledge_text, re.IGNORECASE
+        ):
+            col_name = m.group(1).lower()
+            definition = m.group(2).lower().strip()
+            col_definitions[col_name] = definition
+
+        if not col_definitions:
+            return "", None
+
+        # Get all real column names from kg_context
+        schema_cols: set[str] = set()
+        for line in kg_context.split("\n"):
+            if line.strip().startswith("- "):
+                col = line.strip()[2:].split(" ")[0].strip().lower()
+                if col:
+                    schema_cols.add(col)
+
+        # Find question words that match defined columns via prefix/stem
+        matched_col = ""
+        for col_name in col_definitions:
+            if col_name not in schema_cols:
+                continue
+            for qw in q_words:
+                if qw == col_name or qw.startswith(col_name) or col_name.startswith(qw):
+                    matched_col = col_name
+                    break
+            if matched_col:
+                break
+
+        if not matched_col:
+            return "", None
+
+        # Check if the matched column is already in the formula WHERE
+        where_match = re.search(r'where\b(.+)', formula_lower, re.DOTALL)
+        if not where_match:
+            return "", None
+
+        where_clause = where_match.group(1)
+        if re.search(rf'\b{re.escape(matched_col)}\b', where_clause):
+            return "", None
+
+        # The matched column is NOT in WHERE. Check if a DIFFERENT column with a small numeric filter
+        # is being used that could be confusable (e.g., ordinal values like 1,2,3)
+        other_filters = re.findall(r'(\w+)\s*=\s*(\d+)', where_clause)
+        for other_col, val in other_filters:
+            other_col_lower = other_col.lower()
+            if other_col_lower == matched_col:
+                continue
+            # Only flag ordinal-like values (small numbers ≤ 100) to avoid false positives on years/IDs
+            if int(val) > 100:
+                continue
+            # The other column must be in schema and be a plausible ordinal/ranking column
+            if other_col_lower in schema_cols:
+                col_def = col_definitions[matched_col][:80]
+                other_def = col_definitions.get(other_col_lower, "")[:80]
+                override = (
+                    f"COLUMN MISMATCH: Question word matches '{matched_col}' "
+                    f"(defined as: {col_def}), but formula uses '{other_col_lower}' "
+                    f"(defined as: {other_def or 'no explicit definition'}). "
+                    f"Use WHERE {matched_col} = {val} instead of WHERE {other_col_lower} = {val}."
+                )
+                fix_info = {"wrong_col": other_col_lower, "correct_col": matched_col, "val": val}
+                return override, fix_info
+
+        return "", None
+
     def _validate_formula_deterministic(self, db_path: Path, formula: str) -> str:
         """Validate formula SQL by executing with LIMIT 0. Returns error string or empty."""
+        # Skip validation for expression-only formulas (not full SELECT statements)
+        if not formula.strip().upper().startswith("SELECT"):
+            return ""
         conn = None
         try:
             conn = sqlite3.connect(str(db_path), timeout=5)
@@ -1583,6 +1747,35 @@ RULES:
                             break
                     except Exception:
                         pass
+            # Check for mostly-NULL filter columns (indicates wrong column choice)
+            for col_name, values in list(known_values.items()):
+                if "." not in col_name:
+                    continue
+                table_name, col_n = col_name.split(".", 1)
+                # Only check numeric comparison filters (< > <= >=)
+                is_comparison = any(
+                    v.strip().startswith(("<", ">")) for v in values if isinstance(v, str)
+                )
+                if not is_comparison:
+                    continue
+                try:
+                    total = conn.execute(
+                        f'SELECT COUNT(*) FROM "{table_name}"'
+                    ).fetchone()[0]
+                    non_null = conn.execute(
+                        f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_n}" IS NOT NULL'
+                    ).fetchone()[0]
+                    if total > 0 and non_null / total < 0.1:
+                        domain_rules = grounding.setdefault("domain_rules", [])
+                        domain_rules.append(
+                            f"WARNING: {table_name}.{col_n} is NULL for {total - non_null}/{total} rows "
+                            f"({100 * (total - non_null) / total:.0f}%). This column may not be the right "
+                            f"filter target. Check if another table has this attribute per-record."
+                        )
+                        self._log("filter_null_warning",
+                                  f"{table_name}.{col_n} is {100 * (total - non_null) / total:.0f}% NULL")
+                except Exception:
+                    pass
         finally:
             conn.close()
 
