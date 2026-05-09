@@ -272,6 +272,7 @@ RULES:
 - SUPERLATIVE TIES: "which has the lowest/highest" → set expected_output.rows = "all-matching" (NOT "single"). Use WHERE col = (SELECT MIN/MAX...) to get ALL ties. NEVER use LIMIT 1 for superlatives. Multiple rows sharing the same min/max are ALL correct answers.
 - CO-LOCATED MEASURES: When the question mentions a filter condition (e.g., "approved", "active", "completed") AND that filter column exists in a detail table, prefer using the MEASURE column (cost, amount, value) from that SAME detail table rather than a pre-aggregated summary column in a parent table. Detail-level measures with detail-level filters give accurate results; summary columns may double-count or miss the filter.
 - DETAIL vs SUMMARY: If a detail table (more rows, individual records) and a summary table (fewer rows, aggregated totals) BOTH have a value column, use the detail table when the question asks about filtered subsets. Summary tables lose per-record granularity needed for filtering.
+- SUBSET DISCRIMINATION: When multiple similar values exist in the same column (e.g., 'X' and 'X Y'), and the question uses a QUALIFIER that distinguishes them, choose ONLY the value matching the qualifier — do NOT combine them. The SHORT/BASE form typically represents the default unmodified operation, while 'X Y' specifies a VARIANT (e.g., 'VYBER' = cash withdrawal vs 'VYBER KARTOU' = card withdrawal). "cash transactions" = ONLY the base form that means cash, NOT the extended form that specifies a different method. Only use IN(...) with multiple values when the question says "all" without a distinguishing qualifier.
 """.strip()
 
 def _build_semantic_prompt(
@@ -566,10 +567,15 @@ class QuestionDrivenAgent:
                         all_gaps.add(f"SQL ERROR: {sql_error}. Check column names and table names against the DATABASE SCHEMA.")
                     else:
                         self._log("evaluate", "Verdict: incomplete (empty result)")
-                        all_gaps.add(
-                            "Query returned 0 rows. One or more WHERE filters don't match actual data. "
-                            "Check SAMPLE DATA for correct values, formats, and column names."
-                        )
+                        # Extract WHERE values from the failed SQL and flag them
+                        where_hint = self._diagnose_empty_from_sql(sql, sql_sample_data)
+                        if where_hint:
+                            all_gaps.add(where_hint)
+                        else:
+                            all_gaps.add(
+                                "Query returned 0 rows. One or more WHERE filters don't match actual data. "
+                                "Check SAMPLE DATA for correct values, formats, and column names."
+                            )
                     failed_sqls.append(sql)
                     gaps_text = "\n".join(f"- {g}" for g in all_gaps)
                     gaps_text += "\n".join(
@@ -1558,6 +1564,50 @@ RULES:
         grounding["known_values"] = known_values
         return grounding
 
+
+    def _diagnose_empty_from_sql(self, sql: str, sample_data: str) -> str:
+        """Parse the failed SQL's WHERE clause and check values against SAMPLE DATA.
+
+        No DB access — purely string-based analysis.
+        """
+        if not sql or "WHERE" not in sql.upper():
+            return ""
+
+        # Extract WHERE clause
+        where_idx = sql.upper().find("WHERE")
+        where_clause = sql[where_idx + 5:].strip()
+        for keyword in ["ORDER BY", "GROUP BY", "LIMIT", "HAVING"]:
+            kw_idx = where_clause.upper().find(keyword)
+            if kw_idx > 0:
+                where_clause = where_clause[:kw_idx].strip()
+
+        # Extract individual conditions
+        conditions = [c.strip() for c in re.split(r'\bAND\b', where_clause, flags=re.IGNORECASE) if c.strip()]
+        if not conditions:
+            return ""
+
+        # Extract string values used in filters
+        issues: list[str] = []
+        sample_lower = sample_data.lower()
+        for cond in conditions:
+            str_values = re.findall(r"'([^']*)'", cond)
+            for val in str_values:
+                if val and val.lower() not in sample_lower:
+                    issues.append(f"Filter value '{val}' in condition '{cond}' not found in SAMPLE DATA — likely wrong value or wrong column.")
+            # Check numeric comparisons against a column that might not have matching values
+            num_comparisons = re.findall(r'(\w+(?:\.\w+)?)\s*[<>=!]+\s*(\d+)', cond)
+            for col_ref, num_val in num_comparisons:
+                col_name = col_ref.split(".")[-1].lower() if "." in col_ref else col_ref.lower()
+                # Check if this column's sample values suggest the number is out of range
+                # Look for the column in sample data
+                if col_name in sample_lower:
+                    # Found the column — check if num_val appears anywhere near sample values
+                    if num_val not in sample_data:
+                        issues.append(f"Numeric filter '{cond}' — value {num_val} not seen in SAMPLE DATA for column '{col_name}'. Check if this column/value is correct.")
+
+        if issues:
+            return "EMPTY RESULT — these filters likely caused it:\n" + "\n".join(f"  - {i}" for i in issues[:3])
+        return "Query returned 0 rows. The combined WHERE conditions are too restrictive — try removing or relaxing one filter at a time."
 
     def _diagnose_empty_result(self, db_path: Path, sql: str) -> str:
         """When SQL returns 0 rows, isolate which filter causes the empty result.
