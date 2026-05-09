@@ -464,14 +464,9 @@ def run_benchmark_command(
         zero_count = sum(1 for _, s in scores if s == 0.0)
 
         console.print(f"\n[bold]━━━ Official Scoring ━━━[/bold]")
-        console.print(f"  Tasks scored: {len(scores)}")
-        console.print(f"  [green]Perfect (1.0): {perfect_count}[/green]")
-        console.print(f"  [yellow]Partial (>0): {partial_count}[/yellow]")
-        console.print(f"  [red]Zero: {zero_count}[/red]")
-        console.print(f"  [bold]Average Score: {avg_score:.4f}[/bold]")
 
-        # Per-task breakdown sorted by score
-        console.print(f"\n  [dim]Per-task scores:[/dim]")
+        # Per-task breakdown sorted by score first
+        console.print(f"  [dim]Per-task scores:[/dim]")
         for tid, s in sorted(scores, key=lambda x: x[1]):
             if s == 1.0:
                 console.print(f"    [green]✓ {tid}: {s:.4f}[/green]")
@@ -479,6 +474,13 @@ def run_benchmark_command(
                 console.print(f"    [yellow]~ {tid}: {s:.4f}[/yellow]")
             else:
                 console.print(f"    [red]✗ {tid}: {s:.4f}[/red]")
+
+        # Summary stats last
+        console.print(f"\n  Tasks scored: {len(scores)}")
+        console.print(f"  [green]Perfect (1.0): {perfect_count}[/green]")
+        console.print(f"  [yellow]Partial (>0): {partial_count}[/yellow]")
+        console.print(f"  [red]Zero: {zero_count}[/red]")
+        console.print(f"  [bold]Average Score: {avg_score:.4f}[/bold]")
 
 
 @app.command()
@@ -650,18 +652,19 @@ def tui(
         total_score = sum(s for _, _, s in results)
         avg_score = total_score / total if total > 0 else 0.0
 
-        console.print(f"  Tasks run: {total}")
-        console.print(f"  [green]Perfect (1.0): {perfect}[/green]")
-        console.print(f"  [yellow]Partial (>0): {partial}[/yellow]")
-        console.print(f"  [red]Zero score: {wrong + no_pred}[/red]")
-        console.print(f"  [bold]Average Score: {avg_score:.4f} (total={total_score:.4f}/{total})[/bold]")
-
-        # Per-task breakdown
-        console.print("\n  [dim]Breakdown:[/dim]")
+        # Per-task breakdown first
+        console.print("  [dim]Breakdown:[/dim]")
         for tid, v, s in results:
             icon = {"perfect": "✓", "partial": "~", "wrong": "✗", "no_pred": "✗", "no_gold": "?"}[v]
             color = {"perfect": "green", "partial": "yellow", "wrong": "red", "no_pred": "red", "no_gold": "dim"}[v]
             console.print(f"    [{color}]{icon} {tid} (score={s:.4f})[/{color}]")
+
+        # Summary stats last
+        console.print(f"\n  Tasks run: {total}")
+        console.print(f"  [green]Perfect (1.0): {perfect}[/green]")
+        console.print(f"  [yellow]Partial (>0): {partial}[/yellow]")
+        console.print(f"  [red]Zero score: {wrong + no_pred}[/red]")
+        console.print(f"  [bold]Average Score: {avg_score:.4f} (total={total_score:.4f}/{total})[/bold]")
 
 
 def main() -> None:

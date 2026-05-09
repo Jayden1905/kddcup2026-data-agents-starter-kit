@@ -39,6 +39,7 @@ class TableSchema:
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     row_count: int = 0
     sample_values: dict[str, list[Any]] = field(default_factory=dict)
+    col_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -160,6 +161,31 @@ def _introspect_table(conn: sqlite3.Connection, table_name: str) -> TableSchema 
         except Exception:
             pass
 
+    # Column statistics: cardinality, min/max/avg for numeric columns
+    col_stats: dict[str, dict[str, Any]] = {}
+    for col in columns:
+        stats: dict[str, Any] = {}
+        try:
+            distinct_count = conn.execute(
+                f'SELECT COUNT(DISTINCT "{col.name}") FROM "{table_name}" '
+                f'WHERE "{col.name}" IS NOT NULL'
+            ).fetchone()[0]
+            stats["distinct"] = distinct_count
+            # Numeric stats
+            if col.sql_type.upper() in ("INTEGER", "INT", "REAL", "FLOAT", "NUMERIC", "DOUBLE"):
+                row = conn.execute(
+                    f'SELECT MIN("{col.name}"), MAX("{col.name}"), AVG("{col.name}") '
+                    f'FROM "{table_name}" WHERE "{col.name}" IS NOT NULL'
+                ).fetchone()
+                if row and row[0] is not None:
+                    stats["min"] = row[0]
+                    stats["max"] = row[1]
+                    stats["avg"] = round(row[2], 2) if row[2] is not None else None
+        except Exception:
+            pass
+        if stats:
+            col_stats[col.name] = stats
+
     return TableSchema(
         name=table_name,
         columns=columns,
@@ -167,6 +193,7 @@ def _introspect_table(conn: sqlite3.Connection, table_name: str) -> TableSchema 
         foreign_keys=foreign_keys,
         row_count=row_count,
         sample_values=sample_values,
+        col_stats=col_stats,
     )
 
 
@@ -429,7 +456,18 @@ def format_kg_for_llm(kg: KnowledgeGraph, max_sample_values: int = 8) -> str:
             if col.name in table.sample_values:
                 vals = table.sample_values[col.name][:max_sample_values]
                 sample = f"  e.g. {vals}"
-            lines.append(f"  - {col.name} ({col.sql_type}{nullable}){pk_mark}{sample}")
+            # Add compact stats
+            stats_str = ""
+            if col.name in table.col_stats:
+                st = table.col_stats[col.name]
+                stat_parts = []
+                if "distinct" in st:
+                    stat_parts.append(f"{st['distinct']} unique")
+                if "min" in st and "max" in st:
+                    stat_parts.append(f"range [{st['min']}..{st['max']}]")
+                if stat_parts:
+                    stats_str = f"  ({', '.join(stat_parts)})"
+            lines.append(f"  - {col.name} ({col.sql_type}{nullable}){pk_mark}{stats_str}{sample}")
 
         # Explicit FKs
         for fk in table.foreign_keys:
