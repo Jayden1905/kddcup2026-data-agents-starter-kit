@@ -98,7 +98,7 @@ def _build_sql_prompt(
     extra_context: str = "",
     grounding_context: str = "",
 ) -> str:
-    parts = ["Write a SQL query to answer the question."]
+    parts = [f"QUESTION: {question}\n\nWrite a SQL query to answer the QUESTION above."]
 
     parts.append(f"\nDATABASE SCHEMA:\n{kg_context}")
 
@@ -119,8 +119,6 @@ def _build_sql_prompt(
 
     if extra_context:
         parts.append(f"\nEXPLORATORY RESULTS:\n{extra_context}")
-
-    parts.append(f"\nQUESTION: {question}")
 
     rules = "\n".join(f"- {r}" for r in SQL_RULES)
     has_gaps = bool(gaps)
@@ -153,6 +151,7 @@ def _build_sql_prompt(
         if fv_match:
             parts.append(f"\n⚠️ MANDATORY WHERE CLAUSE (do NOT change these values):\n{fv_match.group(1).strip()}")
 
+    parts.append(f"\nREMINDER — answer THIS question: {question}")
     parts.append('\nReturn ONLY a JSON object:\n{"thought": "reasoning", "sql": "SELECT ..."}')
 
     return "\n".join(parts)
@@ -168,9 +167,7 @@ def _build_evaluate_prompt(
     knowledge_text: str = "",
     grounding_context: str = "",
 ) -> str:
-    parts = ["Evaluate whether these query results answer the question."]
-
-    parts.append(f"\nQUESTION: {question}")
+    parts = [f"QUESTION: {question}\n\nDoes the SQL result below answer this QUESTION?"]
 
     if knowledge_text:
         parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1500]}")
@@ -187,24 +184,22 @@ def _build_evaluate_prompt(
 
     parts.append(f"\nRESULTS:\n{data_text}")
 
-    parts.append("""
-Return ONLY a JSON object:
-{"verdict": "complete"/"incomplete", "reasoning": "why", "gaps": [], "info_queries": [], "suggested_sql": "..."}
+    parts.append(f"""
+Re-read the QUESTION: {question}
+Does the RESULTS data answer it? Return ONLY a JSON object:
+{{"verdict": "complete"/"incomplete", "reasoning": "why", "gaps": [], "info_queries": [], "suggested_sql": "..."}}
 
-- Re-read the QUESTION. Does the data ACTUALLY answer what was asked?
-- PRIORITY: If the query RETURNS DATA and the data answers the QUESTION, verdict is "complete" — even if the SQL deviates from VALIDATED PLAN's filter values. The plan can be wrong; the data doesn't lie.
-- Only mark "incomplete" if: the result is EMPTY, has an error, has wrong columns, or the data clearly does NOT answer the question.
-- The SQL may use different arithmetic/expressions than the FORMULA if it better matches the QUESTION's semantics. Do NOT reject a query just because its expression differs from FORMULA.
-- MULTIPLE ROWS ARE VALID: If the query returns multiple rows, that means there are ties or multiple matches — this is CORRECT. Do NOT mark as incomplete just because there are multiple results.
-- suggested_sql should try to fix the actual problem. Never repeat the same failing query.
-- LOGIC CHECK for percentages/ratios: Re-read the QUESTION's sentence structure. "In X, what % of Y?" means the WHERE should filter for X (the population), and the percentage numerator should count Y within X. If the SQL has it backwards (filtering Y and computing % of X), mark incomplete and provide corrected SQL.
-- LOGIC CHECK for "how many times more": This means division (X/Y), NOT subtraction. If the SQL uses subtraction, mark incomplete.
-- LOGIC CHECK for aggregation: If the question asks "average [attribute] of [entities] who..." and the SQL JOINs entities to a detail table before computing AVG, the average is WRONG (inflated by duplicate entity rows). Mark incomplete with correct approach.
-- NULL CHECK: If any result value is None/NULL, the query is WRONG. A NULL means the computation failed (missing JOIN, wrong column, empty subquery). Mark incomplete and suggest a fix.
-- COLUMN COUNT CHECK: If the question asks for "X and Y" (two distinct values), the result MUST have 2+ columns. If it has only 1 column that sums/concatenates X and Y, mark incomplete.
-- TEMPORAL CHECK: If the question says "last" or "most recent", verify the SQL uses ORDER BY ... DESC LIMIT 1 (or equivalent). If it returns the first/any match instead, mark incomplete.
-- HAVING CHECK: If the question says "where the average/total exceeds N" referring to a group aggregate, verify the SQL uses GROUP BY + HAVING (not just WHERE). A per-row filter on a column that needs averaging across a group is WRONG.
-- SCOPE CHECK: If the question uses "the" (singular definite) and the result has many rows, consider whether additional filters from the question context were missed. If the expected answer is clearly 1 row but you got many, mark incomplete.""")
+- If the result has data and it answers the QUESTION, verdict is "complete" — even if SQL differs from the plan.
+- "incomplete" only if: empty result, error, wrong columns, or data clearly does NOT answer the question.
+- Multiple rows are valid (ties/multiple matches). Do NOT reject just because of multiple results.
+- suggested_sql must fix the actual problem. Never repeat the same failing query.
+- NULL CHECK: Any NULL value = wrong query. Mark incomplete.
+- COLUMN COUNT: "X and Y" in question = 2+ columns in result.
+- LOGIC: "In X, what % of Y?" → X is WHERE filter. "How many times more" = division not subtraction.
+- AGGREGATION: AVG of entity attributes via JOIN to detail table = WRONG (duplicated rows).
+- TEMPORAL: "last/most recent" needs ORDER BY DESC LIMIT 1.
+- HAVING: "where the average exceeds N" = GROUP BY + HAVING, not WHERE.
+- SCOPE: "the X" (singular definite) expecting 1 row but got many = missing filters. Mark incomplete.""")
 
     return "\n".join(parts)
 
@@ -258,6 +253,8 @@ Decompose the question into a structured plan. Return ONLY a JSON object:
 RULES:
 - Start by understanding what_user_wants — every other field must serve that goal.
 - GROUND TRUTH section contains immutable facts extracted from domain knowledge. You MUST follow them exactly.
+- EXACT LEVEL MATCHING: When GROUND TRUTH defines distinct named levels (e.g., "high = 1", "medium = 2", "low = 3"), the question's EXACT wording determines WHICH SINGLE level to use. "medium priority" = only the value labeled "medium" (2), NOT "high" (1). Do NOT combine multiple levels unless the question explicitly says "X or above" or "at least X". Each named label maps to exactly one value.
+- USE CASE AUTHORITY: If GROUND TRUTH includes a MATCHING USE CASE whose title/explanation directly addresses the same condition as the question, copy its WHERE clause EXACTLY. The use case IS the answer — do not second-guess its filter values.
 - For known_values: always include the TABLE name (e.g., "orders.order_date" not just "order_date"). Only use values that exist within that table's SAMPLE DATA range.
 - CRITICAL: Check SAMPLE DATA to decide WHICH TABLE to filter. The same column name in different tables may have different formats or data coverage. Always filter the table that actually contains the data you need.
 - For formula: if GROUND TRUTH defines a metric formula (e.g., "Metric = X / N"), translate it literally to SQL. Keep ALL parts — do NOT remove operations even if you think the data makes them redundant. The aggregation function must match the question intent ("average" → AVG, "total" → SUM).
@@ -486,20 +483,20 @@ def _build_answer_prompt(
     if knowledge_text:
         parts.append(f"\nDOMAIN KNOWLEDGE:\n{knowledge_text[:1500]}")
 
-    parts.append("""
+    parts.append(f"""
 Return ONLY a JSON object:
-{"columns": ["col1", "col2"], "rows": [["value1", "value2"], ...]}
+{{"columns": ["col1", "col2"], "rows": [["value1", "value2"], ...]}}
 
 RULES:
 - Return EVERY row from SQL OUTPUT — never drop or truncate rows.
-- Drop columns that are NOT needed to answer the question (e.g., intermediate IDs used only for joining).
-- NEVER merge multiple columns into one (e.g., don't combine first_name + last_name into full_name).
-- If a column contains a "full name" (e.g., "John Smith") and the question asks for "full name" or "first name and last name", split it into first_name and last_name columns.
-- If a name column contains "Firstname Lastname" as a single string, split on space: first word = first_name, rest = last_name.
-- NEVER rename columns — use the exact SQL column names (except for name splitting above).
+- Drop columns NOT needed to answer the question (e.g., intermediate IDs used only for joining).
+- NEVER merge multiple columns into one.
+- If a name column has "Firstname Lastname" as one string and the question asks for both, split into two columns.
+- NEVER rename columns — use the exact SQL column names.
 - Do NOT transform values — keep them exactly as in SQL OUTPUT.
 - Do NOT add rows that aren't in SQL OUTPUT.
-- If any value is None/NULL and the question expects a real answer, this indicates the SQL was wrong — still output what you have but note that NULL values signal a problem.""")
+
+QUESTION being answered: {question}""")
 
     return "\n".join(parts)
 
@@ -1041,24 +1038,41 @@ RULES:
         )
         use_cases = use_case_pattern.findall(knowledge_text)
 
-        # Score each use case by keyword overlap with question
-        q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
+        # Score each use case by relevance to question
+        # Prioritize use cases whose WHERE/filter condition matches the question's filter intent
+        q_lower = question.lower()
+        q_words = set(re.findall(r'\b[a-z]{3,}\b', q_lower))
+
+        # Extract the core filter terms from the question (nouns after "with/where/for/of")
+        filter_phrases = re.findall(
+            r'(?:with|where|for|of)\s+([a-z\s]+?)(?:\s*,|\s*list|\s*what|\s*how|\?|$)',
+            q_lower,
+        )
+        filter_words = set()
+        for phrase in filter_phrases:
+            filter_words.update(w for w in phrase.split() if len(w) >= 3)
+
         best_use_case = None
         best_score = 0
         for uc_title, uc_sql, uc_explanation in use_cases:
-            uc_words = set(re.findall(r'\b[a-z]{3,}\b', uc_title.lower() + " " + uc_explanation.lower()))
+            uc_text = uc_title.lower() + " " + uc_explanation.lower()
+            uc_words = set(re.findall(r'\b[a-z]{3,}\b', uc_text))
+            # Base score: keyword overlap
             overlap = len(q_words & uc_words)
-            if overlap > best_score:
-                best_score = overlap
+            # Bonus: if the use case title/explanation mentions the question's filter terms
+            filter_overlap = len(filter_words & uc_words)
+            score = overlap + filter_overlap * 3
+            if score > best_score:
+                best_score = score
                 best_use_case = (uc_title.strip(), uc_sql.strip(), uc_explanation.strip())
 
-        if best_use_case and best_score >= 3:
+        if best_use_case and best_score >= 5:
             deterministic_parts.append(
-                f"MATCHING USE CASE (high confidence, score={best_score}):\n"
+                f"MATCHING USE CASE (score={best_score}):\n"
                 f"  Title: {best_use_case[0]}\n"
                 f"  SQL: {best_use_case[1]}\n"
                 f"  Explanation: {best_use_case[2]}\n"
-                f"  ⚠️ THIS SQL IS AUTHORITATIVE — follow its WHERE clause values exactly."
+                f"  ⚠️ THIS USE CASE closely matches your question — follow its WHERE values and logic."
             )
 
         # Extract all field definitions with their exact values/meanings
