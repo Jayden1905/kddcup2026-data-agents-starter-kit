@@ -474,6 +474,32 @@ class QuestionDrivenAgent:
             # Use schema slice for SQL planner if available, otherwise full schema
             sql_schema = schema_slice if schema_slice else kg_context
 
+            # Filter sample data to only include tables in schema slice
+            sql_sample_data = sample_data
+            if schema_slice:
+                slice_tables = set()
+                for line in schema_slice.split("\n"):
+                    if line.startswith("TABLE: "):
+                        tname = line.split("TABLE: ")[1].split(" ")[0].strip()
+                        slice_tables.add(tname.lower())
+                if slice_tables:
+                    filtered_parts: list[str] = []
+                    current_block: list[str] = []
+                    include_block = False
+                    for line in sample_data.split("\n"):
+                        if line.startswith("TABLE "):
+                            if current_block and include_block:
+                                filtered_parts.extend(current_block)
+                            current_block = [line]
+                            tname = line.split("TABLE ")[1].split(" ")[0].strip()
+                            include_block = tname.lower() in slice_tables
+                        else:
+                            current_block.append(line)
+                    if current_block and include_block:
+                        filtered_parts.extend(current_block)
+                    if filtered_parts:
+                        sql_sample_data = "\n".join(filtered_parts)
+
             # Step 5b: Value Discovery — probe DB for actual filter values
             value_discovery = self._discover_filter_values(
                 question, db_path, kg, grounding_context, ctx.knowledge_text,
@@ -511,7 +537,7 @@ class QuestionDrivenAgent:
 
                 # PLAN: Generate SQL (incorporate gaps + extra context if any)
                 sql = self._call_sql(
-                    question, sql_schema, sample_data,
+                    question, sql_schema, sql_sample_data,
                     ctx.knowledge_text, gaps=gaps_text,
                     extra_context=extra_context,
                     column_hints=col_hints,
@@ -537,18 +563,13 @@ class QuestionDrivenAgent:
                 if not data_result.get("rows"):
                     if sql_error:
                         self._log("evaluate", f"Verdict: incomplete (SQL error: {sql_error})")
-                        error_hint = self._diagnose_sql_error(db_path, sql, sql_error)
-                        all_gaps.add(f"SQL ERROR: {sql_error}. {error_hint}")
+                        all_gaps.add(f"SQL ERROR: {sql_error}. Check column names and table names against the DATABASE SCHEMA.")
                     else:
                         self._log("evaluate", "Verdict: incomplete (empty result)")
-                        diag = self._diagnose_empty_result(db_path, sql)
-                        if diag:
-                            all_gaps.add(diag)
-                        else:
-                            all_gaps.add(
-                                "Query returned 0 rows — check table names, "
-                                "join columns, and filter values against SAMPLE DATA"
-                            )
+                        all_gaps.add(
+                            "Query returned 0 rows. One or more WHERE filters don't match actual data. "
+                            "Check SAMPLE DATA for correct values, formats, and column names."
+                        )
                     failed_sqls.append(sql)
                     gaps_text = "\n".join(f"- {g}" for g in all_gaps)
                     gaps_text += "\n".join(
@@ -1394,18 +1415,20 @@ RULES:
 
     def _validate_formula_deterministic(self, db_path: Path, formula: str) -> str:
         """Validate formula SQL by executing with LIMIT 0. Returns error string or empty."""
+        conn = None
         try:
-            conn = sqlite3.connect(str(db_path))
-            # Wrap in LIMIT 0 to validate without returning data
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            conn.execute("PRAGMA busy_timeout = 5000")
             test_sql = f"SELECT * FROM ({formula}) LIMIT 0"
             conn.execute(test_sql)
             conn.close()
             return ""
         except Exception as e:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             return str(e)
 
     def _validate_filter_values(
@@ -1537,7 +1560,11 @@ RULES:
 
 
     def _diagnose_empty_result(self, db_path: Path, sql: str) -> str:
-        """When SQL returns 0 rows, isolate which filter causes the empty result."""
+        """When SQL returns 0 rows, isolate which filter causes the empty result.
+
+        Returns an actionable diagnosis: identifies the blocker filter and shows
+        actual DB values so the planner can fix it in one iteration.
+        """
         if not sql or not db_path.exists():
             return ""
 
@@ -1558,22 +1585,13 @@ RULES:
                 ).fetchone()[0]
                 if base_count == 0:
                     diagnostics.append(
-                        "JOIN itself returns 0 rows — check JOIN conditions and table relationships."
+                        "JOIN itself returns 0 rows — the JOIN conditions are wrong. Check FK paths."
                     )
-                    # Show available tables and their columns
-                    tables = [r[0] for r in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    ).fetchall()]
-                    for tname in tables:
-                        if tname.lower() in sql.lower() or tname.startswith("_"):
-                            continue
-                        cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
-                        diagnostics.append(f"  Available table '{tname}': columns={cols}")
                     return "EMPTY RESULT DIAGNOSIS:\n" + "\n".join(diagnostics)
             except Exception:
                 pass
 
-            # Extract individual WHERE conditions and test each removal
+            # Extract individual WHERE conditions
             where_clause = sql[where_idx + 5:].strip()
             for keyword in ["ORDER BY", "GROUP BY", "LIMIT", "HAVING"]:
                 kw_idx = where_clause.upper().find(keyword)
@@ -1582,104 +1600,70 @@ RULES:
 
             conditions = [c.strip() for c in re.split(r'\bAND\b', where_clause, flags=re.IGNORECASE) if c.strip()]
 
-            if len(conditions) >= 1:
-                for i, cond in enumerate(conditions):
-                    remaining = [c for j, c in enumerate(conditions) if j != i]
-                    test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}" if remaining else base_sql
-                    try:
-                        count = conn.execute(
-                            f"SELECT COUNT(*) FROM ({test_sql})"
-                        ).fetchone()[0]
-                        if count > 0:
-                            diagnostics.append(
-                                f"BLOCKER: filter '{cond.strip()}' eliminates all rows. Without it: {count} rows."
-                            )
-                            # Extract the column and value from the condition
-                            # Try to find table.col or col references
-                            col_found = False
-                            for part in cond.replace("(", " ").replace(")", " ").split():
-                                col_ref = part.strip("\"'`=<>!,")
-                                if not col_ref or col_ref.upper() in ("AND", "OR", "NOT", "IN", "LIKE", "IS", "NULL", "BETWEEN"):
-                                    continue
-                                if "." in col_ref:
-                                    _, col = col_ref.split(".", 1)
-                                    col = col.strip("\"'`")
-                                else:
-                                    col = col_ref
-                                try:
-                                    actual = conn.execute(
-                                        f'SELECT DISTINCT "{col}" FROM ({test_sql}) WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 15'
-                                    ).fetchall()
-                                    vals = [r[0] for r in actual]
-                                    if vals:
-                                        diagnostics.append(
-                                            f"  ACTUAL values for '{col}': {vals}"
-                                        )
-                                        # Extract what value was used in the filter
-                                        str_match = re.findall(r"'([^']*)'", cond)
-                                        if str_match:
-                                            used_val = str_match[0]
-                                            # Check for close matches (LIKE pattern)
-                                            close = [v for v in vals if isinstance(v, str) and (
-                                                used_val.lower() in v.lower() or v.lower() in used_val.lower()
-                                            )]
-                                            if close:
-                                                diagnostics.append(f"  SUGGESTION: Use LIKE '%{used_val}%' or exact match '{close[0]}'")
-                                            else:
-                                                diagnostics.append(f"  Your filter used '{used_val}' but it does NOT exist. Use one of the actual values above.")
-                                        col_found = True
-                                        break
-                                except Exception:
-                                    continue
-                            if not col_found:
-                                # Show all columns of tables in the base query
-                                diagnostics.append(f"  Could not identify column. Check if the column name is correct.")
-                    except Exception:
-                        pass
-
-            # If single condition and no diagnosis yet, show what exists
-            if not diagnostics and len(conditions) == 1:
+            # Test each condition: remove it and see if rows appear
+            blockers: list[tuple[str, int]] = []
+            for i, cond in enumerate(conditions):
+                remaining = [c for j, c in enumerate(conditions) if j != i]
+                test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}" if remaining else base_sql
                 try:
-                    count = conn.execute(f"SELECT COUNT(*) FROM ({base_sql})").fetchone()[0]
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM ({test_sql})"
+                    ).fetchone()[0]
                     if count > 0:
-                        diagnostics.append(f"Base query has {count} rows but the single filter eliminates all.")
-                        # Show column values from tables in the query
-                        tables = [r[0] for r in conn.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table'"
-                        ).fetchall()]
-                        for tname in tables:
-                            if tname.lower() in sql.lower():
-                                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
-                                for col in cols:
-                                    if col.lower() in conditions[0].lower():
-                                        sample = conn.execute(
-                                            f'SELECT DISTINCT "{col}" FROM "{tname}" WHERE "{col}" IS NOT NULL LIMIT 10'
-                                        ).fetchall()
-                                        vals = [r[0] for r in sample]
-                                        diagnostics.append(f"  {tname}.{col} actual values: {vals}")
+                        blockers.append((cond.strip(), count))
                 except Exception:
                     pass
 
-            # Fallback: show sample values for columns that appear in WHERE clause
-            if not diagnostics:
-                tables = [r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()]
-                for tname in tables:
-                    if tname.lower() not in sql.lower():
-                        continue
-                    cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
-                    for col in cols:
-                        if col.lower() in where_clause.lower():
-                            try:
-                                sample = conn.execute(
-                                    f'SELECT DISTINCT "{col}" FROM "{tname}" '
-                                    f'WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 10'
-                                ).fetchall()
-                                vals = [r[0] for r in sample]
-                                diagnostics.append(f"{tname}.{col}: actual values={vals}")
-                            except Exception:
-                                pass
+            if not blockers:
+                # All conditions together block — combined filter is too restrictive
+                diagnostics.append(
+                    f"All {len(conditions)} filters COMBINED produce 0 rows. "
+                    f"The combination is too restrictive — remove or relax one filter."
+                )
+            else:
+                for cond, count_without in blockers:
+                    diagnostics.append(f"REMOVE THIS FILTER: '{cond}' (without it: {count_without} rows)")
+
+                    # Show actual values for the column in this condition
+                    remaining = [c for c in conditions if c.strip() != cond]
+                    test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}" if remaining else base_sql
+
+                    # Find column reference in the condition
+                    for part in cond.replace("(", " ").replace(")", " ").split():
+                        col_ref = part.strip("\"'`=<>!,")
+                        if not col_ref or col_ref.upper() in ("AND", "OR", "NOT", "IN", "LIKE", "IS", "NULL", "BETWEEN", "SELECT", "FROM"):
+                            continue
+                        if "." in col_ref:
+                            _, col = col_ref.split(".", 1)
+                            col = col.strip("\"'`")
+                        else:
+                            col = col_ref
+                        try:
+                            actual = conn.execute(
+                                f'SELECT DISTINCT "{col}" FROM ({test_sql}) WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 10'
+                            ).fetchall()
+                            vals = [r[0] for r in actual]
+                            if vals:
+                                diagnostics.append(f"  Actual values for '{col}' in matching rows: {vals}")
+                                # Show what the filter used vs what exists
+                                str_match = re.findall(r"'([^']*)'", cond)
+                                num_match = re.findall(r'[<>=!]+\s*(\d+)', cond)
+                                if str_match:
+                                    used_val = str_match[0]
+                                    close = [v for v in vals if isinstance(v, str) and (
+                                        used_val.lower() in v.lower() or v.lower() in used_val.lower()
+                                    )]
+                                    if close:
+                                        diagnostics.append(f"  FIX: Replace '{used_val}' with '{close[0]}' (or use LIKE '%{used_val}%')")
+                                    else:
+                                        diagnostics.append(f"  FIX: Value '{used_val}' does NOT exist. Use one of: {vals[:5]}")
+                                elif num_match:
+                                    diagnostics.append(f"  FIX: Numeric filter '{cond}' excludes all. Actual range: {min(vals)} to {max(vals)}")
+                                else:
+                                    diagnostics.append(f"  FIX: This column doesn't have values matching your filter. Remove this condition or use a different column.")
+                                break
+                        except Exception:
+                            continue
         finally:
             conn.close()
 
@@ -2355,14 +2339,16 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
         return ""
 
     def _try_sql(self, db_path: Path, sql: str) -> dict[str, Any] | None:
-        """Execute SQL and return results."""
+        """Execute SQL safely with timeout. Single point of DB execution."""
         if not sql:
             return None
         if not db_path.exists():
             self._log("sql_error", f"DB missing: {db_path}")
             return None
+        conn = None
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = sqlite3.connect(str(db_path), timeout=10)
+            conn.execute("PRAGMA busy_timeout = 10000")
             tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
             if not tables:
                 self._log("sql_error", f"DB empty (0 tables): {db_path}")
@@ -2374,7 +2360,12 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             conn.close()
             return {"columns": columns, "rows": [list(r) for r in rows]}
         except Exception as e:
-            self._log("sql_error", f"SQL failed (tables={tables}): {e}")
+            self._log("sql_error", f"SQL failed: {e}")
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             return None
 
     def _gather_relevant_data(
