@@ -69,6 +69,16 @@ SQL_RULES = [
     # Format matching
     "VALUE FORMAT: Check SAMPLE DATA for the EXACT format of values before filtering. Time might be '1:54.123' not '0:01:54'. Dates might be integers (20130601) not strings ('2013-06-01'). Names might be 'DisplayName' not 'username'. Always match the exact format shown in SAMPLE DATA.",
     "EMPTY RESULT RECOVERY: If the PREVIOUS ATTEMPT FAILED section shows actual values from the DB, use THOSE exact values in your query — do not guess differently.",
+    # Output shape rules (Fix 2)
+    "OUTPUT COLUMNS: 'What is the X and the Y?' or 'the average X and the average Y' = TWO SEPARATE columns in SELECT (one for X, one for Y). Do NOT combine them with + or concatenation.",
+    "SINGULAR vs PLURAL: If the question uses 'the X' (singular/definite article) expecting one specific entity, add additional filters or use LIMIT 1 to narrow to exactly one row. 'What was THE score for THE match...' = 1 row expected.",
+    "TIED VALUES: When using MIN/MAX for superlatives, multiple rows sharing that min/max value are ALL correct. Return all ties, do not arbitrarily pick one.",
+    # Temporal/ordering rules (Fix 3)
+    "TEMPORAL ORDERING: 'last time' / 'most recent' / 'latest' = ORDER BY date/time DESC LIMIT 1. 'first time' / 'earliest' = ORDER BY date/time ASC LIMIT 1. Check which column represents chronological order.",
+    "MONTHLY from YEARLY: If the data stores YEARLY/ANNUAL totals and the question asks for 'monthly average' or 'per month', DIVIDE by 12. If data stores MONTHLY values, just use AVG directly. Check SAMPLE DATA to determine the granularity.",
+    "TIME STRING PARSING: For time columns like '1:36.483' (mm:ss.ms), convert to seconds for comparison: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL). Always handle this when computing time differences or percentages.",
+    # NULL rejection (Fix 4)
+    "NEVER RETURN NULL: If your computation might produce NULL (e.g., division by zero, no matching rows in subquery), wrap with COALESCE or add WHERE col IS NOT NULL. A NULL answer is ALWAYS wrong — the question expects a real value.",
 ]
 
 
@@ -180,7 +190,10 @@ Return ONLY a JSON object:
 - suggested_sql should try to fix the actual problem. Never repeat the same failing query.
 - LOGIC CHECK for percentages/ratios: Re-read the QUESTION's sentence structure. "In X, what % of Y?" means the WHERE should filter for X (the population), and the percentage numerator should count Y within X. If the SQL has it backwards (filtering Y and computing % of X), mark incomplete and provide corrected SQL.
 - LOGIC CHECK for "how many times more": This means division (X/Y), NOT subtraction. If the SQL uses subtraction, mark incomplete.
-- LOGIC CHECK for aggregation: If the question asks "average [attribute] of [entities] who..." and the SQL JOINs entities to a detail table before computing AVG, the average is WRONG (inflated by duplicate entity rows). Mark incomplete with correct approach.""")
+- LOGIC CHECK for aggregation: If the question asks "average [attribute] of [entities] who..." and the SQL JOINs entities to a detail table before computing AVG, the average is WRONG (inflated by duplicate entity rows). Mark incomplete with correct approach.
+- NULL CHECK: If any result value is None/NULL, the query is WRONG. A NULL means the computation failed (missing JOIN, wrong column, empty subquery). Mark incomplete and suggest a fix.
+- COLUMN COUNT CHECK: If the question asks for "X and Y" (two distinct values), the result MUST have 2+ columns. If it has only 1 column that sums/concatenates X and Y, mark incomplete.
+- TEMPORAL CHECK: If the question says "last" or "most recent", verify the SQL uses ORDER BY ... DESC LIMIT 1 (or equivalent). If it returns the first/any match instead, mark incomplete.""")
 
     return "\n".join(parts)
 
@@ -248,6 +261,9 @@ RULES:
 - RATIO LANGUAGE: "How many times is X more than Y?" or "How many times was X more than Y?" = X divided by Y (a ratio). NOT subtraction, NOT a count. Result is a decimal number (e.g., 2.73).
 - AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attributes (e.g., "average age of users who..."), aggregate FROM the entity table with a WHERE/IN filter. Do NOT join to a detail table — that duplicates entity rows per detail record and corrupts the average. Example: AVG(users.age) for users with >10 posts → SELECT AVG(age) FROM users WHERE id IN (subquery on posts).
 - COLUMN SEMANTICS: If GROUND TRUTH defines column meanings (e.g., "rank = based on fastest lap time", "position = race finish order"), map the question's wording to the CORRECT column. "ranked second" → use the column defined as "ranking", not "position".
+- OUTPUT FORMAT: "What is the X and the Y?" or "average X and average Y" = formula must produce TWO SEPARATE columns. The formula should be "SELECT col1, col2 FROM ..." not "SELECT col1 + col2". Each distinct requested value = one column.
+- TEMPORAL: "last time" / "most recent" / "latest" → ORDER BY date/time DESC LIMIT 1. "posted it last time" means the most recent poster, not any poster. Include ORDER BY in formula.
+- MONTHLY vs YEARLY: If data stores one row PER MONTH (e.g., yearmonth table with 12 rows per year per entity), "average monthly consumption" = AVG(value). If data stores ANNUAL totals (one row per year), "average monthly" = AVG(value) / 12. Check SAMPLE DATA row count vs time range to determine granularity.
 """.strip()
 
 GROUNDING_VALIDATE_PROMPT = """You are a strict validator. Check if this plan EXACTLY answers the user's question.
@@ -288,6 +304,11 @@ VALIDATE EACH:
 8. COLUMN SEMANTICS:
    - If GROUND TRUTH COLUMN MAPPINGS exist, verify the plan uses the correct column for each term.
    - E.g., "ranked second" must use the column defined as "ranking" not "position" if they differ.
+9. OUTPUT FORMAT:
+   - "What is the X and the Y?" → formula must SELECT two columns, NOT combine them.
+   - "last time" / "most recent" → formula must ORDER BY date/time DESC.
+   - If data is monthly rows and question asks "average monthly", formula should be AVG(col) not AVG(col)/12.
+   - If data is yearly totals and question asks "average monthly", formula should divide by 12.
 
 Return ONLY a JSON object:
 {{"verdict": "correct"/"needs_fix", "fixed_known_values": {{"column_name": ["corrected_values"]}}, "fixed_data_requirements": ["table.column", ...], "fixed_join_paths": ["tableA.col -> tableB.col"], "fixed_formula": "corrected formula if wrong", "reasoning": "one sentence explaining what was wrong"}}
@@ -427,10 +448,11 @@ RULES:
 - Return EVERY row from SQL OUTPUT — never drop or truncate rows.
 - Drop columns that are NOT needed to answer the question (e.g., intermediate IDs used only for joining).
 - NEVER merge multiple columns into one (e.g., don't combine first_name + last_name into full_name).
-- NEVER split one column into multiple.
-- NEVER rename columns — use the exact SQL column names.
+- If a column contains a "full name" (e.g., "John Smith") and the question asks for "full name", split it into first_name and last_name columns. "Write the full name" = two columns (first_name, last_name).
+- NEVER rename columns — use the exact SQL column names (except for name splitting above).
 - Do NOT transform values — keep them exactly as in SQL OUTPUT.
-- Do NOT add rows that aren't in SQL OUTPUT.""")
+- Do NOT add rows that aren't in SQL OUTPUT.
+- If any value is None/NULL and the question expects a real answer, this indicates the SQL was wrong — still output what you have but note that NULL values signal a problem.""")
 
     return "\n".join(parts)
 
@@ -676,6 +698,20 @@ class QuestionDrivenAgent:
                     f"\n- FAILED SQL (do not repeat): {s}" for s in failed_sqls
                 )
 
+            # Fix 4: NULL result rejection — treat None/NULL-only results as empty
+            if data_result and data_result.get("rows"):
+                rows = data_result["rows"]
+                all_null = all(
+                    all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                    for row in rows
+                )
+                if all_null:
+                    self._log("null_rejection", "All result values are NULL/None — treating as empty")
+                    failed_sqls.append(sql)
+                    all_gaps.add("Query returned only NULL values. The computation failed — check column names, JOIN conditions, and whether subqueries return data. Try a different approach.")
+                    gaps_text = "\n".join(f"- {g}" for g in all_gaps)
+                    data_result = {"columns": [], "rows": []}
+
             # Multi-hypothesis: if loop failed, try alternative interpretations
             if not data_result or not data_result.get("rows"):
                 hyp_result, hyp_sql = self._try_multi_hypothesis(
@@ -685,9 +721,17 @@ class QuestionDrivenAgent:
                     diagnosis=gaps_text,
                 )
                 if hyp_result and hyp_result.get("rows"):
-                    data_result = hyp_result
-                    sql = hyp_sql
-                    self._log("multi_hypothesis_ok", f"Alternative SQL returned {len(hyp_result['rows'])} rows")
+                    # Also reject NULL multi-hypothesis results
+                    all_null = all(
+                        all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                        for row in hyp_result["rows"]
+                    )
+                    if not all_null:
+                        data_result = hyp_result
+                        sql = hyp_sql
+                        self._log("multi_hypothesis_ok", f"Alternative SQL returned {len(hyp_result['rows'])} rows")
+                    else:
+                        self._log("multi_hypothesis_null", "Multi-hypothesis also returned NULL — skipping")
 
             # Deduplicate rows if the question asks for unique items
             if data_result and data_result.get("rows"):
@@ -702,6 +746,13 @@ class QuestionDrivenAgent:
                 if len(unique_rows) < len(rows):
                     self._log("dedup", f"Removed {len(rows) - len(unique_rows)} duplicate rows")
                     data_result["rows"] = unique_rows
+
+            # Fix 5: Post-execution shape validation
+            if data_result and data_result.get("rows"):
+                data_result = self._validate_result_shape(
+                    question, data_result, db_path, kg_context, sample_data,
+                    ctx.knowledge_text, grounding_context, col_hints,
+                )
 
             # Fallback if loop exhausted without good data
             if not data_result or not data_result.get("rows"):
@@ -1071,7 +1122,8 @@ RULES:
             fixed_jp = val_result.get("fixed_join_paths", [])
             fixed_formula = val_result.get("fixed_formula", "")
 
-            # Detect oscillation: if validator reverses a previous fix, stop
+            # Detect oscillation: if validator reverses a previous fix, prefer
+            # question-literal values verified against DB over sample-data substitutions
             if fixed_kv and prev_fixed_kv:
                 oscillating = False
                 for col, vals in fixed_kv.items():
@@ -1079,7 +1131,35 @@ RULES:
                         oscillating = True
                         break
                 if oscillating:
-                    self._log("grounding_oscillation", "Validator reversed previous fix — using current grounding")
+                    # Resolve oscillation: extract values from question and verify in DB
+                    question_values = re.findall(r"'([^']+)'|\"([^\"]+)\"", question)
+                    q_vals = [v[0] or v[1] for v in question_values]
+                    if q_vals and db_path:
+                        conn = sqlite3.connect(str(db_path))
+                        try:
+                            for qv in q_vals:
+                                for col_key in list(grounding.get("known_values", {}).keys()):
+                                    bare_col = col_key.split(".")[-1] if "." in col_key else col_key
+                                    # Find tables with this column and check if value exists
+                                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                                        tname = row[0]
+                                        cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                                        col_match = next((c for c in cols if c.lower() == bare_col.lower()), None)
+                                        if col_match:
+                                            try:
+                                                cnt = conn.execute(
+                                                    f'SELECT COUNT(*) FROM "{tname}" WHERE "{col_match}" = ?', (qv,)
+                                                ).fetchone()[0]
+                                                if cnt > 0:
+                                                    grounding["known_values"][col_key] = [qv]
+                                                    self._log("oscillation_resolved",
+                                                              f"Question value '{qv}' exists in {tname}.{col_match} ({cnt} rows) — using it")
+                                                    break
+                                            except Exception:
+                                                pass
+                        finally:
+                            conn.close()
+                    self._log("grounding_oscillation", "Validator reversed previous fix — resolved with question-literal values")
                     break
 
             rejected_fixes: list[str] = []
@@ -1798,7 +1878,11 @@ RULES:
 - Do NOT repeat any previously failed patterns shown above
 - Use LIKE for text matching when unsure of exact format
 - If DIAGNOSIS shows actual values from the DB, USE them in at least one hypothesis
-- Try both strict and loose interpretations"""
+- Try both strict and loose interpretations
+- If the question says "X and Y" (two values), make sure at least one hypothesis returns 2 columns
+- If the question uses "last/latest/most recent", use ORDER BY DESC LIMIT 1 in at least one hypothesis
+- For time strings like '1:36.483', try: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL) for conversion to seconds
+- NEVER return NULL — wrap computations in COALESCE and add WHERE ... IS NOT NULL filters"""
 
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -1833,6 +1917,77 @@ RULES:
                     best_rows = row_count
 
         return best_result, best_sql
+
+    # ------------------------------------------------------------------
+    # Fix 5: Post-execution result shape validation
+    # ------------------------------------------------------------------
+
+    def _validate_result_shape(
+        self,
+        question: str,
+        data_result: dict[str, Any],
+        db_path: Path,
+        kg_context: str,
+        sample_data: str,
+        knowledge_text: str,
+        grounding_context: str,
+        column_hints: str,
+    ) -> dict[str, Any]:
+        """Validate result shape matches question expectations and fix if needed."""
+        rows = data_result.get("rows", [])
+        cols = data_result.get("columns", [])
+        if not rows:
+            return data_result
+
+        q_lower = question.lower()
+
+        # Check: "X and Y" pattern expects 2+ columns but we got 1
+        # Pattern: "what is the X and the Y" or "average X and average Y"
+        and_pattern = re.search(
+            r'(?:what is|identify|find)\s+(?:the\s+)?(\w+).+?\band\b\s+(?:the\s+)?(\w+)',
+            q_lower,
+        )
+        if and_pattern and len(cols) == 1 and len(rows) == 1:
+            # We have a single combined value — need to re-query as two columns
+            self._log("shape_fix", f"Question asks for two values ('{and_pattern.group(1)}' and '{and_pattern.group(2)}') but got 1 column — re-querying")
+            fix_prompt = f"""The SQL returned a SINGLE combined value but the question asks for TWO SEPARATE values.
+
+QUESTION: {question}
+CURRENT RESULT: {cols[0]} = {rows[0][0]}
+
+The question asks for '{and_pattern.group(1)}' AND '{and_pattern.group(2)}' as SEPARATE values.
+
+DATABASE SCHEMA:
+{kg_context[:2000]}
+
+Write a corrected SQL that returns TWO columns (one for each value).
+Return ONLY: {{"sql": "SELECT ..."}}"""
+            messages = [ModelMessage(role="user", content=fix_prompt)]
+            raw = self._model_call_with_retry(messages)
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict) and parsed.get("sql"):
+                fix_result = self._try_sql(db_path, parsed["sql"])
+                if fix_result and fix_result.get("rows") and len(fix_result.get("columns", [])) >= 2:
+                    self._log("shape_fixed", f"Now has {len(fix_result['columns'])} columns")
+                    return fix_result
+
+        # Check: singular question ("what was THE score") but got many rows
+        # Only trigger when we have way more rows than expected for a singular question
+        singular_patterns = [
+            r"what (?:is|was|were) the .+? (?:for|of|in) the ",
+            r"what is the .+? of the ",
+            r"identify the .+? (?:for|of) the ",
+        ]
+        expects_singular = any(re.search(p, q_lower) for p in singular_patterns)
+        # But NOT if question uses plural indicators
+        plural_indicators = ["list", "all", "each", "every", "which", "how many"]
+        has_plural = any(p in q_lower for p in plural_indicators)
+
+        if expects_singular and not has_plural and len(rows) > 5:
+            self._log("shape_warning", f"Singular question but got {len(rows)} rows — may need tighter filters")
+            # Don't auto-fix (risky) — just log for awareness
+
+        return data_result
 
     # ------------------------------------------------------------------
     # Helpers
