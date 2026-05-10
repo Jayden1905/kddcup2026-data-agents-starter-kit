@@ -39,72 +39,60 @@ CONSOLIDATED_DB_NAME = "_consolidated.db"
 # Prompt builders — dynamic, only include sections that have content
 # ---------------------------------------------------------------------------
 
-SQL_RULES = [
-    "PRIORITY: Your SQL must answer the user's EXACT question — re-read it before writing.",
-    "Use only tables and columns shown in the schema.",
-    "SELECT only columns that answer the question. Never SELECT *.",
-    "Check SAMPLE DATA for date ranges and formats before writing WHERE clauses.",
-    "If a table's date range doesn't cover the period, start from a DIFFERENT table that has the needed dates and JOIN back.",
-    "The same column name in different tables may have DIFFERENT formats (e.g., 'YYYYMM' vs 'YYYY-MM-DD'). Always filter the table that actually contains the target value.",
-    "JOIN through the full FK path. Never skip intermediate linking tables.",
-    "\"X containing Y\" means filter X itself (WHERE X.prop = Y).",
-    "Use LIKE '%keyword%' COLLATE NOCASE for text. Use CAST(x AS REAL) for division.",
-    "If the question asks for names/descriptions, JOIN to get human-readable values instead of raw IDs.",
-    "Only SELECT columns the question explicitly asks for. Do NOT add extra columns (dates, amounts, etc.) that the question didn't mention.",
-    "NEVER use LIMIT unless the question explicitly asks for a specific count (e.g., 'top 3'). For superlatives (lowest/highest/most/least/best/worst), use a subquery: WHERE col = (SELECT MIN/MAX(col) ...) — there may be ties.",
-    "When using MIN/MAX on text columns (times, dates), ALWAYS exclude empty strings: add WHERE col != '' AND col IS NOT NULL in the subquery.",
-    "If a column is often NULL (shown as None/null in SAMPLE DATA), comparisons like col < X return nothing for NULL rows. Consider whether the question refers to a DIFFERENT column or table.",
-    "If the question asks 'which/what X' (asking for names/identifiers), use SELECT DISTINCT to avoid duplicate rows.",
-    "Escape apostrophes in strings: use '' (double single-quote) inside SQL string literals.",
-    "For COUNT/SUM/aggregations: the column being aggregated must semantically match what the question asks about. Re-read the question to determine the correct column.",
-    "When the question says 'per unit/per item/each/per person', compute a ratio (total ÷ count) — do NOT compare a total column directly.",
-    "Do NOT use GROUP BY + aggregate (SUM/AVG) unless the question explicitly asks for totals or averages. 'lowest/highest X' means MIN/MAX of individual rows, not grouped sums.",
-    # Scope/population rules
-    "POPULATION vs METRIC: 'In X, what is Y?' or 'Among X, what is Y?' → X defines the WHERE filter (population/denominator), Y is what you compute ON that filtered set. Example: 'In employees with salary > 50000, what % are managers?' → WHERE salary > 50000, then compute COUNT(managers)/COUNT(*)*100.",
-    "RATIO LANGUAGE: 'How many times X more than Y' or 'how many times was X more than Y' = X/Y (division producing a ratio). It does NOT mean X-Y (subtraction) or COUNT.",
-    # Aggregation grain
-    "AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attribute (e.g., user age, user upvotes), query that entity table DIRECTLY with a subquery filter. Do NOT join to detail tables — joining users to posts duplicates user rows and corrupts the average. Correct: SELECT AVG(age) FROM users WHERE id IN (SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*)>N).",
-    # Domain column mapping
-    "DOMAIN KNOWLEDGE COLUMN MAPPING: If DOMAIN KNOWLEDGE defines what a column means (e.g., 'rank = fastest lap ranking', 'position = race finish order'), use the EXACT column that matches the question's intent. 'ranked second' with rank defined as fastest lap → WHERE rank=2, NOT WHERE position=2.",
-    # Format matching
-    "VALUE FORMAT: Check SAMPLE DATA for the EXACT format of values before filtering. Time might be '1:54.123' not '0:01:54'. Dates might be integers (20130601) not strings ('2013-06-01'). Names might be 'DisplayName' not 'username'. Always match the exact format shown in SAMPLE DATA.",
-    "EMPTY RESULT RECOVERY: If the PREVIOUS ATTEMPT FAILED section shows actual values from the DB, use THOSE exact values in your query — do not guess differently.",
-    # Output shape rules
-    "OUTPUT COLUMNS: 'What is the X and the Y?' or 'the average X and the average Y' = TWO SEPARATE columns in SELECT (one for X, one for Y). Do NOT combine them with + or concatenation.",
-    "SINGULAR vs PLURAL: If the question uses 'the X' (singular/definite) AND provides enough filters to uniquely identify one row, expect 1 row. But NEVER add LIMIT 1 just because the grammar sounds singular — a person can have multiple payments, an entity can appear multiple times. Only LIMIT 1 if the question explicitly says 'the most recent' or 'the first'.",
-    "TIED VALUES / NO LIMIT ON SUPERLATIVES: For 'which/what has the lowest/highest/most/least', ALWAYS use WHERE col = (SELECT MIN/MAX(col) ...) without LIMIT. Multiple rows may share the same min/max — return ALL of them. NEVER use ORDER BY + LIMIT 1 for superlatives.",
-    # Temporal/ordering rules
-    "TEMPORAL ORDERING: 'last time' / 'most recent' / 'latest' = ORDER BY date/time DESC LIMIT 1. 'first time' / 'earliest' = ORDER BY date/time ASC LIMIT 1. Check which column represents chronological order.",
-    "MONTHLY from YEARLY: If the data stores YEARLY/ANNUAL totals and the question asks for 'monthly average' or 'per month', DIVIDE by 12. If data stores MONTHLY values, just use AVG directly. Check SAMPLE DATA to determine the granularity.",
-    "TIME STRING PARSING: For time columns like '1:36.483' (mm:ss.ms), convert to seconds for comparison: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL). Always handle this when computing time differences or percentages.",
-    # NULL rejection
-    "NEVER RETURN NULL: If your computation might produce NULL (e.g., division by zero, no matching rows in subquery), wrap with COALESCE or add WHERE col IS NOT NULL. A NULL answer is ALWAYS wrong — the question expects a real value.",
-    # Aggregation scope
-    "HAVING vs WHERE: 'where the average/total X exceeds/is greater than N' across a GROUP = GROUP BY + HAVING AVG(X) > N. This is NOT a per-row WHERE filter. 'average across schools' = group schools by district, compute avg per district, filter with HAVING.",
-    "PER-GROUP POSITIONAL: 'the Nth item of EACH group' = use ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY position_col) then filter WHERE rn = N. Do NOT use a global OFFSET.",
-    "INTERSECTION LOGIC: 'X with Y containing Z' means: find entities where BOTH conditions hold. Use: WHERE id IN (SELECT id WHERE condition1) AND id IN (SELECT id WHERE condition2). Two separate subqueries intersected, NOT one combined WHERE clause.",
-    "SUPERLATIVE WITH TIES (reinforcement): WHERE col = (SELECT MIN/MAX(col)...) is the ONLY correct pattern for superlatives. LIMIT 1 is FORBIDDEN for any question with lowest/highest/most/least/best/worst.",
-    "CO-LOCATED MEASURES: If the question applies a filter (e.g., 'approved', 'active') and that filter column lives in a detail table, use the value/measure column from that SAME detail table (e.g., expense.cost where expense.approved='true'), NOT from a parent summary table (e.g., budget.spent). Detail tables with per-record filters give accurate totals.",
+# Rules indexed by short label for LLM-based selection
+SQL_RULES_LABELED: list[tuple[str, str]] = [
+    ("exact_question", "Answer the EXACT question. SELECT only asked columns. No SELECT *."),
+    ("schema_only", "Use only tables and columns shown in the schema."),
+    ("date_format", "Check data for date ranges/formats before WHERE clauses. Same column name in different tables may have DIFFERENT formats."),
+    ("join_fk", "JOIN through the full FK path. Never skip intermediate linking tables."),
+    ("text_match", "Use LIKE '%keyword%' COLLATE NOCASE for text. Use CAST(x AS REAL) for division."),
+    ("human_readable", "If question asks for names/descriptions, JOIN to get human-readable values instead of raw IDs."),
+    ("select_minimal", "Only SELECT columns the question explicitly asks for. Do NOT add extra columns."),
+    ("superlative", "For superlatives (lowest/highest/most/least), use WHERE col = (SELECT MIN/MAX(col)...) — NEVER LIMIT. Return ALL ties."),
+    ("null_minmax", "When using MIN/MAX on text columns, exclude empty strings: WHERE col != '' AND col IS NOT NULL."),
+    ("null_column", "If a column is often NULL, comparisons return nothing for NULL rows. Consider a DIFFERENT column or table."),
+    ("distinct", "If question asks 'which/what X', use SELECT DISTINCT to avoid duplicates."),
+    ("apostrophe", "Escape apostrophes: use '' (double single-quote) inside SQL strings."),
+    ("agg_column", "For COUNT/SUM/aggregations: the aggregated column must semantically match what the question asks about."),
+    ("ratio", "When question says 'per unit/per item/each', compute a ratio (total ÷ count)."),
+    ("no_group_unless", "Do NOT use GROUP BY + aggregate unless question asks for totals/averages. 'lowest X' = MIN/MAX of individual rows."),
+    ("population", "POPULATION vs METRIC: 'In X, what is Y?' → X is WHERE filter, Y is what you compute ON that set."),
+    ("ratio_lang", "'How many times X more than Y' = X/Y (division). NOT subtraction, NOT count."),
+    ("agg_grain", "AGGREGATION GRAIN: AVG/SUM of entity attribute → query entity table DIRECTLY with subquery filter. Do NOT join to detail tables (duplicates rows)."),
+    ("domain_col", "DOMAIN KNOWLEDGE COLUMN MAPPING: Use the EXACT column whose DEFINITION matches the question's intent."),
+    ("value_format", "VALUE FORMAT: Match the EXACT format shown in data (time strings, integer dates, display names)."),
+    ("recovery", "EMPTY RESULT RECOVERY: If PREVIOUS ATTEMPT shows actual DB values, use THOSE exact values."),
+    ("multi_col", "OUTPUT COLUMNS: 'What is X and Y?' = TWO SEPARATE columns. Do NOT combine with + or concat."),
+    ("singular_plural", "SINGULAR: Don't add LIMIT 1 just because grammar is singular. Only LIMIT 1 for 'most recent'/'first'."),
+    ("temporal", "TEMPORAL: 'last time'/'most recent' = ORDER BY DESC LIMIT 1. 'first time' = ORDER BY ASC LIMIT 1."),
+    ("monthly_yearly", "MONTHLY from YEARLY: Annual totals + 'monthly average' = DIVIDE by 12. Monthly data = AVG directly."),
+    ("time_parse", "TIME STRING: '1:36.483' → CAST(SUBSTR)*60 + CAST(SUBSTR) for seconds conversion."),
+    ("no_null", "NEVER RETURN NULL: Wrap with COALESCE or add WHERE IS NOT NULL. NULL answer = wrong."),
+    ("having", "HAVING vs WHERE: 'where the average exceeds N' = GROUP BY + HAVING, not per-row WHERE."),
+    ("positional", "PER-GROUP POSITIONAL: 'Nth of each group' = ROW_NUMBER() OVER (PARTITION BY ...)."),
+    ("intersection", "INTERSECTION: 'X with Y containing Z' = two subqueries intersected, NOT one WHERE."),
+    ("colocated", "CO-LOCATED MEASURES: Filter column in detail table → use measure from SAME detail table, not parent summary."),
 ]
+
+# Full rule texts for backward compatibility
+SQL_RULES = [rule for _, rule in SQL_RULES_LABELED]
 
 
 def _build_sql_prompt(
     *,
     question: str,
     kg_context: str,
-    sample_data: str,
+    sample_data: str = "",  # unused — grounding + schema_slice provide all format info
     knowledge_text: str = "",
     column_hints: str = "",
     gaps: str = "",
     extra_context: str = "",
     grounding_context: str = "",
+    selected_rules: str = "",
 ) -> str:
     parts = [f"QUESTION: {question}\n\nWrite a SQL query to answer the QUESTION above."]
 
     parts.append(f"\nDATABASE SCHEMA:\n{kg_context}")
-
-    if sample_data:
-        parts.append(f"\nSAMPLE DATA:\n{sample_data[:1500]}")
 
     if grounding_context:
         parts.append(f"\n{grounding_context}")
@@ -120,36 +108,32 @@ def _build_sql_prompt(
     if extra_context:
         parts.append(f"\nEXPLORATORY RESULTS:\n{extra_context}")
 
-    # Decide rule set size based on prompt length so far
-    base_len = sum(len(p) for p in parts)
     has_gaps = bool(gaps)
 
-    if base_len > 4000:
-        # Compact rules for large schemas — keep only essentials
+    # Use LLM-selected rules if available, otherwise fallback
+    if selected_rules:
+        rules = selected_rules
+    else:
         rules = """- Answer the EXACT question. SELECT only asked columns. No SELECT *.
 - Use FILTER VALUES exactly as given. Do NOT substitute.
-- If CONSTRAINTS has arithmetic (/ 12, * 100), include it EXACTLY in your SQL.
 - For superlatives (lowest/highest), use WHERE col = (SELECT MIN/MAX(col)...) — no LIMIT.
-- JOIN through FK paths shown in schema. Use LIKE '%X%' COLLATE NOCASE for text.
-- Check SAMPLE DATA for value formats before filtering.
-- Use CAST(x AS REAL) for division. Escape apostrophes with ''.
-- If IMPORTANT section flags a column mismatch, use the column it specifies."""
-    else:
-        rules = "\n".join(f"- {r}" for r in SQL_RULES)
+- JOIN through FK paths shown in schema.
+- Use LIKE '%X%' COLLATE NOCASE for text. CAST(x AS REAL) for division.
+- NEVER RETURN NULL — add WHERE IS NOT NULL. Escape apostrophes with ''."""
 
+    # Append context-specific rules
     if grounding_context:
         if has_gaps:
-            rules += "\n- PREVIOUS ATTEMPT FAILED feedback takes PRIORITY over GROUNDING CONTEXT. If the feedback contradicts the grounding, follow the feedback."
-            rules += "\n- Use GROUNDING CONTEXT for filter values and join paths, but fix what the feedback says is wrong."
+            rules += "\n- PREVIOUS ATTEMPT FAILED feedback takes PRIORITY over GROUNDING CONTEXT. Fix what the feedback says is wrong."
         else:
             if "FILTER VALUES" in grounding_context:
-                rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use the values from FILTER VALUES above. Do NOT substitute other values. If CONSTRAINTS say to use LIKE for a value, use LIKE with that value as prefix."
+                rules += "\n- ⚠️ MANDATORY: Your WHERE clause MUST use the values from FILTER VALUES above."
         if "DATA FORMAT WARNINGS" in grounding_context:
-            rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully. Handle time strings, relative values, and encoded formats as described."
+            rules += "\n- ⚠️ Read DATA FORMAT WARNINGS carefully."
         if "IMPORTANT" in grounding_context and "RE-READ THE QUESTION" in grounding_context:
-            rules += "\n- ⚠️ Read the IMPORTANT section carefully. It flags a potential column mismatch — verify your SELECT/GROUP BY uses the column the question actually refers to."
+            rules += "\n- ⚠️ Read the IMPORTANT section — it flags a column mismatch."
         if "CONSTRAINTS" in grounding_context and "/" in grounding_context:
-            rules += "\n- ⚠️ FORMULA AUTHORITY: If CONSTRAINTS defines a formula with arithmetic (e.g., AVG(X) / 12, SUM(Y) * 100), your SQL MUST include that EXACT arithmetic. Do NOT simplify or remove operations — the formula is authoritative even if it seems redundant."
+            rules += "\n- ⚠️ FORMULA AUTHORITY: If CONSTRAINTS has arithmetic (/ 12, * 100), include it EXACTLY in your SQL."
     parts.append(f"\nRULES:\n{rules}")
 
     # Put mandatory filter constraint LAST so it's freshest in model's context (only if no gaps)
@@ -220,20 +204,17 @@ DOMAIN KNOWLEDGE:
 {knowledge_text}
 
 Return ONLY a JSON object:
-{{"anchors": ["exact quote of each relevant definition — include the exact numeric values/mappings"], "use_case_sql": "the complete SQL from a USE CASE that answers the same or very similar question, or null if none match"}}
+{{"anchors": ["exact quote of each relevant definition — include the exact numeric values/mappings"]}}
 
 RULES:
-- For anchors: quote the EXACT definition including numeric mappings (e.g., "'severe' corresponds to value 2").
-- CRITICAL: If ANY word from the question matches a column/field name defined in DOMAIN KNOWLEDGE, you MUST include that definition. For example, if the question mentions "type" and the knowledge defines a "type" field, include it.
-- Include definitions that DISTINGUISH between similar columns (e.g., "rank: fastest lap ranking" vs "position: race finish order") — this prevents using the wrong column.
-- For use_case_sql: if the domain knowledge has a USE CASE whose question matches or is very similar to the user's question, copy its SQL EXACTLY. This SQL is the authoritative answer pattern.
-- If a definition distinguishes between similar terms (e.g., "most severe = 1" vs "severe = 2"), quote BOTH so the distinction is clear.
+- Quote the EXACT definition including numeric mappings (e.g., "'severe' corresponds to value 2").
+- If ANY word from the question matches a column/field name defined in DOMAIN KNOWLEDGE, include that definition.
+- Include definitions that DISTINGUISH between similar columns (e.g., "rank: fastest lap ranking" vs "position: race finish order").
+- If a definition distinguishes between similar terms (e.g., "most severe = 1" vs "severe = 2"), quote BOTH.
 - Be precise and complete — these anchors will be used as domain context for query planning.
 """.strip()
 
-SEMANTIC_GROUNDING_PROMPT = """Your ONLY goal is to answer the user's EXACT question — nothing more, nothing less.
-
-QUESTION: {question}
+SEMANTIC_GROUNDING_PROMPT = """QUESTION: {question}
 
 DATABASE SCHEMA:
 {kg_context}
@@ -242,53 +223,154 @@ DATABASE SCHEMA:
 {previous_attempt}
 Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
-  "what_user_wants": "restate EXACTLY what output the user expects — only columns the question EXPLICITLY mentions",
-  "expected_output": {{"columns": "number of output columns", "rows": "single/multiple/all-matching (use 'all-matching' unless a COUNT/SUM/AVG guarantees exactly 1 row; superlatives and lookups by name may return multiple)", "description": "brief description"}},
-  "formula": "the EXACT SQL expression to compute the answer — if DOMAIN KNOWLEDGE defines a metric formula, translate it literally to SQL without simplifying or removing any operations",
-  "computation_steps": ["step1: find X", "step2: calculate Y from X"],
-  "data_requirements": ["table.column — include ALL columns that could be relevant: any column whose name appears in the question, columns needed for joins, columns needed for filtering, and columns needed for aggregation. Be INCLUSIVE — if the question mentions a word that matches a column name, include that column."],
-  "data_format_notes": ["any unusual formats from SAMPLE DATA that need handling, e.g., time strings need parsing, relative values with + prefix, integer-encoded dates"],
-  "reasoning": "brief HOW to get the answer — must trace back to what_user_wants",
-  "domain_rules": ["constraints from DOMAIN KNOWLEDGE that affect the query"],
-  "known_values": {{"table.column": ["filter values or expressions verified against SAMPLE DATA"]}},
-  "join_paths": ["tableA.col -> tableB.col -> tableC.col"]
+  "what_user_wants": "restate EXACTLY what output the user expects — only columns explicitly mentioned",
+  "expected_output": {{"columns": "number", "rows": "single/multiple/all-matching", "description": "brief"}},
+  "formula": "the EXACT SQL to compute the answer — translate DOMAIN KNOWLEDGE formulas literally, keep all arithmetic",
+  "computation_steps": ["step1", "step2"],
+  "data_requirements": ["table.column — ALL columns relevant to question, joins, filters, aggregation"],
+  "data_format_notes": ["unusual formats needing handling"],
+  "reasoning": "brief HOW to get the answer",
+  "domain_rules": ["constraints from DOMAIN KNOWLEDGE"],
+  "known_values": {{"table.column": ["verified filter values"]}},
+  "join_paths": ["tableA.col -> tableB.col"]
 }}
 
 RULES:
-- Start by understanding what_user_wants — every other field must serve that goal.
-- DOMAIN KNOWLEDGE section contains facts from domain knowledge. FIELD DEFINITIONS and METRIC FORMULAS provide context. Always verify column choices against the actual DATABASE SCHEMA and SAMPLE DATA. If a question term matches an actual column name in the schema, strongly consider using that column directly.
-- EXACT LEVEL MATCHING: When DOMAIN KNOWLEDGE defines distinct named levels (e.g., "high = 1", "medium = 2", "low = 3"), the question's EXACT wording determines WHICH SINGLE level to use. "medium priority" = only the value labeled "medium" (2), NOT "high" (1). Do NOT combine multiple levels unless the question explicitly says "X or above" or "at least X". Each named label maps to exactly one value.
-- USE CASE AUTHORITY: If DOMAIN KNOWLEDGE includes a MATCHING USE CASE whose title/explanation directly addresses the same condition as the question, copy its WHERE clause EXACTLY. The use case IS the answer — do not second-guess its filter values.
-- For known_values: always include the TABLE name (e.g., "orders.order_date" not just "order_date"). Only use values that exist within that table's SAMPLE DATA range.
-- CRITICAL: Check SAMPLE DATA to decide WHICH TABLE to filter. The same column name in different tables may have different formats or data coverage. Always filter the table that actually contains the data you need.
-- FORMULA AUTHORITY (CRITICAL): If DOMAIN KNOWLEDGE defines a metric formula (e.g., "Average Monthly Consumption = AVG(Consumption) / 12"), translate it LITERALLY to SQL. Keep ALL operations — do NOT remove divisions, multiplications, or other arithmetic even if you think the data granularity makes them redundant. You MUST NOT override the formula with your own reasoning about data frequency. The formula IS the answer. If it says divide by 12, DIVIDE BY 12.
-- "per unit/per item/each" in the question means a RATIO (total ÷ quantity). Check SAMPLE DATA to determine which column is a total vs a quantity, then use division in the formula.
-- For join_paths: trace the FULL FK path shown in DATABASE SCHEMA. Never skip intermediate tables.
-- For data_requirements: be INCLUSIVE. List every table.column that could help answer the question — if a word in the question matches a column name in the schema, INCLUDE that column. Also include columns for joins and filters. The SQL planner will decide which to actually SELECT.
-- Do NOT invent output columns the question didn't ask for. If the question says "list all X", SELECT only the column that identifies X — do NOT add properties (like amount, date) unless the question explicitly asks for them.
-- If DOMAIN KNOWLEDGE includes a USE CASE SQL marked as AUTHORITATIVE, follow it EXACTLY — same WHERE values, same columns, same logic. Do NOT override its filter values even if they seem counterintuitive. The use case is the definitive answer pattern.
-- If DOMAIN KNOWLEDGE includes a non-authoritative USE CASE SQL, follow its structure but ensure the selected/aggregated column semantically matches what the question asks about.
-- POPULATION vs METRIC (critical for percentages/counts): Parse sentence structure carefully:
-  * "In X, what is the percentage/count of Y?" → X is the population (WHERE filter = denominator), Y is what you measure.
-  * "Among X, how many have Y?" → X is the population, Y is the condition being counted.
-  * "Of X, what percentage are Y?" → denominator = COUNT(X), numerator = COUNT(X where Y).
-  * WRONG: "In employees with salary > 50000, % managers" → filtering by role='manager' and computing % with salary. CORRECT: filter by salary > 50000, compute % that are managers.
-- RATIO LANGUAGE: "How many times is X more than Y?" or "How many times was X more than Y?" = X divided by Y (a ratio). NOT subtraction, NOT a count. Result is a decimal number (e.g., 2.73).
-- AGGREGATION GRAIN: When computing AVG/SUM of an entity's own attributes (e.g., "average age of users who..."), aggregate FROM the entity table with a WHERE/IN filter. Do NOT join to a detail table — that duplicates entity rows per detail record and corrupts the average. Example: AVG(users.age) for users with >10 posts → SELECT AVG(age) FROM users WHERE id IN (subquery on posts).
-- COLUMN SEMANTICS (CRITICAL): If DOMAIN KNOWLEDGE defines column meanings (e.g., "rank = ranking based on fastestLapTime", "position = race finish order"), you MUST use the column whose DEFINITION matches the question's intent. "ranked second" → use the column DEFINED as "ranking" (rank), NOT "position". Do NOT substitute a different column even if it seems similar. The definition IS authoritative.
-- OUTPUT FORMAT: "What is the X and the Y?" or "average X and average Y" = formula must produce TWO SEPARATE columns. The formula should be "SELECT col1, col2 FROM ..." not "SELECT col1 + col2". Each distinct requested value = one column.
-- TEMPORAL: "last time" / "most recent" / "latest" → ORDER BY date/time DESC LIMIT 1. "posted it last time" means the most recent poster, not any poster. Include ORDER BY in formula.
-- MONTHLY vs YEARLY: If data stores one row PER MONTH (e.g., monthly_stats table with 12 rows per year per entity), "average monthly X" = AVG(value). If data stores ANNUAL totals (one row per year), "average monthly" = AVG(value) / 12. Check SAMPLE DATA row count vs time range to determine granularity.
-- DATA FORMAT INSPECTION: Look at SAMPLE DATA's "distinct values" annotations. If values have FORMAT tags (e.g., [FORMAT: time string mm:ss.ms]), record this in data_format_notes. Your formula must handle these formats (e.g., convert time strings to seconds before doing math).
-- GRANULARITY: Check SAMPLE DATA's GRANULARITY annotations. "~12 rows/entity" with monthly dates = monthly data. "~1 row/entity" with yearly = annual data. This determines whether to divide by 12 or not.
-- HAVING vs WHERE: "where the average X exceeds N" or "schools where the average exceeds N" = this is a GROUP-level filter. The formula must use GROUP BY + HAVING, NOT a per-row WHERE clause. The GROUP BY groups by the entity (school, district, etc.), and HAVING filters groups by their aggregate.
-- PER-GROUP POSITIONAL: "the Nth item of EACH group" needs ROW_NUMBER() OVER (PARTITION BY group ORDER BY position). Do NOT use global LIMIT/OFFSET.
-- SUPERLATIVE TIES: "which has the lowest/highest" → set expected_output.rows = "all-matching" (NOT "single"). Use WHERE col = (SELECT MIN/MAX...) to get ALL ties. NEVER use LIMIT 1 for superlatives. Multiple rows sharing the same min/max are ALL correct answers.
-- CO-LOCATED MEASURES: When the question mentions a filter condition (e.g., "approved", "active", "completed") AND that filter column exists in a detail table, prefer using the MEASURE column (cost, amount, value) from that SAME detail table rather than a pre-aggregated summary column in a parent table. Detail-level measures with detail-level filters give accurate results; summary columns may double-count or miss the filter.
-- DETAIL vs SUMMARY: If a detail table (more rows, individual records) and a summary table (fewer rows, aggregated totals) BOTH have a value column, use the detail table when the question asks about filtered subsets. Summary tables lose per-record granularity needed for filtering.
-- SUBSET DISCRIMINATION: When multiple similar values exist in the same column (e.g., 'X' and 'X Y'), and the question uses a QUALIFIER that distinguishes them, choose ONLY the value matching the qualifier — do NOT combine them. The SHORT/BASE form typically represents the default unmodified operation, while 'X Y' specifies a VARIANT (e.g., 'VYBER' = cash withdrawal vs 'VYBER KARTOU' = card withdrawal). "cash transactions" = ONLY the base form that means cash, NOT the extended form that specifies a different method. Only use IN(...) with multiple values when the question says "all" without a distinguishing qualifier.
-- PARTIAL MATCH: When the question uses "X-related", "related to X", "X-based", or "from X" with a proper noun, use LIKE '%X%' (not exact =). "Riverside-related school districts" → WHERE district LIKE '%Riverside%'. Only use exact match (=) when the question says "named X", "called X", or "is X" without relational qualifiers.
+- what_user_wants drives everything. Do NOT invent columns the question didn't ask for.
+- FORMULA AUTHORITY: If DOMAIN KNOWLEDGE defines a formula, translate it LITERALLY to SQL. Keep ALL arithmetic (/ 12, * 100) even if it seems redundant. The formula IS authoritative.
+- USE CASE AUTHORITY: If DOMAIN KNOWLEDGE has a matching USE CASE, copy its WHERE clause EXACTLY.
+- EXACT LEVEL MATCHING: Named levels ("high=1", "medium=2") → use ONLY the level matching the question's exact wording. No combining unless "X or above".
+- COLUMN SEMANTICS: If DOMAIN KNOWLEDGE defines column meanings, use the column whose DEFINITION matches the question intent. Definition IS authoritative.
+- For known_values: include TABLE name. Only use values within SAMPLE DATA range.
+- Check SAMPLE DATA to decide WHICH TABLE to filter (same column name may differ across tables).
+- For join_paths: trace FULL FK path. Never skip intermediate tables.
+- For data_requirements: be INCLUSIVE — list every column that could help.
+- POPULATION vs METRIC: "In X, what is Y?" → X = WHERE filter, Y = what you compute on that set.
+- RATIO: "How many times X more than Y" = X/Y (division, not subtraction).
+- AGGREGATION GRAIN: AVG of entity attribute → query entity table with subquery filter. Don't join to detail tables (duplicates).
+- OUTPUT: "X and Y?" = TWO columns. Each requested value = one column.
+- TEMPORAL: "last/most recent" = ORDER BY DESC LIMIT 1.
+- MONTHLY vs YEARLY: Annual totals + "monthly" = divide by 12. Monthly data = AVG directly. Check SAMPLE DATA granularity.
+- HAVING: "where the average exceeds N" = GROUP BY + HAVING, not per-row WHERE.
+- SUPERLATIVES: "lowest/highest" → rows = "all-matching". Use WHERE col = (SELECT MIN/MAX...). NEVER LIMIT 1.
+- CO-LOCATED MEASURES: Filter in detail table → use measure from SAME detail table, not parent summary.
+- PARTIAL MATCH: "X-related" / "from X" with proper noun → LIKE '%X%'. Exact match only for "named X" / "is X".
 """.strip()
+
+def _trim_schema_by_relevance(kg_context: str, question: str, budget: int) -> str:
+    """Trim schema using Steiner tree: keep only tables needed to connect question-relevant tables.
+
+    Graph: tables = nodes, FK relationships = edges.
+    Terminals: tables whose name or columns overlap with question keywords.
+    Steiner tree: minimum table set connecting all terminals via FK paths.
+    """
+    if len(kg_context) <= budget:
+        return kg_context
+
+    # Split into table blocks
+    blocks: dict[str, str] = {}  # table_name -> block_text
+    current_name = ""
+    current_lines: list[str] = []
+    for line in kg_context.split("\n"):
+        if line.startswith("TABLE: "):
+            if current_lines and current_name:
+                blocks[current_name] = "\n".join(current_lines)
+            current_name = line.split("TABLE: ")[1].split(" ")[0].split("(")[0].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    if current_lines and current_name:
+        blocks[current_name] = "\n".join(current_lines)
+
+    if not blocks:
+        return kg_context[:budget]
+
+    all_tables = list(blocks.keys())
+
+    # Build adjacency graph from FK lines in schema
+    graph: dict[str, set[str]] = {t: set() for t in all_tables}
+    for name, text in blocks.items():
+        for line in text.split("\n"):
+            if "FK:" in line or "->" in line:
+                # Find referenced table names
+                for other in all_tables:
+                    if other != name and other.lower() in line.lower():
+                        graph[name].add(other)
+                        graph[other].add(name)
+
+    # Identify terminal nodes: tables with question-keyword overlap
+    q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
+    terminals: list[str] = []
+    for name, text in blocks.items():
+        table_words = set(re.findall(r'\b[a-z]{3,}\b', (name + " " + text).lower()))
+        if q_words & table_words:
+            terminals.append(name)
+
+    # If no terminals found or only 1, fall back to all tables
+    if len(terminals) <= 1:
+        terminals = all_tables
+
+    # Steiner tree approximation: BFS shortest path between all terminal pairs,
+    # union of paths = set of required tables
+    from collections import deque
+
+    def bfs_path(start: str, end: str) -> list[str]:
+        if start == end:
+            return [start]
+        visited = {start}
+        queue: deque[list[str]] = deque([[start]])
+        while queue:
+            path = queue.popleft()
+            for neighbor in graph.get(path[-1], set()):
+                if neighbor == end:
+                    return path + [end]
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(path + [neighbor])
+        return []  # no path (disconnected)
+
+    steiner_tables: set[str] = set(terminals)
+    for i, t1 in enumerate(terminals):
+        for t2 in terminals[i + 1:]:
+            path = bfs_path(t1, t2)
+            steiner_tables.update(path)
+
+    # If Steiner tree is empty or covers all tables, include all
+    if not steiner_tables:
+        steiner_tables = set(all_tables)
+
+    # Build result: Steiner tables first (in original order), then others if budget allows
+    ordered = [t for t in all_tables if t in steiner_tables]
+    remaining_tables = [t for t in all_tables if t not in steiner_tables]
+
+    result_parts: list[str] = []
+    total = 0
+
+    for name in ordered + remaining_tables:
+        text = blocks[name]
+        if total + len(text) + 1 <= budget:
+            result_parts.append(text)
+            total += len(text) + 1
+        else:
+            # Try column-trimmed version (12 cols max)
+            lines = text.split("\n")
+            trimmed = []
+            col_count = 0
+            for ln in lines:
+                if ln.startswith("  ") and ":" in ln and not ln.strip().startswith("FK:") and not ln.strip().startswith("PK:"):
+                    col_count += 1
+                    if col_count > 12:
+                        continue
+                trimmed.append(ln)
+            if col_count > 12:
+                trimmed.append(f"  ... ({col_count - 12} more columns)")
+            short_text = "\n".join(trimmed)
+            if total + len(short_text) + 1 <= budget:
+                result_parts.append(short_text)
+                total += len(short_text) + 1
+
+    return "\n".join(result_parts) if result_parts else kg_context[:budget]
+
 
 def _build_semantic_prompt(
     *,
@@ -298,12 +380,21 @@ def _build_semantic_prompt(
     anchor_text: str = "",
     previous_attempt: str = "",
 ) -> str:
-    sample_section = f"\nSAMPLE DATA:\n{sample_data[:3000]}" if sample_data else ""
-    anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text}" if anchor_text else ""
-    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt}" if previous_attempt else ""
+    # Budget: keep total prompt under 8000 chars to avoid Qwen timeouts
+    BUDGET = 8000
+    template_len = len(SEMANTIC_GROUNDING_PROMPT) + len(question) * 2
+    remaining = BUDGET - template_len - len(anchor_text[:1500]) - len(previous_attempt[:500])
+
+    # Schema gets priority, sample data fills remainder
+    schema_budget = max(remaining - 1500, 2000)
+    kg_trimmed = _trim_schema_by_relevance(kg_context, question, schema_budget)
+    sample_budget = max(remaining - len(kg_trimmed), 500)
+    sample_section = f"\nSAMPLE DATA:\n{sample_data[:sample_budget]}" if sample_data else ""
+    anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1500]}" if anchor_text else ""
+    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt[:500]}" if previous_attempt else ""
     return SEMANTIC_GROUNDING_PROMPT.format(
         question=question,
-        kg_context=kg_context,
+        kg_context=kg_trimmed,
         sample_section=sample_section,
         anchor_section=anchor_section,
         previous_attempt=prev_section,
@@ -548,127 +639,29 @@ class QuestionDrivenAgent:
                 grounding_context += f"\n\n{threshold_context}"
 
             # ----------------------------------------------------------
-            # Closed loop: PLAN → EXECUTE → EVALUATE (max 4 iterations)
+            # Step 6: Deterministic SQL investigation — verify JOINs and filters
             # ----------------------------------------------------------
-            max_iterations = 4
-            data_result = None
-            sql = ""
-            gaps_text = ""
-            extra_context = ""  # info from exploratory queries
-            all_gaps: set[str] = set()  # dedup gaps across iterations
-            failed_sqls: list[str] = []
-            seen_sql_normalized: set[str] = set()
+            grounding_context = self._investigate_joins(db_path, grounding_context)
 
-            for iteration in range(1, max_iterations + 1):
-                self._log("iteration", f"--- Iteration {iteration}/{max_iterations} ---")
+            # ----------------------------------------------------------
+            # Rule selection: LLM picks relevant rules from grounding
+            # ----------------------------------------------------------
+            selected_rules = self._select_sql_rules(question, grounding_context)
 
-                # PLAN: Generate SQL (incorporate gaps + extra context if any)
-                sql = self._call_sql(
-                    question, sql_schema, sql_sample_data,
-                    ctx.knowledge_text, gaps=gaps_text,
-                    extra_context=extra_context,
-                    column_hints=col_hints,
-                    grounding_context=grounding_context,
-                )
-
-                if not sql:
-                    self._log("sql_generated", "(empty — LLM timeout or parse failure)")
-                    all_gaps.add("SQL generation failed (timeout). Retry.")
-                    continue
-
-                self._log("sql_generated", sql)
-
-                # Detect duplicate SQL BEFORE execution — save time
-                sql_normalized = " ".join(sql.split()).strip().upper()
-                if sql_normalized in seen_sql_normalized:
-                    self._log("evaluate", "Verdict: duplicate SQL — stopping iterations")
-                    break
-                seen_sql_normalized.add(sql_normalized)
-
-                # EXECUTE: Run the SQL
-                sql_error = ""
-                data_result = self._try_sql(db_path, sql)
-                if data_result is None:
-                    sql_error = self.steps[-1].get("detail", "") if self.steps else ""
-                    data_result = {"columns": [], "rows": []}
-
-                # Force-incomplete on empty results (skip LLM eval)
-                if not data_result.get("rows"):
-                    if sql_error:
-                        self._log("evaluate", f"Verdict: incomplete (SQL error: {sql_error})")
-                        all_gaps.add(f"SQL ERROR: {sql_error}. Check column names and table names against the DATABASE SCHEMA.")
-                    else:
-                        self._log("evaluate", "Verdict: incomplete (empty result)")
-                        where_hint = self._diagnose_empty_from_sql(sql, sql_sample_data)
-                        if where_hint:
-                            self._log("diagnosis", where_hint)
-                            all_gaps.add(where_hint)
-                        else:
-                            all_gaps.add(
-                                "Query returned 0 rows. One or more WHERE filters don't match actual data. "
-                                "Check SAMPLE DATA for correct values, formats, and column names."
-                            )
-                    failed_sqls.append(sql)
-                    gaps_text = "\n".join(f"- {g}" for g in all_gaps)
-                    # Only include last failed SQL (truncated) to limit prompt size
-                    gaps_text += f"\n- LAST FAILED SQL (do not repeat): {sql[:150]}"
-                    continue
-
-                # Skip evaluate on last iteration — just use what we have
-                if iteration == max_iterations:
-                    break
-
-                # EVALUATE: lightweight LLM feedback (OK or one-sentence issue)
-                feedback = self._evaluate_result_feedback(
-                    question, sql, data_result, grounding_context,
-                )
-                if not feedback:
-                    self._log("evaluate", "Verdict: complete")
-                    break
-
-                self._log("evaluate", f"Verdict: incomplete — {feedback}")
-                all_gaps.add(feedback)
-                failed_sqls.append(sql)
-                gaps_text = "\n".join(f"- {g}" for g in all_gaps)
-                # Only include last failed SQL (truncated) to limit prompt size
-                gaps_text += f"\n- LAST FAILED SQL (do not repeat): {sql[:150]}"
-
-            # Reject results where all values are NULL/None
-            if data_result and data_result.get("rows"):
-                rows = data_result["rows"]
-                all_null = all(
-                    all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
-                    for row in rows
-                )
-                if all_null:
-                    self._log("null_rejection", "All result values are NULL/None — treating as empty")
-                    failed_sqls.append(sql)
-                    all_gaps.add("Query returned only NULL values. The computation failed — check column names, JOIN conditions, and whether subqueries return data. Try a different approach.")
-                    gaps_text = "\n".join(f"- {g}" for g in all_gaps)
-                    data_result = {"columns": [], "rows": []}
-
-            # Multi-hypothesis: if loop failed, try alternative interpretations
-            if not data_result or not data_result.get("rows"):
-                hyp_result, hyp_sql = self._try_multi_hypothesis(
-                    question, db_path, sql_schema, sample_data,
-                    ctx.knowledge_text, grounding_context, col_hints,
-                    failed_sqls=failed_sqls,
-                    diagnosis=gaps_text,
-                )
-                if hyp_result and hyp_result.get("rows"):
-                    # Also reject NULL multi-hypothesis results
-                    all_null = all(
-                        all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
-                        for row in hyp_result["rows"]
-                    )
-                    if not all_null:
-                        data_result = hyp_result
-                        sql = hyp_sql
-                        self._log("multi_hypothesis_ok",
-                                  f"cols={hyp_result.get('columns')}, rows={len(hyp_result['rows'])}, "
-                                  f"SQL: {hyp_sql[:150]}")
-                    else:
-                        self._log("multi_hypothesis_null", "Multi-hypothesis also returned NULL — skipping")
+            # ----------------------------------------------------------
+            # Multi-step SQL investigation: plan → verify steps → final
+            # ----------------------------------------------------------
+            data_result, sql, failed_sqls = self._run_investigation(
+                question=question,
+                db_path=db_path,
+                sql_schema=sql_schema,
+                sql_sample_data=sql_sample_data,
+                knowledge_text=ctx.knowledge_text,
+                grounding_context=grounding_context,
+                col_hints=col_hints,
+                selected_rules=selected_rules,
+                sample_data=sample_data,
+            )
 
             # Deduplicate rows if the question asks for unique items
             if data_result and data_result.get("rows"):
@@ -744,6 +737,249 @@ class QuestionDrivenAgent:
             )
 
     # ------------------------------------------------------------------
+    # Multi-step investigation: plan → verify → finalize
+    # ------------------------------------------------------------------
+
+    def _run_investigation(
+        self,
+        *,
+        question: str,
+        db_path: Path,
+        sql_schema: str,
+        sql_sample_data: str,
+        knowledge_text: str,
+        grounding_context: str,
+        col_hints: str,
+        selected_rules: str,
+        sample_data: str,
+    ) -> tuple[dict[str, Any] | None, str, list[str]]:
+        """Multi-step SQL investigation: generate plan, verify each step, build final query.
+
+        Returns: (data_result, final_sql, failed_sqls)
+        """
+        failed_sqls: list[str] = []
+
+        # Step 1: Generate multi-step plan
+        plan = self._generate_sql_plan(
+            question, sql_schema, grounding_context, selected_rules,
+        )
+
+        if not plan or not plan.get("steps"):
+            # Fallback: single-shot SQL (old behavior)
+            self._log("plan", "No multi-step plan — using single-shot SQL")
+            sql = self._call_sql(
+                question, sql_schema, sql_sample_data,
+                knowledge_text, grounding_context=grounding_context,
+                column_hints=col_hints, selected_rules=selected_rules,
+            )
+            if sql:
+                result = self._try_sql(db_path, sql)
+                if result and result.get("rows"):
+                    self._log("sql_generated", sql)
+                    return result, sql, failed_sqls
+                failed_sqls.append(sql)
+            # Fall through to multi-hypothesis
+            return self._fallback_to_hypothesis(
+                question, db_path, sql_schema, sample_data,
+                knowledge_text, grounding_context, col_hints, failed_sqls, "",
+            )
+
+        # Step 2: Execute verification steps with retries, collect confirmed facts
+        confirmed_facts: list[str] = []
+        MAX_RETRIES = 2
+        self._log("plan", f"{len(plan['steps'])} steps: {[s.get('purpose','') for s in plan['steps']]}")
+
+        for i, step in enumerate(plan["steps"]):
+            step_sql = step.get("sql", "")
+            purpose = step.get("purpose", f"step {i+1}")
+            is_final = step.get("is_final", False) or (i == len(plan["steps"]) - 1)
+
+            if not step_sql:
+                continue
+
+            self._log("step", f"[{i+1}/{len(plan['steps'])}] {purpose}")
+
+            # Retry loop for each step
+            step_succeeded = False
+            current_sql = step_sql
+            step_gaps = ""
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                self._log("step_sql", f"(attempt {attempt}) {current_sql}")
+                result = self._try_sql(db_path, current_sql)
+
+                if result is None:
+                    # SQL error
+                    error = self.steps[-1].get("detail", "") if self.steps else "unknown error"
+                    self._log("step_error", f"Step {i+1} attempt {attempt}: {error}")
+                    failed_sqls.append(current_sql)
+                    step_gaps = f"- SQL ERROR: {error}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
+                    # Diagnose for column/table hints
+                    if db_path:
+                        diag = self._diagnose_sql_error(db_path, current_sql, error)
+                        if diag:
+                            step_gaps += f"\n- {diag}"
+
+                elif not result.get("rows"):
+                    # Empty result
+                    self._log("step_empty", f"Step {i+1} attempt {attempt}: 0 rows")
+                    failed_sqls.append(current_sql)
+                    diagnosis = ""
+                    if db_path:
+                        diagnosis = self._diagnose_empty_result(db_path, current_sql)
+                        if diagnosis:
+                            self._log("step_diagnosis", diagnosis[:200])
+                    step_gaps = f"- Empty result (0 rows)\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
+                    if diagnosis:
+                        step_gaps += f"\n- {diagnosis}"
+
+                else:
+                    # Success — got data
+                    cols = result.get("columns", [])
+                    rows = result["rows"]
+
+                    # Check for all-NULL
+                    all_null = all(
+                        all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                        for row in rows
+                    )
+                    if all_null:
+                        self._log("step_null", f"Step {i+1} attempt {attempt}: all NULL")
+                        failed_sqls.append(current_sql)
+                        step_gaps = f"- Query returned only NULL values\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
+                    else:
+                        # Step succeeded
+                        step_succeeded = True
+                        if is_final:
+                            self._log("step_final", f"cols={cols}, rows={len(rows)}")
+                            return result, current_sql, failed_sqls
+                        else:
+                            # Verification step — record confirmed values
+                            if len(rows) <= 5:
+                                fact_vals = [str(rows[r][0]) for r in range(min(len(rows), 3))]
+                                fact = f"{purpose}: {cols[0] if cols else '?'} = {', '.join(fact_vals)}"
+                            else:
+                                fact = f"{purpose}: {len(rows)} rows found"
+                            confirmed_facts.append(fact)
+                            self._log("step_confirmed", fact)
+                        break
+
+                # If we have retries left, generate a fix
+                if attempt < MAX_RETRIES and step_gaps:
+                    step_gaps += f"\n- LAST FAILED SQL (do NOT repeat): {current_sql[:150]}"
+                    retry_sql = self._call_sql(
+                        question, sql_schema, sql_sample_data,
+                        knowledge_text, grounding_context=grounding_context,
+                        column_hints=col_hints, selected_rules=selected_rules,
+                        gaps=step_gaps,
+                    )
+                    if retry_sql and retry_sql.strip().upper() != current_sql.strip().upper():
+                        current_sql = retry_sql
+                    else:
+                        # LLM produced same SQL — stop retrying this step
+                        self._log("step_duplicate", f"Step {i+1}: retry produced same SQL, giving up")
+                        break
+
+            if not step_succeeded and is_final:
+                # Final step failed all retries
+                self._log("step_failed", f"Step {i+1} (final) failed after {MAX_RETRIES} attempts")
+                break
+
+        # If plan didn't produce final result, fall back
+        self._log("plan_incomplete", f"Plan exhausted — confirmed: {confirmed_facts}")
+
+        # Try single-shot SQL with confirmed facts as extra context
+        if confirmed_facts:
+            facts_context = "CONFIRMED FACTS (from verification queries):\n" + "\n".join(f"  - {f}" for f in confirmed_facts)
+            sql = self._call_sql(
+                question, sql_schema, sql_sample_data,
+                knowledge_text, grounding_context=grounding_context,
+                column_hints=col_hints, selected_rules=selected_rules,
+                extra_context=facts_context,
+            )
+            if sql:
+                self._log("sql_generated", sql)
+                result = self._try_sql(db_path, sql)
+                if result and result.get("rows"):
+                    all_null = all(
+                        all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                        for row in result["rows"]
+                    )
+                    if not all_null:
+                        return result, sql, failed_sqls
+                failed_sqls.append(sql)
+
+        # Multi-hypothesis fallback
+        return self._fallback_to_hypothesis(
+            question, db_path, sql_schema, sample_data,
+            knowledge_text, grounding_context, col_hints, failed_sqls,
+            "\n".join(f"- {f}" for f in confirmed_facts),
+        )
+
+    def _fallback_to_hypothesis(
+        self, question, db_path, sql_schema, sample_data,
+        knowledge_text, grounding_context, col_hints, failed_sqls, diagnosis,
+    ) -> tuple[dict[str, Any] | None, str, list[str]]:
+        """Multi-hypothesis fallback when investigation fails."""
+        hyp_result, hyp_sql = self._try_multi_hypothesis(
+            question, db_path, sql_schema, sample_data,
+            knowledge_text, grounding_context, col_hints,
+            failed_sqls=failed_sqls,
+            diagnosis=diagnosis,
+        )
+        if hyp_result and hyp_result.get("rows"):
+            all_null = all(
+                all(v is None or str(v).strip().lower() in ("none", "null", "") for v in row)
+                for row in hyp_result["rows"]
+            )
+            if not all_null:
+                self._log("multi_hypothesis_ok",
+                          f"cols={hyp_result.get('columns')}, rows={len(hyp_result['rows'])}, "
+                          f"SQL: {hyp_sql[:150]}")
+                return hyp_result, hyp_sql, failed_sqls
+            else:
+                self._log("multi_hypothesis_null", "Multi-hypothesis also returned NULL")
+        return None, "", failed_sqls
+
+    def _generate_sql_plan(
+        self, question: str, kg_context: str, grounding_context: str, selected_rules: str,
+    ) -> dict[str, Any] | None:
+        """LLM generates a multi-step SQL plan: verification steps + final query."""
+        prompt = f"""QUESTION: {question}
+
+DATABASE SCHEMA:
+{kg_context[:3000]}
+
+{grounding_context[:1500]}
+
+Generate a step-by-step SQL plan. Break complex queries into verification steps + final query.
+
+Return ONLY a JSON object:
+{{"steps": [
+  {{"purpose": "what this step verifies", "sql": "SELECT ...", "is_final": false}},
+  {{"purpose": "final answer query", "sql": "SELECT ...", "is_final": true}}
+]}}
+
+RULES:
+- Simple queries (single table, direct filter): just 1 step with is_final=true
+- Complex queries (JOINs, subqueries, computed values): 1-2 verification steps + final
+- Verification steps: resolve IDs, confirm filter values exist, check JOIN produces rows
+- Final step: uses confirmed values from verification steps
+- Each step must be valid standalone SQL
+- Max 3 steps total (keep it lean)
+{selected_rules}"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if isinstance(parsed, dict) and "steps" in parsed:
+            steps = parsed["steps"]
+            if isinstance(steps, list) and steps:
+                return parsed
+        return None
+
+    # ------------------------------------------------------------------
     # LLM Call 1: SQL Generation
     # ------------------------------------------------------------------
 
@@ -751,6 +987,7 @@ class QuestionDrivenAgent:
         self, question: str, kg_context: str, sample_data: str,
         knowledge_text: str, gaps: str = "", extra_context: str = "",
         column_hints: str = "", grounding_context: str = "",
+        selected_rules: str = "",
     ) -> str:
         prompt = _build_sql_prompt(
             question=question,
@@ -761,6 +998,7 @@ class QuestionDrivenAgent:
             gaps=gaps,
             extra_context=extra_context,
             grounding_context=grounding_context,
+            selected_rules=selected_rules,
         )
 
         messages = [ModelMessage(role="user", content=prompt)]
@@ -1059,9 +1297,9 @@ RULES:
             # Column mappings intentionally excluded — they pre-bias grounding.
             # The grounding step has full schema + sample data to determine correct columns.
 
-            use_case_sql = parsed.get("use_case_sql")
-            if use_case_sql and not best_use_case:
-                llm_parts.append(f"\nMATCHING USE CASE SQL (follow this exactly):\n  {use_case_sql}")
+            # use_case_sql intentionally not included — it often matches
+            # unrelated queries by keyword overlap and biases grounding away
+            # from properly interpreting the actual question.
 
         # Combine: deterministic parts take priority (placed first = fresher in context)
         all_parts = deterministic_parts + llm_parts
@@ -1229,6 +1467,48 @@ RULES:
 
         return formatted, schema_slice
 
+    def _select_sql_rules(self, question: str, grounding_context: str) -> str:
+        """LLM picks which SQL rules are relevant based on question + grounding. ~2K char prompt."""
+        rule_list = "\n".join(
+            f"{i}: {label}" for i, (label, _) in enumerate(SQL_RULES_LABELED)
+        )
+        prompt = f"""Pick the SQL rules needed for this task.
+
+QUESTION: {question}
+
+PLAN:
+{grounding_context[:1500]}
+
+RULES (by index and label):
+{rule_list}
+
+Return ONLY a JSON: {{"indices": [0, 3, 7, ...]}}
+Pick 5-10 rules most relevant to this specific question. Always include 0 (exact_question)."""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if isinstance(parsed, dict) and "indices" in parsed:
+            indices = parsed["indices"]
+            if isinstance(indices, list) and indices:
+                selected = []
+                for idx in indices:
+                    if isinstance(idx, int) and 0 <= idx < len(SQL_RULES_LABELED):
+                        selected.append(SQL_RULES_LABELED[idx][1])
+                if selected:
+                    self._log("rules_selected", f"{len(selected)} rules: {[SQL_RULES_LABELED[i][0] for i in indices if isinstance(i, int) and 0 <= i < len(SQL_RULES_LABELED)]}")
+                    return "\n".join(f"- {r}" for r in selected)
+
+        # Fallback: compact rules
+        self._log("rules_selected", "fallback (parse failed)")
+        return """- Answer the EXACT question. SELECT only asked columns. No SELECT *.
+- Use FILTER VALUES exactly as given. Do NOT substitute.
+- For superlatives (lowest/highest), use WHERE col = (SELECT MIN/MAX(col)...) — no LIMIT.
+- JOIN through FK paths shown in schema.
+- Use LIKE '%X%' COLLATE NOCASE for text. CAST(x AS REAL) for division.
+- NEVER RETURN NULL — add WHERE IS NOT NULL. Escape apostrophes with ''."""
+
     def _enrich_data_requirements(
         self, db_path: Path, question: str, grounding: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1313,9 +1593,30 @@ RULES:
 
                 lines.append(f"TABLE: {tname} ({row_count} rows, PK: {', '.join(pk_cols) if pk_cols else '(none)'})")
 
-                # Include ALL columns of the table (planner needs full table context)
+                # Get FK columns for this table
+                fk_cols_set: set[str] = set()
+                try:
+                    fks = conn.execute(f'PRAGMA foreign_key_list("{tname}")').fetchall()
+                    for fk in fks:
+                        fk_cols_set.add(fk[3])  # from_col
+                except Exception:
+                    pass
+
+                # Include: requested columns, PKs, FKs. Skip others if table is wide.
+                pk_set = set(pk_cols)
+                priority_cols = req_cols | pk_set | fk_cols_set
+                all_col_names = [c[1] for c in col_info]
+
+                # If table has many columns, only show priority + a few extras
+                if len(col_info) > 12:
+                    show_cols = priority_cols
+                else:
+                    show_cols = set(all_col_names)
+
                 for c in col_info:
                     col_name = c[1]
+                    if col_name not in show_cols:
+                        continue
                     col_type = c[2] or "TEXT"
                     nullable = "" if c[3] == 0 else " NOT NULL"
                     pk_mark = " [PK]" if c[5] else ""
@@ -1330,6 +1631,11 @@ RULES:
                     except Exception:
                         pass
                     lines.append(f"  - {col_name} ({col_type}{nullable}){pk_mark}{sample}")
+
+                # Note omitted columns count
+                omitted = len(col_info) - len([c for c in col_info if c[1] in show_cols])
+                if omitted > 0:
+                    lines.append(f"  ... ({omitted} more columns)")
 
                 # Get FK info for this table
                 try:
@@ -1614,6 +1920,117 @@ RULES:
                 except Exception:
                     pass
             return str(e)
+
+    def _investigate_joins(self, db_path: Path | None, grounding_context: str) -> str:
+        """Deterministic: verify inferred JOIN paths actually produce rows.
+
+        If a JOIN path uses transformations (e.g., '0' || col) and produces 0 rows,
+        try a direct column-to-column join. Updates grounding_context with corrections.
+        """
+        if not db_path or not db_path.exists() or "JOIN PATHS:" not in grounding_context:
+            return grounding_context
+
+        # Extract join paths from grounding context
+        join_lines: list[str] = []
+        in_join_section = False
+        for line in grounding_context.split("\n"):
+            if line.strip() == "JOIN PATHS:":
+                in_join_section = True
+                continue
+            if in_join_section:
+                if line.startswith("  ") and "->" in line:
+                    join_lines.append(line.strip())
+                else:
+                    break
+
+        if not join_lines:
+            return grounding_context
+
+        conn = sqlite3.connect(str(db_path))
+        corrections: list[str] = []
+        try:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall() if not r[0].startswith("_")]
+
+            for join_expr in join_lines:
+                # Parse: "tableA.colA -> expression" e.g. "schools.CDSCode -> '0' || satscores.cds"
+                parts = join_expr.split("->")
+                if len(parts) != 2:
+                    continue
+                left = parts[0].strip()  # e.g. "schools.CDSCode"
+                right = parts[1].strip()  # e.g. "'0' || satscores.cds"
+
+                # Only investigate if right side has transformations
+                has_transform = any(op in right for op in ["||", "CAST", "SUBSTR", "REPLACE", "TRIM"])
+                if not has_transform:
+                    continue
+
+                # Extract table.col from left side
+                if "." not in left:
+                    continue
+                left_table, left_col = left.split(".", 1)
+
+                # Extract table.col from right side (find table.col pattern in expression)
+                right_table_col = re.search(r'(\w+)\.(\w+)', right)
+                if not right_table_col:
+                    continue
+                right_table = right_table_col.group(1)
+                right_col = right_table_col.group(2)
+
+                # Check both tables exist
+                if left_table not in tables or right_table not in tables:
+                    continue
+
+                # Test the transformed join
+                try:
+                    transformed_count = conn.execute(
+                        f'SELECT COUNT(*) FROM "{left_table}" l JOIN "{right_table}" r '
+                        f'ON l."{left_col}" = {right.replace(f"{right_table}.", "r.")}'
+                    ).fetchone()[0]
+                except Exception:
+                    transformed_count = 0
+
+                # Test direct join
+                try:
+                    direct_count = conn.execute(
+                        f'SELECT COUNT(*) FROM "{left_table}" l JOIN "{right_table}" r '
+                        f'ON l."{left_col}" = r."{right_col}"'
+                    ).fetchone()[0]
+                except Exception:
+                    direct_count = 0
+
+                self._log("join_probe",
+                          f"{join_expr} → transformed={transformed_count}, direct={direct_count}")
+
+                # If direct join is better (more rows), correct the grounding
+                if direct_count > transformed_count and direct_count > 0:
+                    old_path = join_expr
+                    new_path = f"{left_table}.{left_col} -> {right_table}.{right_col}"
+                    grounding_context = grounding_context.replace(
+                        f"  {old_path}", f"  {new_path}"
+                    )
+                    corrections.append(
+                        f"JOIN CORRECTED: '{old_path}' → '{new_path}' "
+                        f"(direct={direct_count} rows vs transformed={transformed_count})"
+                    )
+                    # Also remove any CONSTRAINT about the transformation
+                    for constraint_pattern in [
+                        r"  - .*prefix.*match.*\n",
+                        r"  - .*'0'.*added.*\n",
+                        r"  ⚠️ .*prefix.*\n",
+                        r"  ⚠️ .*'0'.*\n",
+                    ]:
+                        grounding_context = re.sub(constraint_pattern, "", grounding_context, flags=re.IGNORECASE)
+
+        finally:
+            conn.close()
+
+        if corrections:
+            for c in corrections:
+                self._log("join_corrected", c)
+
+        return grounding_context
 
     def _validate_filter_values(
         self, db_path: Path, grounding: dict[str, Any]
@@ -1909,8 +2326,31 @@ RULES:
                 ).fetchone()[0]
                 if base_count == 0:
                     diagnostics.append(
-                        "JOIN itself returns 0 rows — the JOIN conditions are wrong. Check FK paths."
+                        "JOIN itself returns 0 rows — the JOIN conditions are wrong. "
+                        "Try joining on a different column or without transformations (no string concatenation/padding)."
                     )
+                    # Show common column names between tables in the SQL
+                    tables_in_sql = [r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall() if r[0].lower() in sql.lower()]
+                    if len(tables_in_sql) >= 2:
+                        all_cols: dict[str, list[str]] = {}
+                        for t in tables_in_sql:
+                            all_cols[t] = [c[1] for c in conn.execute(f'PRAGMA table_info("{t}")').fetchall()]
+                        shared = set(all_cols[tables_in_sql[0]])
+                        for t in tables_in_sql[1:]:
+                            shared &= set(all_cols[t])
+                        if shared:
+                            diagnostics.append(f"  Shared column names across joined tables: {sorted(shared)}")
+                        else:
+                            # Show columns with similar names
+                            col_sets = [(t, set(c.lower() for c in cols)) for t, cols in all_cols.items()]
+                            for i_t, (t1, cs1) in enumerate(col_sets):
+                                for t2, cs2 in col_sets[i_t+1:]:
+                                    for c1 in cs1:
+                                        for c2 in cs2:
+                                            if c1 != c2 and (c1 in c2 or c2 in c1):
+                                                diagnostics.append(f"  Similar columns: {t1}.{c1} ~ {t2}.{c2} — try direct join")
                     return "EMPTY RESULT DIAGNOSIS:\n" + "\n".join(diagnostics)
             except Exception:
                 pass
@@ -1939,11 +2379,43 @@ RULES:
                     pass
 
             if not blockers:
-                # All conditions together block — combined filter is too restrictive
-                diagnostics.append(
-                    f"All {len(conditions)} filters COMBINED produce 0 rows. "
-                    f"The combination is too restrictive — remove or relax one filter."
-                )
+                # No single filter removal helps — likely a JOIN mismatch.
+                # Test: do the filter values exist in the individual tables (without JOIN)?
+                join_suspect = False
+                tables_all = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()]
+                for cond in conditions:
+                    if join_suspect:
+                        break
+                    str_vals = re.findall(r"'([^']*)'", cond)
+                    for val in str_vals:
+                        if not val or join_suspect:
+                            break
+                        for tbl in tables_all:
+                            try:
+                                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()]
+                                for col in cols:
+                                    hit = conn.execute(
+                                        f'SELECT 1 FROM "{tbl}" WHERE "{col}" = ? LIMIT 1', (val,)
+                                    ).fetchone()
+                                    if hit:
+                                        join_suspect = True
+                                        diagnostics.append(
+                                            f"Value '{val}' exists in {tbl}.{col} but JOIN produces 0 rows with it — "
+                                            f"the JOIN condition is WRONG. Try joining on a different column or without transformations."
+                                        )
+                                        break
+                            except Exception:
+                                pass
+                            if join_suspect:
+                                break
+
+                if not diagnostics:
+                    diagnostics.append(
+                        f"All {len(conditions)} filters COMBINED produce 0 rows with this JOIN. "
+                        f"The JOIN condition is likely wrong — try a simpler/direct join."
+                    )
             else:
                 for cond, count_without in blockers:
                     diagnostics.append(f"REMOVE THIS FILTER: '{cond}' (without it: {count_without} rows)")
@@ -2248,8 +2720,11 @@ RULES:
             failed_section += "\n".join(f"  - {s[:200]}" for s in failed_sqls[-3:])
 
         diag_section = ""
+        join_fix_rule = ""
         if diagnosis:
             diag_section = f"\nDIAGNOSIS OF FAILURES:\n{diagnosis[:1000]}"
+            if "JOIN condition is WRONG" in diagnosis or "JOIN condition is likely wrong" in diagnosis or "JOIN itself returns 0 rows" in diagnosis:
+                join_fix_rule = "\n- ⚠️ JOIN FIX REQUIRED: At least one hypothesis MUST use a DIRECT column-to-column join WITHOUT string concatenation, padding, or transformations (e.g., ON a.col = b.col instead of ON a.col = '0' || b.col). If two columns share a name or similar name across tables, try joining them directly."
 
         prompt = f"""The previous SQL attempts all returned EMPTY results or failed.
 The question might have ambiguous terms that map to different columns or values.
@@ -2284,7 +2759,7 @@ RULES:
 - If the question says "X and Y" (two values), make sure at least one hypothesis returns 2 columns
 - If the question uses "last/latest/most recent", use ORDER BY DESC LIMIT 1 in at least one hypothesis
 - For time strings like '1:36.483', try: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL) for conversion to seconds
-- NEVER return NULL — wrap computations in COALESCE and add WHERE ... IS NOT NULL filters"""
+- NEVER return NULL — wrap computations in COALESCE and add WHERE ... IS NOT NULL filters{join_fix_rule}"""
 
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
