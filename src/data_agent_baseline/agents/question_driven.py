@@ -72,6 +72,7 @@ SQL_RULES_LABELED: list[tuple[str, str]] = [
     ("positional", "PER-GROUP POSITIONAL: 'Nth of each group' = ROW_NUMBER() OVER (PARTITION BY ...)."),
     ("intersection", "INTERSECTION: 'X with Y containing Z' = two subqueries intersected, NOT one WHERE."),
     ("colocated", "CO-LOCATED MEASURES: Filter column in detail table → use measure from SAME detail table, not parent summary."),
+    ("same_name_col", "SAME-NAME COLUMNS: When multiple tables share a column name, read the question language to pick the right table. 'the patient's X' → Patient.X, not DetailTable.X."),
 ]
 
 # Full rule texts for backward compatibility
@@ -255,14 +256,17 @@ RULES:
 - SUPERLATIVES: "lowest/highest" → rows = "all-matching". Use WHERE col = (SELECT MIN/MAX...). NEVER LIMIT 1.
 - CO-LOCATED MEASURES: Filter in detail table → use measure from SAME detail table, not parent summary.
 - PARTIAL MATCH: "X-related" / "from X" with proper noun → LIKE '%X%'. Exact match only for "named X" / "is X".
+- SAME-NAME COLUMNS: When multiple tables have the SAME column name, read the question language to decide which table to SELECT from. "the patient's X" → Patient.X. "the exam's X" → Exam.X. The subject/possessive in the question is authoritative.
 """.strip()
 
-def _trim_schema_by_relevance(kg_context: str, question: str, budget: int) -> str:
+def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, anchor_text: str = "") -> str:
     """Trim schema using Steiner tree: keep only tables needed to connect question-relevant tables.
 
     Graph: tables = nodes, FK relationships = edges.
     Terminals: tables whose name or columns overlap with question keywords.
-    Steiner tree: minimum table set connecting all terminals via FK paths.
+    Also uses anchor_text (domain knowledge) to bridge semantic gaps between
+    question language and column names (e.g. "disease" → Diagnosis column).
+    Skips trimming entirely for small schemas (≤5 tables).
     """
     if len(kg_context) <= budget:
         return kg_context
@@ -287,32 +291,91 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int) -> st
 
     all_tables = list(blocks.keys())
 
+    # Small schemas: skip Steiner tree, just include all with column cap if needed
+    if len(all_tables) <= 5:
+        result_parts: list[str] = []
+        total = 0
+        for name in all_tables:
+            text = blocks[name]
+            if total + len(text) + 1 <= budget:
+                result_parts.append(text)
+                total += len(text) + 1
+            else:
+                lines = text.split("\n")
+                trimmed = []
+                col_count = 0
+                for ln in lines:
+                    if ln.startswith("  ") and ":" in ln and not ln.strip().startswith("FK:") and not ln.strip().startswith("PK:"):
+                        col_count += 1
+                        if col_count > 12:
+                            continue
+                    trimmed.append(ln)
+                if col_count > 12:
+                    trimmed.append(f"  ... ({col_count - 12} more columns)")
+                short_text = "\n".join(trimmed)
+                if total + len(short_text) + 1 <= budget:
+                    result_parts.append(short_text)
+                    total += len(short_text) + 1
+        return "\n".join(result_parts) if result_parts else kg_context[:budget]
+
     # Build adjacency graph from FK lines in schema
     graph: dict[str, set[str]] = {t: set() for t in all_tables}
     for name, text in blocks.items():
         for line in text.split("\n"):
             if "FK:" in line or "->" in line:
-                # Find referenced table names
                 for other in all_tables:
                     if other != name and other.lower() in line.lower():
                         graph[name].add(other)
                         graph[other].add(name)
 
-    # Identify terminal nodes: tables with question-keyword overlap
-    q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
-    terminals: list[str] = []
-    for name, text in blocks.items():
-        table_words = set(re.findall(r'\b[a-z]{3,}\b', (name + " " + text).lower()))
-        if q_words & table_words:
-            terminals.append(name)
+    # Identify terminal nodes via keyword overlap with question
+    # Use only nouns/meaningful words (exclude stop words)
+    stop_words = {"the", "and", "for", "are", "was", "were", "that", "this", "with",
+                  "from", "have", "has", "had", "been", "will", "would", "could",
+                  "their", "them", "they", "what", "which", "who", "how", "many",
+                  "much", "each", "every", "all", "any", "list", "find", "show",
+                  "give", "name", "number", "total", "average", "count"}
+    q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower())) - stop_words
+    terminals: set[str] = set()
 
-    # If no terminals found or only 1, fall back to all tables
+    # Match 1: question words vs table names and column names
+    for name, text in blocks.items():
+        # Table name match
+        if name.lower() in q_words or any(w in name.lower() for w in q_words):
+            terminals.add(name)
+            continue
+        # Column name match (lines starting with spaces before the colon)
+        for line in text.split("\n"):
+            if line.startswith("  ") and ":" in line:
+                col_name = line.strip().split(":")[0].split("(")[0].strip().lower()
+                col_words = set(re.findall(r'[a-z]{3,}', col_name))
+                if q_words & col_words:
+                    terminals.add(name)
+                    break
+
+    # Match 2: use anchor_text to bridge semantic gaps
+    # Anchor text contains natural language descriptions that may match question words
+    # Map those descriptions back to table names mentioned nearby
+    if anchor_text and len(terminals) < len(all_tables):
+        anchor_lower = anchor_text.lower()
+        for word in q_words:
+            if word in anchor_lower:
+                # Find which table this anchor word relates to
+                for anchor_line in anchor_text.split("\n"):
+                    if word in anchor_line.lower():
+                        for tbl in all_tables:
+                            if tbl.lower() in anchor_line.lower() or tbl.lower() + "." in anchor_line.lower():
+                                terminals.add(tbl)
+
+    # If still no terminals or only 1, fall back to all tables
     if len(terminals) <= 1:
-        terminals = all_tables
+        terminals = set(all_tables)
 
     # Steiner tree approximation: BFS shortest path between all terminal pairs,
     # union of paths = set of required tables
     from collections import deque
+
+    terminal_list = list(terminals)
 
     def bfs_path(start: str, end: str) -> list[str]:
         if start == end:
@@ -329,13 +392,12 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int) -> st
                     queue.append(path + [neighbor])
         return []  # no path (disconnected)
 
-    steiner_tables: set[str] = set(terminals)
-    for i, t1 in enumerate(terminals):
-        for t2 in terminals[i + 1:]:
+    steiner_tables: set[str] = set(terminal_list)
+    for i, t1 in enumerate(terminal_list):
+        for t2 in terminal_list[i + 1:]:
             path = bfs_path(t1, t2)
             steiner_tables.update(path)
 
-    # If Steiner tree is empty or covers all tables, include all
     if not steiner_tables:
         steiner_tables = set(all_tables)
 
@@ -343,7 +405,7 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int) -> st
     ordered = [t for t in all_tables if t in steiner_tables]
     remaining_tables = [t for t in all_tables if t not in steiner_tables]
 
-    result_parts: list[str] = []
+    result_parts = []
     total = 0
 
     for name in ordered + remaining_tables:
@@ -387,7 +449,7 @@ def _build_semantic_prompt(
 
     # Schema gets priority, sample data fills remainder
     schema_budget = max(remaining - 1500, 2000)
-    kg_trimmed = _trim_schema_by_relevance(kg_context, question, schema_budget)
+    kg_trimmed = _trim_schema_by_relevance(kg_context, question, schema_budget, anchor_text)
     sample_budget = max(remaining - len(kg_trimmed), 500)
     sample_section = f"\nSAMPLE DATA:\n{sample_data[:sample_budget]}" if sample_data else ""
     anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1500]}" if anchor_text else ""
