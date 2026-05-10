@@ -305,7 +305,7 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, ancho
                 trimmed = []
                 col_count = 0
                 for ln in lines:
-                    if ln.startswith("  ") and ":" in ln and not ln.strip().startswith("FK:") and not ln.strip().startswith("PK:"):
+                    if ln.startswith("  ") and not ln.strip().startswith("FK:") and not ln.strip().startswith("PK:"):
                         col_count += 1
                         if col_count > 12:
                             continue
@@ -338,37 +338,56 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, ancho
     q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower())) - stop_words
     terminals: set[str] = set()
 
+    def _stem_match(word_set_a: set[str], word_set_b: set[str]) -> bool:
+        """Check if any word in A matches any word in B (exact or stem-substring for 4+ char words)."""
+        for a in word_set_a:
+            for b in word_set_b:
+                if a == b:
+                    return True
+                if len(a) >= 4 and len(b) >= 4 and (a in b or b in a):
+                    return True
+        return False
+
+    # Track match strength: name-match > column-match > anchor-match
+    name_matched: set[str] = set()
+    col_matched: set[str] = set()
+
     # Match 1: question words vs table names and column names
     for name, text in blocks.items():
-        # Table name match
-        if name.lower() in q_words or any(w in name.lower() for w in q_words):
+        # Table name match (strongest signal)
+        name_words = set(re.findall(r'[a-z]{3,}', name.lower()))
+        if _stem_match(q_words, name_words):
             terminals.add(name)
+            name_matched.add(name)
             continue
-        # Column name match (lines starting with spaces before the colon)
+        # Column name match (weaker — FK columns like player_id match broadly)
         for line in text.split("\n"):
-            if line.startswith("  ") and ":" in line:
-                col_name = line.strip().split(":")[0].split("(")[0].strip().lower()
-                col_words = set(re.findall(r'[a-z]{3,}', col_name))
-                if q_words & col_words:
+            if line.startswith("  ") and not line.strip().startswith("FK:") and not line.strip().startswith("PK:"):
+                col_part = line.strip().split("(")[0].split(":")[0].strip().lower() if "(" in line or ":" in line else line.strip().lower()
+                col_words = set(re.findall(r'[a-z]{3,}', col_part))
+                if _stem_match(q_words, col_words):
                     terminals.add(name)
+                    col_matched.add(name)
                     break
 
     # Match 2: use anchor_text to bridge semantic gaps
     # Anchor text contains natural language descriptions that may match question words
     # Map those descriptions back to table names mentioned nearby
+    anchor_matched: set[str] = set()
     if anchor_text and len(terminals) < len(all_tables):
         anchor_lower = anchor_text.lower()
         for word in q_words:
             if word in anchor_lower:
-                # Find which table this anchor word relates to
                 for anchor_line in anchor_text.split("\n"):
                     if word in anchor_line.lower():
                         for tbl in all_tables:
                             if tbl.lower() in anchor_line.lower() or tbl.lower() + "." in anchor_line.lower():
                                 terminals.add(tbl)
+                                if tbl not in name_matched and tbl not in col_matched:
+                                    anchor_matched.add(tbl)
 
-    # If still no terminals or only 1, fall back to all tables
-    if len(terminals) <= 1:
+    # If no terminals found, fall back to all tables
+    if not terminals:
         terminals = set(all_tables)
 
     # Steiner tree approximation: BFS shortest path between all terminal pairs,
@@ -401,9 +420,15 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, ancho
     if not steiner_tables:
         steiner_tables = set(all_tables)
 
-    # Build result: Steiner tables first (in original order), then others if budget allows
-    ordered = [t for t in all_tables if t in steiner_tables]
+    # Build result priority: name-matched > anchor-matched > col-matched > connectors > rest
+    # Within each tier, smaller tables first to maximize coverage
+    connectors = steiner_tables - terminals
+    tier_name = sorted([t for t in all_tables if t in name_matched], key=lambda t: len(blocks[t]))
+    tier_anchor = sorted([t for t in all_tables if t in anchor_matched], key=lambda t: len(blocks[t]))
+    tier_col = sorted([t for t in all_tables if t in col_matched and t not in name_matched and t not in anchor_matched], key=lambda t: len(blocks[t]))
+    tier_conn = sorted([t for t in all_tables if t in connectors], key=lambda t: len(blocks[t]))
     remaining_tables = [t for t in all_tables if t not in steiner_tables]
+    ordered = tier_name + tier_anchor + tier_col + tier_conn
 
     result_parts = []
     total = 0
@@ -419,7 +444,7 @@ def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, ancho
             trimmed = []
             col_count = 0
             for ln in lines:
-                if ln.startswith("  ") and ":" in ln and not ln.strip().startswith("FK:") and not ln.strip().startswith("PK:"):
+                if ln.startswith("  ") and not ln.strip().startswith("FK:") and not ln.strip().startswith("PK:"):
                     col_count += 1
                     if col_count > 12:
                         continue
