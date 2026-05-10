@@ -2237,14 +2237,16 @@ GROUNDING CONTEXT:
 GENERATED SQL:
 {sql}
 
-Check if the SQL uses WRONG columns or tables compared to what GROUNDING CONTEXT specifies.
-Only flag REAL violations — using a wrong column for the key metric or wrong join.
-Do NOT flag minor style differences or extra columns in verification queries.
+Check if the SQL uses a WRONG column for the key metric/filter that the question asks about.
+Only flag if the SQL computes the answer from a DIFFERENT column than what GROUNDING specifies.
+PASS if: correct metric column used, correct filter column used, joins reach the right tables.
+FAIL if: wrong column for the main computation (e.g. using 'spent' when grounding says 'cost').
+Do NOT flag: join style differences, extra columns, subquery vs JOIN approaches.
 
 Reply in this EXACT format (first line must be PASS or FAIL):
 PASS
 or
-FAIL: <one sentence explaining what column/table is wrong and what it should be>"""
+FAIL: <one sentence: what column is wrong and what it should be>"""
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
