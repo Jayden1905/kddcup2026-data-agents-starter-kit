@@ -135,6 +135,8 @@ def _build_sql_prompt(
             rules += "\n- ⚠️ Read the IMPORTANT section — it flags a column mismatch."
         if "CONSTRAINTS" in grounding_context and "/" in grounding_context:
             rules += "\n- ⚠️ FORMULA AUTHORITY: If CONSTRAINTS has arithmetic (/ 12, * 100), include it EXACTLY in your SQL."
+        if "EXPECTED ROWS: single" in grounding_context:
+            rules += "\n- ⚠️ EXPECTED: single row result. Ensure your query has enough WHERE filters or aggregation to produce exactly 1 row."
     parts.append(f"\nRULES:\n{rules}")
 
     # Put mandatory filter constraint LAST so it's freshest in model's context (only if no gaps)
@@ -192,7 +194,8 @@ Does the RESULTS data answer it? Return ONLY a JSON object:
 - AGGREGATION: AVG of entity attributes via JOIN to detail table = WRONG (duplicated rows).
 - TEMPORAL: "last/most recent" needs ORDER BY DESC LIMIT 1.
 - HAVING: "where the average exceeds N" = GROUP BY + HAVING, not WHERE.
-- SCOPE: "the X" (singular definite) MAY still return multiple rows if the entity has multiple records (e.g., "the date X paid" could be multiple payments). Only mark incomplete if there are clearly UNRELATED rows (wrong entity, wrong filter).""")
+- SCOPE: "the X" (singular definite) MAY still return multiple rows if the entity has multiple records (e.g., "the date X paid" could be multiple payments). Only mark incomplete if there are clearly UNRELATED rows (wrong entity, wrong filter).
+- ROW EXPECTATION: If GROUNDING CONTEXT says "EXPECTED ROWS: single" but the result has multiple rows, mark incomplete — a filter or aggregation is missing.""")
 
     return "\n".join(parts)
 
@@ -493,6 +496,26 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     """Format grounding as factual context for SQL planner — no SQL, no steps, no approach."""
     parts: list[str] = []
 
+    # User intent and expected output shape
+    user_wants = grounding.get("what_user_wants", "")
+    expected_output = grounding.get("expected_output", {})
+    if user_wants:
+        parts.append(f"USER WANTS: {user_wants}")
+    if expected_output:
+        row_expect = expected_output.get("rows", "")
+        col_expect = expected_output.get("columns", "")
+        if row_expect:
+            parts.append(f"EXPECTED ROWS: {row_expect}")
+        if col_expect:
+            parts.append(f"EXPECTED COLUMNS: {col_expect}")
+
+    # Reference formula — the planner should follow this structure
+    # Skip if population override detected (formula direction may be wrong)
+    has_population_override = any("POPULATION RULE" in s for s in grounding.get("_semantic_overrides", []))
+    formula = grounding.get("formula", "")
+    if formula and not has_population_override:
+        parts.append(f"REFERENCE SQL (follow this logic):\n  {formula}")
+
     # Join paths (factual FK relationships)
     join_paths = grounding.get("join_paths", [])
     if join_paths:
@@ -644,20 +667,34 @@ class QuestionDrivenAgent:
                 except Exception:
                     pass
 
-            # Step 3: Doc extraction (LLM-based, batched by section)
+            # Step 3: Doc extraction (compiled: LLM writes rules, engine runs them)
             if ctx.doc_sources:
                 doc_paths = [doc.path for doc in ctx.doc_sources]
-                from data_agent_baseline.pipeline.llm_extractor import (
-                    hybrid_extract_docs,
+                from data_agent_baseline.pipeline.compiled_extractor import (
+                    compiled_extract_docs,
                 )
-                hybrid_extract_docs(
+                n_extracted = compiled_extract_docs(
                     doc_paths=doc_paths,
                     db_path=db_path,
                     model=self.model,
+                    question=question,
                     knowledge_text=ctx.knowledge_text,
                     log_fn=self._log,
                     structured_tables=structured_tables,
                 )
+                # Fallback: if compiled extraction got nothing, try hybrid LLM approach
+                if n_extracted == 0:
+                    from data_agent_baseline.pipeline.llm_extractor import (
+                        hybrid_extract_docs,
+                    )
+                    hybrid_extract_docs(
+                        doc_paths=doc_paths,
+                        db_path=db_path,
+                        model=self.model,
+                        knowledge_text=ctx.knowledge_text,
+                        log_fn=self._log,
+                        structured_tables=structured_tables,
+                    )
 
             # Step 4: Build KG from full DB (deterministic)
             kg = build_kg_from_sqlite(db_path)
@@ -1040,6 +1077,7 @@ DATABASE SCHEMA:
 {grounding_context[:1500]}
 
 Generate a step-by-step SQL plan. Break complex queries into verification steps + final query.
+Your final SQL MUST follow the REFERENCE SQL logic shown in the grounding context above.
 
 Return ONLY a JSON object:
 {{"steps": [
@@ -1054,6 +1092,10 @@ RULES:
 - Final step: uses confirmed values from verification steps
 - Each step must be valid standalone SQL
 - Max 3 steps total (keep it lean)
+- RATIO/AVG queries: verify the denominator count separately before computing the final ratio
+- PERCENTAGE with 'In X, what is the percentage of Y?': X defines the WHERE filter (denominator population), Y is the CASE/COUNT numerator. Do NOT flip them.
+- HUMAN-READABLE OUTPUT: If the question asks for names/descriptions, the final SELECT must JOIN to resolve FK IDs to display names — never return raw IDs like 'rec...' or numeric FK values
+- MONTHLY vs YEARLY: If data is yearly and question asks monthly, divide by 12. Verify data granularity in a verification step.
 {selected_rules}"""
 
         messages = [ModelMessage(role="user", content=prompt)]
@@ -1477,6 +1519,32 @@ RULES:
             self._log("grounding_validated", "OK (formula valid)")
             break
 
+        # POPULATION CHECK: for "In X, what is the percentage of Y?" questions,
+        # verify the formula uses X as WHERE (denominator) and Y as CASE (numerator)
+        if grounding:
+            q_lower = question.lower()
+            has_percentage = "percentage" in q_lower or "proportion" in q_lower or "%" in q_lower
+            in_match = re.match(r"^in\s+(.+?),\s+what\s+is\s+the\s+(?:percentage|proportion)", q_lower)
+            if has_percentage and in_match:
+                population_clause = in_match.group(1).strip()
+                formula = grounding.get("formula", "")
+                computation_steps = grounding.get("computation_steps", [])
+                # Check if the first step filters by the population condition
+                # If computation starts with filtering by the metric (Y) instead of population (X), flag it
+                steps_text = " ".join(computation_steps).lower()
+                if population_clause and formula:
+                    # The population condition should be in the WHERE clause
+                    # If we detect the formula filters by the metric entity first, override
+                    override = (
+                        f"POPULATION RULE: '{population_clause}' defines the WHERE filter (denominator). "
+                        f"The percentage numerator is the subset matching the other condition. "
+                        f"Correct pattern: SELECT COUNT(condition) / COUNT(*) FROM ... WHERE [population_filter]"
+                    )
+                    if "_semantic_overrides" not in grounding:
+                        grounding["_semantic_overrides"] = []
+                    grounding["_semantic_overrides"].append(override)
+                    self._log("population_check", f"Injected population rule: '{population_clause}' = WHERE filter")
+
         # SEMANTIC FEEDBACK: run once, inject as constraint if issue found
         # Don't re-ground — the SQL planner handles the constraint better
         if grounding:
@@ -1537,6 +1605,10 @@ RULES:
                 overrides.append(col_override)
                 grounding["_semantic_overrides"] = overrides
 
+        # Fix 5: Verify all question entities appear in formula/known_values
+        if grounding:
+            grounding = self._verify_filter_completeness(question, grounding)
+
         # Deterministic enrichment: add any schema columns whose name matches a question word
         if db_path:
             grounding = self._enrich_data_requirements(db_path, question, grounding)
@@ -1570,7 +1642,8 @@ RULES (by index and label):
 {rule_list}
 
 Return ONLY a JSON: {{"indices": [0, 3, 7, ...]}}
-Pick 5-10 rules most relevant to this specific question. Always include 0 (exact_question)."""
+Pick 5-10 rules most relevant to this specific question. Always include 0 (exact_question).
+If the question asks for names, descriptions, or labels — include rule 5 (human_readable)."""
 
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -1580,11 +1653,22 @@ Pick 5-10 rules most relevant to this specific question. Always include 0 (exact
             indices = parsed["indices"]
             if isinstance(indices, list) and indices:
                 selected = []
+                selected_labels = []
                 for idx in indices:
                     if isinstance(idx, int) and 0 <= idx < len(SQL_RULES_LABELED):
                         selected.append(SQL_RULES_LABELED[idx][1])
+                        selected_labels.append(SQL_RULES_LABELED[idx][0])
+
+                # Deterministic injection: percentage/proportion questions need the population rule
+                q_lower = question.lower()
+                if ("percentage" in q_lower or "proportion" in q_lower or "%" in q_lower) and "population" not in selected_labels:
+                    pop_rule = next((r for l, r in SQL_RULES_LABELED if l == "population"), None)
+                    if pop_rule:
+                        selected.append(pop_rule)
+                        selected_labels.append("population")
+
                 if selected:
-                    self._log("rules_selected", f"{len(selected)} rules: {[SQL_RULES_LABELED[i][0] for i in indices if isinstance(i, int) and 0 <= i < len(SQL_RULES_LABELED)]}")
+                    self._log("rules_selected", f"{len(selected)} rules: {selected_labels}")
                     return "\n".join(f"- {r}" for r in selected)
 
         # Fallback: compact rules
@@ -1595,6 +1679,41 @@ Pick 5-10 rules most relevant to this specific question. Always include 0 (exact
 - JOIN through FK paths shown in schema.
 - Use LIKE '%X%' COLLATE NOCASE for text. CAST(x AS REAL) for division.
 - NEVER RETURN NULL — add WHERE IS NOT NULL. Escape apostrophes with ''."""
+
+    def _verify_filter_completeness(self, question: str, grounding: dict[str, Any]) -> dict[str, Any]:
+        """Check that quoted strings and proper nouns from question are in formula/known_values.
+
+        If missing, inject them as constraints so the SQL planner adds the filter.
+        """
+        formula = grounding.get("formula", "")
+        known_values = grounding.get("known_values", {})
+        kv_flat = " ".join(str(v) for vs in known_values.values() for v in vs).lower()
+        formula_lower = formula.lower()
+
+        # Extract quoted entities from question
+        quoted = re.findall(r"['\"]([^'\"]+)['\"]", question)
+        # Extract proper nouns (capitalized multi-word sequences not at start of sentence)
+        proper_nouns = re.findall(r'(?:the |in |for |of )([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)+)', question)
+
+        missing_entities = []
+        for entity in quoted + proper_nouns:
+            entity_lower = entity.lower()
+            if entity_lower not in formula_lower and entity_lower not in kv_flat:
+                # Check if any word from the entity is in formula (partial match is OK)
+                words = entity_lower.split()
+                if not any(w in formula_lower for w in words if len(w) > 3):
+                    missing_entities.append(entity)
+
+        if missing_entities:
+            overrides = grounding.get("_semantic_overrides", [])
+            for entity in missing_entities[:2]:
+                overrides.append(
+                    f"The question mentions '{entity}' which MUST appear as a filter condition (WHERE/HAVING). "
+                    f"Find the column that contains this value and add it to the query."
+                )
+            grounding["_semantic_overrides"] = overrides
+
+        return grounding
 
     def _enrich_data_requirements(
         self, db_path: Path, question: str, grounding: dict[str, Any]
@@ -3094,14 +3213,158 @@ Return ONLY: {{"python": "import sqlite3\\n..."}}"""
 
         q_lower = question.lower()
 
+        # Grounding-based row validation: if grounding expects "single" but we got many
+        expected_rows_match = re.search(r"EXPECTED ROWS:\s*(\S+)", grounding_context)
+        if expected_rows_match:
+            expected_rows = expected_rows_match.group(1).lower()
+            if expected_rows == "single" and len(rows) > 1:
+                self._log("shape_fix_grounding", f"Grounding expects single row but got {len(rows)}")
+                # Check if question has superlative (most/least/highest/lowest/best/worst/largest/smallest)
+                superlatives = ["most", "least", "highest", "lowest", "best", "worst",
+                                "largest", "smallest", "maximum", "minimum", "max", "min",
+                                "longest", "shortest", "fastest", "slowest", "oldest", "youngest",
+                                "top", "first", "last"]
+                has_superlative = any(s in q_lower for s in superlatives)
+
+                if has_superlative:
+                    # Simple fix: take first row (SQL likely already ordered correctly)
+                    self._log("shape_fixed_superlative", f"Taking first row (superlative in question)")
+                    data_result["rows"] = [rows[0]]
+                    return data_result
+                else:
+                    # Missing filter — ask LLM to fix
+                    fix_prompt = f"""The SQL returned {len(rows)} rows but the question expects exactly ONE result.
+
+QUESTION: {question}
+CURRENT RESULT: {len(rows)} rows, columns={cols}
+FIRST 3 ROWS: {rows[:3]}
+
+The question asks about a SPECIFIC item (one match, one event, one person, etc.) but the SQL is missing a filter that would narrow it down.
+Re-read the question. What additional WHERE condition is needed to get exactly 1 row?
+
+DATABASE SCHEMA:
+{kg_context[:2000]}
+
+{grounding_context[:800]}
+
+Return ONLY: {{"sql": "SELECT ..."}}"""
+                    messages = [ModelMessage(role="user", content=fix_prompt)]
+                    raw = self._model_call_with_retry(messages)
+                    parsed = self._parse_json(raw)
+                    if isinstance(parsed, dict) and parsed.get("sql"):
+                        fix_result = self._try_sql(db_path, parsed["sql"])
+                        if fix_result and fix_result.get("rows") and 0 < len(fix_result["rows"]) < len(rows):
+                            self._log("shape_fixed_grounding", f"Narrowed from {len(rows)} to {len(fix_result['rows'])} rows")
+                            data_result = fix_result
+                            rows = data_result.get("rows", [])
+                            cols = data_result.get("columns", [])
+
+        # Fix 4: Detect error strings or None/NULL values in result and retry
+        first_row_str = " ".join(str(v) for v in rows[0]) if rows else ""
+        has_none_values = any(str(v).lower() in ("none", "null", "") for v in rows[0]) if rows else False
+        # Only flag None as suspicious if question asks for names/descriptions (not counts/aggregations)
+        name_indicators = ["name", "who", "full name", "surname", "title", "display"]
+        none_is_suspicious = has_none_values and any(w in q_lower for w in name_indicators)
+
+        if "error" in first_row_str.lower() or first_row_str.strip() in ("0", "0.0", "0.00") or none_is_suspicious:
+            # Check if result is suspicious (error text or zero when expecting real data)
+            has_error = "error" in first_row_str.lower()
+            if has_error or none_is_suspicious:
+                issue_desc = "error/null values" if none_is_suspicious else "error string"
+                self._log("shape_fix_error", f"Result contains {issue_desc}: {first_row_str[:60]}")
+                if none_is_suspicious:
+                    fix_prompt = f"""The SQL returned NULL/None values for columns that should have real data (names, descriptions, etc.).
+
+QUESTION: {question}
+CURRENT RESULT: columns={cols}, values={rows[0]}
+
+The NULL values likely mean: a column name is WRONG (e.g., 'name' doesn't exist but 'first_name'+'last_name' do), or the JOIN failed.
+Check the DATABASE SCHEMA carefully for the ACTUAL column names and fix the query.
+
+DATABASE SCHEMA:
+{kg_context[:2000]}
+
+{grounding_context[:1000]}
+
+Write a corrected SQL using the EXACT column names from the schema.
+Return ONLY: {{"sql": "SELECT ..."}}"""
+                else:
+                    fix_prompt = f"""The SQL returned an error value instead of real data.
+
+QUESTION: {question}
+CURRENT RESULT: columns={cols}, values={rows[0]}
+
+This is wrong. The result should be a meaningful number or value, not an error.
+Possible issues: division by zero, NULL in computation, wrong column type.
+
+DATABASE SCHEMA:
+{kg_context[:2000]}
+
+{grounding_context[:1000]}
+
+Write a SIMPLER SQL that avoids the computation error. Use NULLIF for division, COALESCE for NULLs.
+Return ONLY: {{"sql": "SELECT ..."}}"""
+                messages = [ModelMessage(role="user", content=fix_prompt)]
+                raw = self._model_call_with_retry(messages)
+                parsed = self._parse_json(raw)
+                if isinstance(parsed, dict) and parsed.get("sql"):
+                    fix_result = self._try_sql(db_path, parsed["sql"])
+                    if fix_result and fix_result.get("rows"):
+                        fix_str = " ".join(str(v) for v in fix_result["rows"][0])
+                        fix_nones = sum(1 for v in fix_result["rows"][0] if str(v).lower() in ("none", "null", ""))
+                        orig_nones = sum(1 for v in rows[0] if str(v).lower() in ("none", "null", ""))
+                        if "error" not in fix_str.lower() and fix_nones < orig_nones:
+                            self._log("shape_fixed_error", f"Fixed: {fix_result['rows'][0]}")
+                            return fix_result
+
+        # Fix 2: Detect raw FK IDs in output and re-query with JOIN for human-readable values
+        if rows and cols:
+            has_raw_id = False
+            raw_id_cols = []
+            for i, col in enumerate(cols):
+                sample_vals = [str(rows[r][i]) for r in range(min(len(rows), 3))]
+                # Detect patterns: "rec..." (Airtable IDs), all-digit long strings unlikely to be answers
+                for v in sample_vals:
+                    if v and (v.startswith("rec") and len(v) > 10) or \
+                       (col.lower().endswith("_id") and not any(w in q_lower for w in [col.lower(), "id"])):
+                        has_raw_id = True
+                        raw_id_cols.append((i, col, sample_vals[0]))
+                        break
+
+            if has_raw_id and len(raw_id_cols) > 0:
+                id_desc = ", ".join(f"'{c}' has values like '{v}'" for _, c, v in raw_id_cols)
+                self._log("shape_fix_fk", f"Raw IDs detected: {id_desc}")
+                fix_prompt = f"""The SQL result contains raw foreign key IDs instead of human-readable names.
+
+QUESTION: {question}
+CURRENT RESULT: columns={cols}, sample row={rows[0]}
+RAW ID COLUMNS: {id_desc}
+
+The user expects human-readable names/descriptions, not internal IDs. Add a JOIN to resolve these IDs to their display values.
+
+DATABASE SCHEMA:
+{kg_context[:2000]}
+
+Return ONLY: {{"sql": "SELECT ..."}}"""
+                messages = [ModelMessage(role="user", content=fix_prompt)]
+                raw = self._model_call_with_retry(messages)
+                parsed = self._parse_json(raw)
+                if isinstance(parsed, dict) and parsed.get("sql"):
+                    fix_result = self._try_sql(db_path, parsed["sql"])
+                    if fix_result and fix_result.get("rows"):
+                        new_vals = [str(v) for v in fix_result["rows"][0]]
+                        # Verify at least one raw ID was resolved
+                        old_vals = [str(rows[0][idx]) for idx, _, _ in raw_id_cols]
+                        if any(nv != ov for nv, ov in zip(new_vals, old_vals)):
+                            self._log("shape_fixed_fk", f"Resolved IDs: {fix_result['rows'][0]}")
+                            return fix_result
+
         # Check: "X and Y" pattern expects 2+ columns but we got 1
-        # Pattern: "what is the X and the Y" or "average X and average Y"
         and_pattern = re.search(
             r'(?:what is|identify|find)\s+(?:the\s+)?(\w+).+?\band\b\s+(?:the\s+)?(\w+)',
             q_lower,
         )
         if and_pattern and len(cols) == 1 and len(rows) == 1:
-            # We have a single combined value — need to re-query as two columns
             self._log("shape_fix", f"Question asks for two values ('{and_pattern.group(1)}' and '{and_pattern.group(2)}') but got 1 column — re-querying")
             fix_prompt = f"""The SQL returned a SINGLE combined value but the question asks for TWO SEPARATE values.
 
