@@ -38,3 +38,4 @@ configs/*
 .DS_Store
 .ipynb_checkpoints/
 *.tar.gz
+DOCKER.md

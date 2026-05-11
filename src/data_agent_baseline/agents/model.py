@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -7,6 +8,13 @@ from urllib.parse import urlparse
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
 REQUEST_TIMEOUT = 60  # seconds per API call
+
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_thinking_tokens(content: str) -> str:
+    """Remove <think>...</think> blocks that vLLM reasoning parsers may include."""
+    return _THINK_RE.sub("", content).strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +89,7 @@ class OpenAIModelAdapter:
         content = choices[0].message.content
         if not isinstance(content, str):
             raise RuntimeError("Model response missing text content.")
-        return content
+        return _strip_thinking_tokens(content)
 
 
 def _normalize_azure_endpoint(endpoint: str) -> str:

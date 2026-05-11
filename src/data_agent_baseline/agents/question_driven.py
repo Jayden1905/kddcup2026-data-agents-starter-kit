@@ -2618,6 +2618,8 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
             for col_name, values in list(known_values.items()):
                 if "." not in col_name:
                     continue
+                if not values or not isinstance(values, (list, tuple)):
+                    continue
                 table_name, col_n = col_name.split(".", 1)
                 # Only check numeric comparison filters (< > <= >=)
                 is_comparison = any(

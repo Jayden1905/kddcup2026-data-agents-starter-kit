@@ -35,8 +35,8 @@ def run():
         },
         "run": {
             "output_dir": "/tmp/run_output",
-            "max_workers": 1,
-            "task_timeout_seconds": 0,
+            "max_workers": 2,
+            "task_timeout_seconds": 500,
         },
     }
 
