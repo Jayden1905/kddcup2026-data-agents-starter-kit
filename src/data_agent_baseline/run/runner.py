@@ -265,6 +265,9 @@ def _write_task_outputs(
         if agent_log.exists():
             shutil.copy2(agent_log, task_output_dir / "agent.log")
             agent_log.unlink()
+        consolidated_db = dataset_root / task_id / "context" / "_consolidated.db"
+        if consolidated_db.exists():
+            shutil.copy2(consolidated_db, task_output_dir / "consolidated.db")
 
     return TaskRunArtifacts(
         task_id=task_id,

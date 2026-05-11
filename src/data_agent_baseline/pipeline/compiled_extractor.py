@@ -52,6 +52,9 @@ Then return ONLY a JSON object:
 CRITICAL RULES:
 - Field names MUST match the database schema / knowledge definitions exactly. Copy the exact column names character for character (e.g. "height_cm" not "height", "publisher_id" not "publisher").
 - Include ALL columns that this document could populate, even if only some records have them.
+- CATEGORICAL FIELDS: If the document assigns each record to a category/type/class (e.g. "categorized as X", "designated for Y", "classified as Z"), you MUST include that as a field. Name it to match the knowledge/schema (e.g. "category", "type").
+- FOREIGN KEYS: If records reference entities from the existing database (e.g. event names, member IDs), include a link field (e.g. "link_to_event", "event_id") matching the schema convention.
+- AMOUNTS: If the knowledge defines a field name for monetary values (e.g. "amount"), use that name — not synonyms like "allocation" or "budget_value".
 - Always include "_id" as the first field."""
 
 WORKER_PROMPT = """Extract ALL records from this chunk as JSON array.
@@ -61,6 +64,8 @@ FIELDS TO EXTRACT: {fields}
 ID FORMAT: {id_description}
 
 {db_context}
+
+{fk_lookup}
 
 {schema_hint}
 
@@ -76,8 +81,11 @@ RULES:
 4. "_id" must be the EXACT identifier from the text — preserve original format.
 5. If text has corrections ("initially X, corrected/amended to Y"), use the FINAL corrected value only.
 6. Values should be clean atomic data (numbers, names, IDs), not prose.
-7. If a value is described as placeholder, missing, or 0.0 with a note it's inaccurate, use null.
-8. If no records in this chunk, return: []
+7. For FK/link fields: if VALID REFERENCES are listed above, use the ID value (e.g. "recXYZ"), NOT the name.
+8. For category/type fields: look for phrases like "categorized as X", "classified as X", "designated for X", "type of X". Extract ONLY the short label (e.g. "Advertisement", "Food"), NOT surrounding prose.
+9. For numeric fields (amount, cost, spent, remaining): extract the NUMBER only. Look for "amount of 75", "spent value of 67.81", "balance of 7.19" etc.
+10. If a value is described as placeholder, missing, or 0.0 with a note it's inaccurate, use null.
+11. If no records in this chunk, return: []
 
 Return ONLY the JSON array, nothing else."""
 
@@ -160,7 +168,7 @@ def _get_existing_db_context(db_path: Path) -> str:
     try:
         conn = sqlite3.connect(str(db_path))
         tables = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '_%'"
+            r"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\_%' ESCAPE '\'"
         ).fetchall()]
         if not tables:
             conn.close()
@@ -178,6 +186,175 @@ def _get_existing_db_context(db_path: Path) -> str:
         return "\n".join(parts)
     except Exception:
         return ""
+
+
+def _build_fk_lookup(db_path: Path) -> str:
+    """Build a FK lookup reference: PK → human-readable name for each existing table.
+
+    Workers use this to output proper FK values instead of prose descriptions.
+    """
+    if not db_path or not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        tables = [r[0] for r in conn.execute(
+            r"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\_%' ESCAPE '\'"
+        ).fetchall()]
+        if not tables:
+            conn.close()
+            return ""
+
+        parts: list[str] = []
+        for table in tables[:5]:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            if not cols:
+                continue
+            pk_col = cols[0]
+            # Find a name/label column
+            name_col = None
+            for c in cols[1:]:
+                if any(n in c.lower() for n in ("name", "title", "label", "display")):
+                    name_col = c
+                    break
+            if not name_col:
+                continue
+            rows = conn.execute(
+                f'SELECT "{pk_col}", "{name_col}" FROM "{table}" WHERE "{name_col}" IS NOT NULL LIMIT 50'
+            ).fetchall()
+            if rows:
+                parts.append(f"VALID {table} REFERENCES (use {pk_col} as FK value):")
+                for pk_val, name_val in rows:
+                    parts.append(f"  {pk_val} = {name_val}")
+        conn.close()
+        if parts:
+            return "\n".join(parts)
+        return ""
+    except Exception:
+        return ""
+
+
+def _resolve_fk_post_extraction(
+    records: list[dict[str, Any]],
+    db_path: Path,
+    plan_fields: list[str],
+    log_fn: Callable[[str, str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Post-extraction: resolve FK fields by fuzzy-matching text values to existing PKs.
+
+    For fields that look like FKs (link_to_X, X_id, event_name when event table exists),
+    match extracted text values against actual PK/name pairs in referenced tables.
+    """
+    if not db_path or not db_path.exists() or not records:
+        return records
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        tables = [r[0] for r in conn.execute(
+            r"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\_%' ESCAPE '\'"
+        ).fetchall()]
+    except Exception:
+        return records
+
+    # Build lookup: table_name → {pk_val: name_val, name_val_lower: pk_val}
+    table_lookups: dict[str, dict[str, str]] = {}
+    table_pk_cols: dict[str, str] = {}
+    for table in tables:
+        try:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            if not cols:
+                continue
+            pk_col = cols[0]
+            table_pk_cols[table] = pk_col
+            name_col = None
+            for c in cols[1:]:
+                if any(n in c.lower() for n in ("name", "title", "label", "display")):
+                    name_col = c
+                    break
+            if not name_col:
+                continue
+            rows = conn.execute(
+                f'SELECT "{pk_col}", "{name_col}" FROM "{table}" WHERE "{name_col}" IS NOT NULL'
+            ).fetchall()
+            lookup: dict[str, str] = {}
+            for pk_val, name_val in rows:
+                lookup[str(name_val).lower()] = str(pk_val)
+                lookup[str(pk_val)] = str(pk_val)  # identity mapping
+            table_lookups[table] = lookup
+        except Exception:
+            continue
+    conn.close()
+
+    if not table_lookups:
+        return records
+
+    # Identify FK fields in plan: link_to_X, X_id, or field named after another table
+    fk_fields: dict[str, str] = {}  # field_name → target_table
+    for field in plan_fields:
+        fl = field.lower()
+        if fl == "_id":
+            continue
+        # link_to_event → event
+        if fl.startswith("link_to_"):
+            target = fl[8:]
+            for t in tables:
+                if t.lower() == target or t.lower().rstrip("s") == target:
+                    fk_fields[field] = t
+                    break
+        # event_id → event
+        elif fl.endswith("_id"):
+            target = fl[:-3]
+            for t in tables:
+                if t.lower() == target or t.lower().rstrip("s") == target:
+                    fk_fields[field] = t
+                    break
+        # event_name when entity != event → FK to event
+        elif fl.endswith("_name"):
+            target = fl[:-5]
+            for t in tables:
+                if t.lower() == target or t.lower().rstrip("s") == target:
+                    fk_fields[field] = t
+                    break
+
+    if not fk_fields:
+        return records
+
+    resolved_count = 0
+    for record in records:
+        for fk_field, target_table in fk_fields.items():
+            val = record.get(fk_field)
+            if val is None:
+                continue
+            val_str = str(val).strip()
+            val_lower = val_str.lower()
+            lookup = table_lookups.get(target_table, {})
+            if not lookup:
+                continue
+            # Already a valid PK?
+            if val_str in lookup:
+                continue
+            # Exact name match
+            if val_lower in lookup:
+                record[fk_field] = lookup[val_lower]
+                resolved_count += 1
+                continue
+            # Fuzzy: check if any lookup name is contained in the value or vice versa
+            best_match = None
+            best_len = 0
+            for name_key, pk_val in lookup.items():
+                if name_key == pk_val:  # skip identity entries
+                    continue
+                if name_key in val_lower or val_lower in name_key:
+                    if len(name_key) > best_len:
+                        best_match = pk_val
+                        best_len = len(name_key)
+            if best_match:
+                record[fk_field] = best_match
+                resolved_count += 1
+
+    if log_fn and resolved_count > 0:
+        log_fn("fk_resolved", f"Resolved {resolved_count} FK values across fields {list(fk_fields.keys())}")
+
+    return records
 
 
 def _parse_json_response(raw: str) -> list[dict[str, Any]]:
@@ -308,6 +485,7 @@ def _run_workers(
     chunks: list[str],
     plan: dict[str, Any],
     db_context: str,
+    fk_lookup: str,
     log_fn: Callable[[str, str], None] | None,
 ) -> list[dict[str, Any]]:
     """Workers extract records from chunks in parallel."""
@@ -332,6 +510,7 @@ def _run_workers(
             fields=fields_str,
             id_description=id_description,
             db_context=db_context,
+            fk_lookup=fk_lookup,
             schema_hint=schema_hint,
             chunk_text=chunk[:3000],
         )
@@ -555,9 +734,19 @@ def chunked_extract(
         log_fn("phase", "=== PLANNER PHASE ===")
     plan = _run_planner(model, text, question, db_context, knowledge_hint, log_fn)
     if not plan:
-        plan = {"entity": doc_path.stem, "fields": ["_id", "name"], "id_description": "unique identifier"}
+        # Build a better fallback using knowledge columns
+        fallback_fields = ["_id"]
+        known_cols = _extract_knowledge_columns(knowledge_text)
+        # Add columns from knowledge that are likely entity attributes
+        skip_words = {"select", "from", "where", "count", "group", "order", "join", "having", "case", "when", "then", "else", "end"}
+        for col in sorted(known_cols):
+            if col not in skip_words and len(col) > 2 and col != "_id":
+                fallback_fields.append(col)
+        if len(fallback_fields) < 3:
+            fallback_fields.extend(["name", "category", "amount"])
+        plan = {"entity": doc_path.stem, "fields": fallback_fields, "id_description": "unique identifier"}
         if log_fn:
-            log_fn("planner_fallback", f"Using minimal plan for {doc_path.stem}")
+            log_fn("planner_fallback", f"Using knowledge-based plan for {doc_path.stem}: {fallback_fields}")
 
     # Cross-reference: ensure planner fields include known columns from knowledge/DB
     known_cols = _extract_knowledge_columns(knowledge_text)
@@ -595,15 +784,23 @@ def chunked_extract(
             if missing_added and log_fn:
                 log_fn("planner_augment", f"Added from knowledge entity section: {missing_added}")
 
+    # Build FK lookup for workers
+    fk_lookup = _build_fk_lookup(db_path)
+    if fk_lookup and log_fn:
+        log_fn("fk_lookup", f"{fk_lookup[:200]}")
+
     # Agent 2: WORKERS
     if log_fn:
         log_fn("phase", "=== WORKERS PHASE ===")
-    all_records = _run_workers(model, chunks, plan, db_context, log_fn)
+    all_records = _run_workers(model, chunks, plan, db_context, fk_lookup, log_fn)
 
     if not all_records:
         if log_fn:
             log_fn("orchestrator_empty", f"{doc_path.stem}: no records extracted from {len(chunks)} chunks")
         return 0
+
+    # Post-extraction: resolve FK fields to actual PK values
+    all_records = _resolve_fk_post_extraction(all_records, db_path, plan.get("fields", []), log_fn)
 
     # Agent 3: VALIDATOR
     if log_fn:
@@ -695,6 +892,29 @@ def _write_records(
         if rare_cols:
             log_fn("column_filter", f"Dropped {len(rare_cols)} rare columns (< {threshold} occurrences): {sorted(rare_cols)[:20]}")
         log_fn("column_filter", f"Keeping {len(frequent_cols)} columns: {sorted(frequent_cols)}")
+
+    # Deduplicate case-insensitive column names (SQLite is case-insensitive)
+    seen_lower: dict[str, str] = {}  # lowercase -> canonical name
+    canonical_cols: set[str] = set()
+    merge_map: dict[str, str] = {}  # duplicate -> canonical
+    for col in sorted(frequent_cols):
+        col_lower = col.lower()
+        if col_lower in seen_lower:
+            merge_map[col] = seen_lower[col_lower]
+        else:
+            seen_lower[col_lower] = col
+            canonical_cols.add(col)
+    if merge_map:
+        # Merge duplicate columns in records
+        for r in records:
+            for dup, canonical in merge_map.items():
+                if dup in r:
+                    if canonical not in r or r[canonical] is None:
+                        r[canonical] = r[dup]
+                    del r[dup]
+        frequent_cols = canonical_cols
+        if log_fn:
+            log_fn("column_dedup", f"Merged case-duplicates: {merge_map}")
 
     # Gather columns and infer types (only frequent cols)
     all_cols: dict[str, str] = {}

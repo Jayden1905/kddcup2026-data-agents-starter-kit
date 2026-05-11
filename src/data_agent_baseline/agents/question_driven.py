@@ -231,6 +231,7 @@ Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
   "what_user_wants": "restate EXACTLY what output the user expects — only columns explicitly mentioned",
   "expected_output": {{"columns": "number", "rows": "single/multiple/all-matching", "description": "brief"}},
+  "computation_type": "one of: simple_lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | comparison | multi_step",
   "formula": "plain-language formula — WHAT to compute, not SQL. e.g. 'event with lowest cost', 'AVG(Consumption) / 12'",
   "computation_steps": ["step1", "step2"],
   "data_requirements": ["table.column — ALL columns relevant to question, joins, filters, aggregation"],
@@ -251,6 +252,15 @@ RULES:
 - join_paths will be computed automatically — just list ALL tables.columns needed in data_requirements.
 - For data_requirements: be INCLUSIVE — list every column that could help.
 - POPULATION vs METRIC: "In X, what is Y?" → X = WHERE filter, Y = what you compute on that set.
+- COMPUTATION TYPE RULES:
+  - "how many times X compared to Y" / "how many times more" = ratio (X/Y division)
+  - "what percentage" / "what proportion" = percentage (X * 100 / Y)
+  - "how many distinct/unique" = count_distinct
+  - "how many" (simple) = count
+  - "average/mean" = avg
+  - "total/sum" = sum
+  - "highest/lowest/best/worst" = min_max
+  - "how much faster/slower/more/less" = comparison (compute difference or ratio)
 - RATIO: "How many times X more than Y" = X/Y (division, not subtraction).
 - AGGREGATION GRAIN: AVG of entity attribute → query entity table with subquery filter. Don't join to detail tables (duplicates).
 - OUTPUT: "X and Y?" = TWO columns. Each requested value = one column.
@@ -259,6 +269,7 @@ RULES:
 - HAVING: "where the average exceeds N" = GROUP BY + HAVING, not per-row WHERE.
 - SUPERLATIVES: "lowest/highest" → rows = "all-matching". Use WHERE col = (SELECT MIN/MAX...). NEVER LIMIT 1.
 - CO-LOCATED MEASURES: Filter in detail table → use measure from SAME detail table, not parent summary.
+- COLUMN NAME PRIORITY: If a column name in ANY table exactly matches a word in the question, prefer it over semantically similar columns in other tables. Literal name match > inferred meaning.
 - PARTIAL MATCH: "X-related" / "from X" with proper noun → LIKE '%X%'. Exact match only for "named X" / "is X".
 - SAME-NAME COLUMNS: When multiple tables have the SAME column name, read the question language to decide which table to SELECT from. "the patient's X" → Patient.X. "the exam's X" → Exam.X. The subject/possessive in the question is authoritative.
 """.strip()
@@ -505,8 +516,11 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     # User intent and expected output shape
     user_wants = grounding.get("what_user_wants", "")
     expected_output = grounding.get("expected_output", {})
+    computation_type = grounding.get("computation_type", "")
     if user_wants:
         parts.append(f"USER WANTS: {user_wants}")
+    if computation_type:
+        parts.append(f"COMPUTATION TYPE: {computation_type} (your SQL MUST produce this type of result)")
     if expected_output:
         row_expect = expected_output.get("rows", "")
         col_expect = expected_output.get("columns", "")
@@ -901,23 +915,10 @@ class QuestionDrivenAgent:
             else:
                 answer = self._raw_result_to_answer(data_result)
 
-            # Cleanup
-            if db_path.exists():
-                try:
-                    db_path.unlink()
-                except OSError:
-                    pass
-
             return self._build_result(answer, task)
 
         except Exception as e:
             logger.exception("Pipeline failed")
-            cleanup_db = context_dir / CONSOLIDATED_DB_NAME
-            if cleanup_db.exists():
-                try:
-                    cleanup_db.unlink()
-                except OSError:
-                    pass
             return AgentRunResult(
                 task_id=task.task_id,
                 answer=None,
@@ -1045,11 +1046,29 @@ class QuestionDrivenAgent:
                             failed_sqls.append(current_sql)
                             step_gaps = f"- {violation}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
                         else:
+                            # Passed grounding check — now sanity check the result
+                            sanity = self._sanity_check_result(question, grounding_context, cols, rows, current_sql)
+                            if sanity and attempt < MAX_RETRIES:
+                                self._log("step_sanity_fail", sanity)
+                                failed_sqls.append(current_sql)
+                                step_gaps = f"- {sanity}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
+                            else:
+                                step_succeeded = True
+                                self._log("step_final", f"cols={cols}, rows={len(rows)}")
+                                return result, current_sql, failed_sqls
+                    elif is_final and attempt < MAX_RETRIES:
+                        # No mandatory corrections — still do sanity check
+                        sanity = self._sanity_check_result(question, grounding_context, cols, rows, current_sql)
+                        if sanity:
+                            self._log("step_sanity_fail", sanity)
+                            failed_sqls.append(current_sql)
+                            step_gaps = f"- {sanity}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
+                        else:
                             step_succeeded = True
                             self._log("step_final", f"cols={cols}, rows={len(rows)}")
                             return result, current_sql, failed_sqls
                     else:
-                        # Step succeeded
+                        # Step succeeded (non-final or no retries left)
                         step_succeeded = True
                         if is_final:
                             self._log("step_final", f"cols={cols}, rows={len(rows)}")
@@ -2260,6 +2279,59 @@ FAIL: <one sentence: what column is wrong and what it should be>"""
             if first_line.upper().startswith("FAIL"):
                 return first_line[5:].strip() if len(first_line) > 5 else raw.split("\n", 1)[-1].strip()[:200]
             if "not violate" in raw.lower() or "correctly" in raw.lower() or "no violation" in raw.lower():
+                return ""
+            if len(raw) > 200:
+                raw = raw[:200]
+            return raw
+        except Exception:
+            return ""
+
+    def _sanity_check_result(self, question: str, grounding_context: str, cols: list[str], rows: list[list], sql: str) -> str:
+        """LLM sanity check: does the result make sense for the question?
+
+        Catches: wrong computation type (0% when expecting non-zero), ratio=1.0 when
+        expecting a real ratio, empty/None results, obviously wrong magnitudes.
+        Returns issue description or empty string if OK.
+        """
+        if not rows:
+            return ""
+
+        result_preview = ", ".join(cols) + "\n"
+        for row in rows[:5]:
+            result_preview += ", ".join(str(v) for v in row) + "\n"
+        if len(rows) > 5:
+            result_preview += f"... ({len(rows)} total rows)\n"
+
+        prompt = f"""QUESTION: {question}
+
+GROUNDING:
+{grounding_context[:1000]}
+
+SQL: {sql}
+
+RESULT:
+{result_preview}
+
+Does this result make sense as the answer? Check:
+1. If question asks for a percentage/ratio — is the value plausible (not 0, not exactly 1.0 unless trivial)?
+2. If question asks "how many" — is it a reasonable count (not None, not 0 when data clearly exists)?
+3. If result has None/NULL values — that likely means the SQL failed to find matching data.
+4. If question asks for a name/identifier — is None or empty suspicious?
+
+Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspicious>"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages)
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if not raw:
+                return ""
+            first_line = raw.split("\n")[0].strip()
+            if first_line.upper().startswith("PASS"):
+                return ""
+            if first_line.upper().startswith("FAIL"):
+                return first_line[5:].strip() if len(first_line) > 5 else raw.split("\n", 1)[-1].strip()[:200]
+            if "reasonable" in raw.lower() or "plausible" in raw.lower() or "makes sense" in raw.lower():
                 return ""
             if len(raw) > 200:
                 raw = raw[:200]
