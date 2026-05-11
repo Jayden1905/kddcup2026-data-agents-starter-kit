@@ -45,34 +45,24 @@ def run():
     config_path.write_text(yaml.dump(config))
 
     app_config = load_app_config(config_path)
-    print(f"[entrypoint] Starting benchmark, output_dir=/tmp/run_output", flush=True)
-    run_dir, artifacts = run_benchmark(config=app_config)
-    print(f"[entrypoint] Benchmark done. {len(artifacts)} tasks, run_dir={run_dir}", flush=True)
 
-    # Copy all prediction.csv files to /output/task_<id>/prediction.csv
-    copied = 0
-    failed = 0
-    for artifact in artifacts:
+    copied = [0]
+
+    def on_task_done(artifact):
+        """Copy prediction immediately after each task finishes."""
         if artifact.prediction_csv_path and artifact.prediction_csv_path.exists():
             out_task_dir = output_dir / artifact.task_id
             out_task_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(artifact.prediction_csv_path, out_task_dir / "prediction.csv")
-            copied += 1
+            copied[0] += 1
+            print(f"[entrypoint] {artifact.task_id}: copied to /output ({copied[0]} total)", flush=True)
         else:
-            failed += 1
             reason = artifact.failure_reason or "no prediction"
             print(f"[entrypoint] {artifact.task_id}: FAILED ({reason})", flush=True)
 
-    # Fallback: if no artifacts had predictions, scan the run directory directly
-    if copied == 0 and run_dir and Path(run_dir).exists():
-        for pred in Path(run_dir).rglob("prediction.csv"):
-            task_id = pred.parent.name
-            out_task_dir = output_dir / task_id
-            out_task_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(pred, out_task_dir / "prediction.csv")
-            copied += 1
-
-    print(f"[entrypoint] Done: {copied} copied, {failed} failed, output={output_dir}", flush=True)
+    print(f"[entrypoint] Starting benchmark", flush=True)
+    run_benchmark(config=app_config, progress_callback=on_task_done)
+    print(f"[entrypoint] Done: {copied[0]} predictions written to {output_dir}", flush=True)
 
 
 if __name__ == "__main__":
