@@ -1,97 +1,88 @@
-# Benchmark Analysis — Run 20260505T070453Z
+# Benchmark Analysis — Latest Run (20260511)
 
-**Score: 25/50 correct (50%)**
+**Score: 36/50 perfect, 4 partial, 10 zero (avg 0.7633)**
 
-- Exact match: 12
-- Value match (correct values, column names differ): 13
-- Wrong: 21
-- Timeout: 4
+Previous run (20260510): 33/50 perfect, avg 0.6788
+Original baseline (20260505): 25/50 correct (50%)
 
 ---
 
-## Category 1: Timeouts (4 tasks)
+## Improvements Since Last Analysis
 
-| Task | Difficulty | Question |
-|------|-----------|----------|
-| task_349 | hard | (timed out before producing answer) |
-| task_396 | hard | (timed out before producing answer) |
-| task_408 | hard | (timed out before producing answer) |
-| task_418 | hard | (timed out before producing answer) |
-
-**Root cause:** Graph extraction (discovery + per-entity extraction) takes too long on large documents. All are hard tasks with doc files.
-
----
-
-## Category 2: Wrong Computation / Logic (7 tasks)
-
-| Task | Difficulty | Question | Predicted | Gold |
-|------|-----------|----------|-----------|------|
-| task_169 | medium | Average monthly consumption of SME customers in 2013 | 82027220.30 | 459.96 |
-| task_196 | medium | Average number of bonds for iodine atoms | 2.0 | 1.0 |
-| task_249 | medium | Average upvotes and age for users with >10 posts | 340.0, 34.08 | 182.28, 34.08 |
-| task_214 | medium | Brazilian Portuguese sets in Commander block | 0 | 7 |
-| task_344 | hard | Male patients with normal WBC + abnormal fibrinogen | 2 | 4 |
-| task_350 | hard | Students at Women's Soccer wanting medium T-shirt | 2 | 7 |
-| task_352 | hard | Budget ratio Yearly Kickoff vs October Meeting (Advertisement) | 0 | 2.727 |
-
-**Root cause:** SQL logic errors — wrong aggregation, wrong filters, wrong join conditions, or misinterpreted knowledge.md thresholds.
+| Task | Before | Now | Fix |
+|------|--------|-----|-----|
+| task_145 | 0 | 1.0 | computation_type + sanity check |
+| task_243 | 0 | 1.0 | computation_type "ratio" guided correct division |
+| task_250 | 0 | 1.0 | sanity check caught None result, retried |
+| task_352 | 0 | 1.0 | FK lookup + planner field extraction improved |
+| task_420 | 0 | 1.0 | sanity check caught 0%, duplicate column fix |
 
 ---
 
-## Category 3: Empty / Missing Results (4 tasks)
+## Still Failing: Zero-Score (10 tasks)
 
-| Task | Difficulty | Question | Predicted | Gold |
-|------|-----------|----------|-----------|------|
-| task_173 | medium | List countries of gas stations with transactions in June 2013 | (empty — header only) | CZE, SVK |
-| task_330 | hard | Final score Sep 24 2008 Belgian Jupiler League match | (empty — header only) | 1, 1 |
-| task_415 | hard | Constructor ref + website for 2009 Singapore GP champion | (empty — header only) | mclaren, url |
-| task_86 | easy | Which race was Alex Yoong in with track number < 20 | (returned reasoning text) | Australian GP, Malaysian GP, ... |
+### Category 1: Wrong Computation / Thresholds (4 tasks)
 
-**Root cause:** Agent couldn't find the data — either graph extraction failed on doc files, the SQL returned no rows due to wrong filters, or required tables were missing from context.
+| Task | Difficulty | Question | Predicted | Gold | Root Cause |
+|------|-----------|----------|-----------|------|------------|
+| task_169 | medium | Average monthly consumption of SME 2013 | 82027220.30 | 459.96 | SUM vs AVG ambiguity — "Total Annual Consumption" interpreted as SUM. Known unsolvable. |
+| task_249 | medium | Avg upvotes + age for users with >10 posts | 177.07, 34.09 | 182.28, 34.08 | Wrong GROUP BY — counting posts differently (COUNT(*) vs COUNT(DISTINCT)) |
+| task_344 | hard | Male patients normal WBC + abnormal fibrinogen | 2 | 4 | Missing domain knowledge — WBC/FG normal ranges not in knowledge.md |
+| task_418 | extreme | Patients with abnormal creatinine, not 70 yet | 0 | 1 | Wrong threshold or filter — returns 0 instead of 1 |
 
----
+### Category 2: Wrong Column / Filter (3 tasks)
 
-## Category 4: Wrong Entity Selection (4 tasks)
+| Task | Difficulty | Question | Predicted | Gold | Root Cause |
+|------|-----------|----------|-----------|------|------------|
+| task_25 | easy | Event with lowest cost | February Speaker | Nov/Oct/Sep Speaker | Non-deterministic: grounding picks budget.spent instead of expense.cost ~40% of runs |
+| task_75 | easy | Best lap time in race 19 Q2 | Nakajima | Räikkönen | Wrong qualifying column — uses q3 or wrong race filter |
+| task_257 | medium | Total views + user for 'Computer Game Datasets' | 1708, (empty) | 1708, mbq | DisplayName is NULL in joined result — wrong join or user lookup |
 
-| Task | Difficulty | Question | Predicted | Gold |
-|------|-----------|----------|-----------|------|
-| task_19 | easy | Members who grew up in Illinois | Annabella Warren, Tyler Hewitt, Trent Smith | Trent Smith, Tyler Hewitt, Annabella Warren |
-| task_25 | easy | Which event has the lowest cost | Officers meeting - November ($20.2) | November Speaker, October Speaker, September Speaker |
-| task_199 | medium | Schools from Riverside districts with avg SAT math > 400 | River Springs Charter, La Sierra High, ... | Arlington High, John W. North High, ... |
-| task_75 | easy | Best lap time in race 19 Q2 | Fisichella | Räikkönen |
+### Category 3: Wrong Aggregation/Grouping (2 tasks)
 
-**Root cause:** Wrong sort order, wrong filter interpretation, or wrong subset of records.
+| Task | Difficulty | Question | Predicted | Gold | Root Cause |
+|------|-----------|----------|-----------|------|------------|
+| task_163 | medium | Expense types + total for October Meeting | Advertisement 54.25, Food 121.14 | Meeting, 175.39 | Wrong interpretation: grouped by expense category instead of event type. Gold wants event.type + SUM(cost) |
+| task_396 | hard | Percentage of Marvel heroes height 150-180 | 53.125 | ~53.1 (different calc) | Likely rounding or filter difference |
 
----
+### Category 4: Complex Computation (1 task)
 
-## Category 5: Wrong Output Format (5 tasks)
-
-| Task | Difficulty | Question | Issue |
-|------|-----------|----------|-------|
-| task_38 | easy | Cash withdrawals for client 3356 | Returned all columns (7), gold wants only trans_id. Also only 2 rows vs 16. |
-| task_180 | medium | Consumption for customers paying >29/unit for product 5 | Wrong customers + wrong consumption values |
-| task_379 | hard | Tally toxicology element of 4th atom per carcinogenic molecule | Returned element+count, gold wants just element list |
-| task_163 | medium | Expense types and total for October Meeting | Returned itemized expenses, gold wants single "Meeting,175.39" |
-| task_355 | hard | Member who spent on water+veggie tray+supplies with cost | Returned multiple members, gold=single member "Elijah Allen,28.15" |
-
-**Root cause:** Misinterprets what to return — too many columns, wrong interpretation of grouping, or wrong AND vs OR logic for filters.
+| Task | Difficulty | Question | Predicted | Gold | Root Cause |
+|------|-----------|----------|-----------|------|------------|
+| task_408 | hard | How much faster % champion vs last in 2008 Australian GP | 1.47 | different formula | Time string parsing + percentage formula mismatch |
 
 ---
 
-## Category 6: Column Format Only (1 task — actually correct)
+## Partial Scores (4 tasks)
 
-| Task | Difficulty | Predicted | Gold |
-|------|-----------|-----------|------|
-| task_27 | easy | "Sacha Harrison", 866.25 | "Sacha", "Harrison", 866.25 |
-
-**Root cause:** full_name vs first_name + last_name split. Values are correct.
+| Task | Difficulty | Score | Issue |
+|------|-----------|-------|-------|
+| task_86 | easy | 0.94 | Column name `race_name` vs `name` — values are correct |
+| task_379 | hard | 0.67 | Doc extraction: some molecules incorrectly classified as carcinogenic |
+| task_22 | easy | 0.50 | Missing one date (only returned 1 of 2 dues payments) |
+| task_180 | medium | 0.06 | Wrong customer filter — "paid >29 per unit" misinterpreted |
 
 ---
 
-## Priority for Fixes
+## Fixes Implemented This Session
 
-1. **Timeouts (4)** — optimize graph extraction speed or increase timeout
-2. **Wrong computation (7)** — improve SQL generation and knowledge.md rule extraction
-3. **Wrong output format (5)** — better interpretation of what columns/rows to return
-4. **Empty results (4)** — improve graph extraction reliability
-5. **Wrong entity selection (4)** — better filter/sort logic
+1. **computation_type in grounding** — Grounding now outputs explicit type (ratio/percentage/count_distinct/etc.) injected as hard constraint into SQL prompt
+2. **Sanity check (_sanity_check_result)** — LLM verifies result makes sense (catches 0%, None, ratio=1.0)
+3. **SQL validation (_validate_sql_against_grounding)** — LLM checks SQL uses correct columns per grounding
+4. **FK lookup for doc extraction workers** — Workers see PK→name mappings from existing tables
+5. **Post-extraction FK resolution** — Fuzzy matches text values to actual PKs after extraction
+6. **Better worker extraction hints** — Category/type and numeric field extraction rules in prompt
+7. **Duplicate column name fix** — Case-insensitive dedup prevents SQLite crashes (task_420)
+8. **Planner fallback improvement** — Uses knowledge columns when planner times out
+9. **consolidated.db in output** — DB copied to artifacts for inspection
+
+---
+
+## Priority for Next Fixes
+
+1. **task_25 non-determinism** — Grounding sometimes picks budget.spent over expense.cost. Need stronger column selection or deterministic override when column name matches question word.
+2. **task_163 aggregation grain** — "type of expenses" misinterpreted as expense category vs event type. Needs better question parsing.
+3. **task_249 COUNT(DISTINCT)** — Need to enforce DISTINCT when grounding says count_distinct.
+4. **task_257 NULL DisplayName** — Join issue, user lookup returns NULL.
+5. **task_396 percentage** — Close to correct, may be rounding/filter issue.
+6. **task_86 column name** — Simple rename issue, nearly free fix.
