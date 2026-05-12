@@ -16,6 +16,7 @@ import logging
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,7 @@ SQL_RULES_LABELED: list[tuple[str, str]] = [
     ("text_match", "Use LIKE '%keyword%' COLLATE NOCASE for text. Use CAST(x AS REAL) for division."),
     ("human_readable", "If question asks for names/descriptions, JOIN to get human-readable values instead of raw IDs."),
     ("select_minimal", "Only SELECT columns the question explicitly asks for. Do NOT add extra columns."),
-    ("superlative", "For superlatives (lowest/highest/most/least), use WHERE col = (SELECT MIN/MAX(col)...) — NEVER LIMIT. Return ALL ties."),
+    ("superlative", "For superlatives (lowest/highest/most/least), use WHERE col = (SELECT MIN/MAX(col) FROM ... WHERE col IS NOT NULL AND col != '') — NEVER LIMIT unless domain knowledge SQL shows LIMIT. Return ALL ties."),
     ("null_minmax", "When using MIN/MAX on text columns, exclude empty strings: WHERE col != '' AND col IS NOT NULL."),
     ("null_column", "If a column is often NULL, comparisons return nothing for NULL rows. Consider a DIFFERENT column or table."),
     ("distinct", "If question asks 'which/what X', use SELECT DISTINCT to avoid duplicates."),
@@ -66,7 +67,7 @@ SQL_RULES_LABELED: list[tuple[str, str]] = [
     ("singular_plural", "SINGULAR: Don't add LIMIT 1 just because grammar is singular. Only LIMIT 1 for 'most recent'/'first'."),
     ("temporal", "TEMPORAL: 'last time'/'most recent' = ORDER BY DESC LIMIT 1. 'first time' = ORDER BY ASC LIMIT 1."),
     ("monthly_yearly", "MONTHLY from YEARLY: If DOMAIN KNOWLEDGE defines a formula with /12, ALWAYS include /12 in the SQL. Formula is authoritative over data granularity."),
-    ("time_parse", "TIME STRING: '1:36.483' → CAST(SUBSTR)*60 + CAST(SUBSTR) for seconds conversion."),
+    ("time_parse", "TIME STRING: '1:36.483' → CAST(SUBSTR)*60 + CAST(SUBSTR) for seconds conversion. ALWAYS filter WHERE col IS NOT NULL AND col != '' before converting. If domain knowledge provides an exact SQL example for this question, use ORDER BY col ASC LIMIT 1 instead of conversion."),
     ("no_null", "NEVER RETURN NULL: Wrap with COALESCE or add WHERE IS NOT NULL. NULL answer = wrong."),
     ("having", "HAVING vs WHERE: 'where the average exceeds N' = GROUP BY + HAVING, not per-row WHERE."),
     ("positional", "PER-GROUP POSITIONAL: 'Nth of each group' = ROW_NUMBER() OVER (PARTITION BY ...)."),
@@ -124,6 +125,10 @@ def _build_sql_prompt(
 - Use LIKE '%X%' COLLATE NOCASE for text. CAST(x AS REAL) for division.
 - NEVER RETURN NULL — add WHERE IS NOT NULL. Escape apostrophes with ''."""
 
+    # Always-on rules
+    rules += "\n- NEVER use AS to rename columns. SELECT the original column name directly (e.g. SELECT name, NOT SELECT name AS race_name)."
+    rules += "\n- TIME STRINGS: If a column contains time values like '1:36.483', ALWAYS add WHERE col IS NOT NULL AND col != '' first. Then either convert to seconds (CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL)) or simply ORDER BY col ASC/DESC (string sort works for consistent m:ss.ms format)."
+
     # Append context-specific rules
     if grounding_context:
         if has_gaps:
@@ -137,8 +142,6 @@ def _build_sql_prompt(
             rules += "\n- ⚠️ APPLY ALL items under MANDATORY CORRECTIONS — they override the FORMULA."
         if "CONSTRAINTS" in grounding_context and "/" in grounding_context:
             rules += "\n- ⚠️ FORMULA AUTHORITY: If CONSTRAINTS has arithmetic (/ 12, * 100), include it EXACTLY in your SQL."
-        if "EXPECTED ROWS: single" in grounding_context:
-            rules += "\n- ⚠️ EXPECTED: single row result. Ensure your query has enough WHERE filters or aggregation to produce exactly 1 row."
     parts.append(f"\nRULES:\n{rules}")
 
     # Put mandatory filter constraint LAST so it's freshest in model's context (only if no gaps)
@@ -196,8 +199,7 @@ Does the RESULTS data answer it? Return ONLY a JSON object:
 - AGGREGATION: AVG of entity attributes via JOIN to detail table = WRONG (duplicated rows).
 - TEMPORAL: "last/most recent" needs ORDER BY DESC LIMIT 1.
 - HAVING: "where the average exceeds N" = GROUP BY + HAVING, not WHERE.
-- SCOPE: "the X" (singular definite) MAY still return multiple rows if the entity has multiple records (e.g., "the date X paid" could be multiple payments). Only mark incomplete if there are clearly UNRELATED rows (wrong entity, wrong filter).
-- ROW EXPECTATION: If GROUNDING CONTEXT says "EXPECTED ROWS: single" but the result has multiple rows, mark incomplete — a filter or aggregation is missing.""")
+- SCOPE: "the X" (singular definite) MAY still return multiple rows if the entity has multiple records (e.g., "the date X paid" could be multiple payments). Only mark incomplete if there are clearly UNRELATED rows (wrong entity, wrong filter).""")
 
     return "\n".join(parts)
 
@@ -230,7 +232,7 @@ DATABASE SCHEMA:
 Decompose the question into a structured plan. Return ONLY a JSON object:
 {{
   "what_user_wants": "restate EXACTLY what output the user expects — only columns explicitly mentioned",
-  "expected_output": {{"columns": "number", "rows": "single/multiple/all-matching", "description": "brief"}},
+  "expected_output": {{"columns": "number", "description": "brief"}},
   "computation_type": "one of: simple_lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | comparison | multi_step",
   "formula": "plain-language formula — WHAT to compute, not SQL. e.g. 'event with lowest cost', 'AVG(Consumption) / 12'",
   "computation_steps": ["step1", "step2"],
@@ -243,8 +245,9 @@ Decompose the question into a structured plan. Return ONLY a JSON object:
 
 RULES:
 - what_user_wants drives everything. Do NOT invent columns the question didn't ask for.
-- FORMULA AUTHORITY: If DOMAIN KNOWLEDGE defines a formula, copy its arithmetic into "formula" field as-is (/ 12, * 100, etc). Do NOT simplify or cancel operations.
-- USE CASE AUTHORITY: If DOMAIN KNOWLEDGE has a matching USE CASE, copy its WHERE clause EXACTLY.
+- NO ASSUMPTIONS: Do NOT add data_format_notes or domain_rules that assume conversion/transformation unless DOMAIN KNOWLEDGE explicitly states it. If a REFERENCE SQL is provided, follow its approach exactly (e.g. if it uses ORDER BY col ASC, do NOT add "must convert to seconds").
+- FORMULA AUTHORITY: If DOMAIN KNOWLEDGE defines a formula, copy it VERBATIM into "formula" field. Do NOT reason about whether any part is redundant — every operation is intentional.
+- USE CASE AUTHORITY: If DOMAIN KNOWLEDGE has a matching USE CASE or REFERENCE SQL, copy its logic EXACTLY.
 - EXACT LEVEL MATCHING: Named levels ("high=1", "medium=2") → use ONLY the level matching the question's exact wording. No combining unless "X or above".
 - COLUMN SEMANTICS: If DOMAIN KNOWLEDGE defines column meanings, use the column whose DEFINITION matches the question intent. Definition IS authoritative.
 - For known_values: include TABLE name. Only use values within SAMPLE DATA range.
@@ -485,7 +488,7 @@ def _build_semantic_prompt(
     # Budget: keep total prompt under 8000 chars to avoid Qwen timeouts
     BUDGET = 8000
     template_len = len(SEMANTIC_GROUNDING_PROMPT) + len(question) * 2
-    remaining = BUDGET - template_len - len(anchor_text[:1500]) - len(previous_attempt[:500])
+    remaining = BUDGET - template_len - len(anchor_text[:1500]) - len(previous_attempt)
 
     # Schema gets priority, sample data fills remainder
     schema_budget = max(remaining - 1500, 2000)
@@ -493,7 +496,7 @@ def _build_semantic_prompt(
     sample_budget = max(remaining - len(kg_trimmed), 500)
     sample_section = f"\nSAMPLE DATA:\n{sample_data[:sample_budget]}" if sample_data else ""
     anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1500]}" if anchor_text else ""
-    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt[:500]}" if previous_attempt else ""
+    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt}" if previous_attempt else ""
     return SEMANTIC_GROUNDING_PROMPT.format(
         question=question,
         kg_context=kg_trimmed,
@@ -522,18 +525,19 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     if computation_type:
         parts.append(f"COMPUTATION TYPE: {computation_type} (your SQL MUST produce this type of result)")
     if expected_output:
-        row_expect = expected_output.get("rows", "")
         col_expect = expected_output.get("columns", "")
-        if row_expect:
-            parts.append(f"EXPECTED ROWS: {row_expect}")
         if col_expect:
             parts.append(f"EXPECTED COLUMNS: {col_expect}")
 
     # Reference formula — the planner should follow this structure
-    # Skip if population override detected (formula direction may be wrong)
+    # Skip if override contradicts formula (population rule or formula-correcting override)
     has_population_override = any("POPULATION RULE" in s for s in override_rules)
+    has_formula_override = any(
+        "formula" in s.lower() or "incorrectly" in s.lower() or "don't" in s.lower() or "do not" in s.lower()
+        for s in override_rules
+    )
     formula = grounding.get("formula", "")
-    if formula and not has_population_override:
+    if formula and not has_population_override and not has_formula_override:
         parts.append(f"REFERENCE FORMULA (your SQL MUST use the same columns and logic):\n  {formula}")
 
     # Join paths (factual FK relationships)
@@ -656,15 +660,22 @@ def _apply_null_guard(sql: str) -> str:
     col = order_match.group(1)
     # Check if there's already a NULL guard for this column
     if re.search(rf'{re.escape(col)}\s+IS\s+NOT\s+NULL', sql, re.IGNORECASE):
-        return sql
+        # Already has NULL guard — check if also has != ''
+        if re.search(rf"{re.escape(col)}\s*!=\s*''", sql, re.IGNORECASE):
+            return sql
+        # Add empty string guard
+        insert_pos = order_match.start()
+        prefix = sql[:insert_pos].rstrip()
+        suffix = sql[insert_pos:]
+        return f"{prefix} AND {col} != '' {suffix}"
     # Inject WHERE/AND clause before ORDER BY
     insert_pos = order_match.start()
     prefix = sql[:insert_pos].rstrip()
     suffix = sql[insert_pos:]
     if re.search(r'\bWHERE\b', prefix, re.IGNORECASE):
-        return f"{prefix} AND {col} IS NOT NULL {suffix}"
+        return f"{prefix} AND {col} IS NOT NULL AND {col} != '' {suffix}"
     else:
-        return f"{prefix} WHERE {col} IS NOT NULL {suffix}"
+        return f"{prefix} WHERE {col} IS NOT NULL AND {col} != '' {suffix}"
 
 
 
@@ -1038,50 +1049,20 @@ class QuestionDrivenAgent:
                         self._log("step_null", f"Step {i+1} attempt {attempt}: all NULL")
                         failed_sqls.append(current_sql)
                         step_gaps = f"- Query returned only NULL values\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
-                    # Validate: LLM checks SQL matches grounding
-                    elif is_final and ("MANDATORY CORRECTIONS" in grounding_context or "REQUIRED COLUMNS" in grounding_context) and attempt < MAX_RETRIES:
-                        violation = self._validate_sql_against_grounding(current_sql, grounding_context, question)
-                        if violation:
-                            self._log("step_filter_violation", violation)
-                            failed_sqls.append(current_sql)
-                            step_gaps = f"- {violation}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
-                        else:
-                            # Passed grounding check — now sanity check the result
-                            sanity = self._sanity_check_result(question, grounding_context, cols, rows, current_sql)
-                            if sanity and attempt < MAX_RETRIES:
-                                self._log("step_sanity_fail", sanity)
-                                failed_sqls.append(current_sql)
-                                step_gaps = f"- {sanity}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
-                            else:
-                                step_succeeded = True
-                                self._log("step_final", f"cols={cols}, rows={len(rows)}")
-                                return result, current_sql, failed_sqls
-                    elif is_final and attempt < MAX_RETRIES:
-                        # No mandatory corrections — still do sanity check
-                        sanity = self._sanity_check_result(question, grounding_context, cols, rows, current_sql)
-                        if sanity:
-                            self._log("step_sanity_fail", sanity)
-                            failed_sqls.append(current_sql)
-                            step_gaps = f"- {sanity}\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
-                        else:
-                            step_succeeded = True
-                            self._log("step_final", f"cols={cols}, rows={len(rows)}")
-                            return result, current_sql, failed_sqls
-                    else:
-                        # Step succeeded (non-final or no retries left)
+                    elif is_final:
                         step_succeeded = True
-                        if is_final:
-                            self._log("step_final", f"cols={cols}, rows={len(rows)}")
-                            return result, current_sql, failed_sqls
+                        self._log("step_final", f"cols={cols}, rows={len(rows)}")
+                        return result, current_sql, failed_sqls
+                    else:
+                        # Verification step (non-final) — record confirmed values
+                        step_succeeded = True
+                        if len(rows) <= 5:
+                            fact_vals = [str(rows[r][0]) for r in range(min(len(rows), 3))]
+                            fact = f"{purpose}: {cols[0] if cols else '?'} = {', '.join(fact_vals)}"
                         else:
-                            # Verification step — record confirmed values
-                            if len(rows) <= 5:
-                                fact_vals = [str(rows[r][0]) for r in range(min(len(rows), 3))]
-                                fact = f"{purpose}: {cols[0] if cols else '?'} = {', '.join(fact_vals)}"
-                            else:
-                                fact = f"{purpose}: {len(rows)} rows found"
-                            confirmed_facts.append(fact)
-                            self._log("step_confirmed", fact)
+                            fact = f"{purpose}: {len(rows)} rows found"
+                        confirmed_facts.append(fact)
+                        self._log("step_confirmed", fact)
                         break
 
                 # If we have retries left, generate a fix
@@ -1173,7 +1154,7 @@ DATABASE SCHEMA:
 {grounding_context}
 
 Generate a step-by-step SQL plan. Break complex queries into verification steps + final query.
-Your final SQL MUST implement the FORMULA using the JOIN PATHS and FILTER VALUES from the grounding context above.
+Your final SQL MUST implement the REFERENCE FORMULA LITERALLY — do NOT rewrite or substitute any function or operator. Apply JOIN PATHS and FILTER VALUES from the grounding context above.
 
 Return ONLY a JSON object:
 {{"steps": [
@@ -1430,12 +1411,22 @@ RULES:
         # Phase 1: Deterministic extraction of use cases and field definitions
         deterministic_parts: list[str] = []
 
-        # Extract all USE CASE SQL blocks
+        # Extract all USE CASE SQL blocks (code-fenced format)
         use_case_pattern = re.compile(
             r'###\s*Use Case[^:]*:\s*(.+?)\n.*?```sql\s*\n(.+?)```\s*\n.*?Explanation[:\s]*(.+?)(?:\n\n|\Z)',
             re.DOTALL | re.IGNORECASE,
         )
         use_cases = use_case_pattern.findall(knowledge_text)
+
+        # Also extract inline SQL patterns: "- SQL: `SELECT ...`" with preceding Metric/Explanation
+        inline_sql_pattern = re.compile(
+            r'-\s*(?:Metric|Explanation)[:\s]*(.+?)\n(?:.*?\n)*?-\s*SQL:\s*`([^`]+)`',
+            re.IGNORECASE,
+        )
+        for match in inline_sql_pattern.finditer(knowledge_text):
+            title = match.group(1).strip()
+            sql = match.group(2).strip()
+            use_cases.append((title, sql, title))
 
         # Score each use case by relevance to question
         # Prioritize use cases whose WHERE/filter condition matches the question's filter intent
@@ -1558,9 +1549,8 @@ RULES:
         knowledge_text: str,
         db_path: Path | None = None,
     ) -> str:
-        """Ground → Deterministic validate → Semantic feedback → Re-ground (max 2 iterations)."""
+        """Multi-step grounding: Table Select → Focused Ground → Validate → Feedback."""
         grounding: dict[str, Any] = {}
-        previous_attempt = ""
 
         # Extract domain anchors
         anchor_text = self._extract_domain_anchors(question, knowledge_text, db_path=db_path)
@@ -1572,23 +1562,42 @@ RULES:
             if knowledge_guidance:
                 self._log("knowledge_guidance", knowledge_guidance[:300])
 
-        # GROUND once — only retry if formula has bad SQL (table/column errors)
         self._log("grounding_iter", "--- Grounding ---")
 
-        # Inject knowledge guidance before anchor text
+        # Inject knowledge guidance AFTER anchor text (anchors have precise formulas, take priority)
         effective_anchor = anchor_text
         if knowledge_guidance:
             effective_anchor = (
-                f"⚠️ DOMAIN KNOWLEDGE:\n"
-                f"{knowledge_guidance}\n\n{anchor_text}"
+                f"{anchor_text}\n\n⚠️ ADDITIONAL DOMAIN KNOWLEDGE:\n"
+                f"{knowledge_guidance}"
             )
+
+        # --- Round 1: Table Selection ---
+        selected_tables = self._grounding_select_tables(question, kg_context, effective_anchor, db_path)
+
+        # --- Round 2: Focused Grounding with selected table details ---
+        focused_schema = ""
+        if selected_tables and db_path:
+            focused_schema = self._build_focused_schema_for_grounding(db_path, selected_tables, question)
+
+        # Use focused schema if available, otherwise fall back to full schema
+        grounding_schema = focused_schema if focused_schema else kg_context
+
+        # Extract matching SQL from domain knowledge — if found, inject as absolute reference
+        domain_sql_ref = self._extract_matching_domain_sql(question, anchor_text)
+        if domain_sql_ref:
+            effective_anchor = (
+                f"⚠️ REFERENCE SQL FROM DOMAIN KNOWLEDGE (use this exact pattern — do NOT add extra conversion or transformation):\n"
+                f"  {domain_sql_ref}\n\n{effective_anchor}"
+            )
+            self._log("domain_sql_match", domain_sql_ref[:200])
 
         prompt = _build_semantic_prompt(
             question=question,
-            kg_context=kg_context,
-            sample_data=sample_data,
+            kg_context=grounding_schema,
+            sample_data=sample_data if not focused_schema else "",
             anchor_text=effective_anchor,
-            previous_attempt=previous_attempt,
+            previous_attempt="",
         )
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -1603,9 +1612,68 @@ RULES:
             self._log("semantic_grounding", "(failed to parse after retry)")
             return "", ""
 
-        # Verify filter values against actual DB
-        if db_path and grounding.get("known_values"):
-            grounding = self._validate_filter_values(db_path, grounding)
+        # Run filter validation (deterministic) + column name priority (LLM) in parallel
+        validation_issues = []
+        if db_path and grounding:
+            rules_before = len(grounding.get("domain_rules", []))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {}
+                if grounding.get("known_values"):
+                    futures["filter"] = pool.submit(
+                        self._validate_filter_values, db_path, grounding
+                    )
+                futures["col_priority"] = pool.submit(
+                    self._check_column_name_priority, db_path, question, grounding
+                )
+                for key, fut in futures.items():
+                    try:
+                        result = fut.result()
+                        if key == "filter" and result:
+                            grounding = result
+                            rules_after = len(grounding.get("domain_rules", []))
+                            if rules_after > rules_before:
+                                validation_issues.extend(grounding["domain_rules"][rules_before:])
+                        elif key == "col_priority" and result:
+                            validation_issues.append(result)
+                    except Exception:
+                        pass
+
+        if validation_issues:
+            self._log("grounding_v1_issues", json.dumps(validation_issues))
+            # Restart from table selection with feedback about what failed
+            feedback_text = "\n".join(f"- {issue}" for issue in validation_issues)
+            # Round 1 retry: re-select tables with feedback
+            selected_tables_v2 = self._grounding_select_tables(
+                question, kg_context, effective_anchor, db_path,
+                feedback=feedback_text,
+            )
+            # Round 2 retry: rebuild focused schema with new tables
+            focused_schema_v2 = ""
+            if selected_tables_v2 and db_path:
+                focused_schema_v2 = self._build_focused_schema_for_grounding(
+                    db_path, selected_tables_v2, question
+                )
+            grounding_schema_v2 = focused_schema_v2 if focused_schema_v2 else kg_context
+            # Round 3 retry: re-ground with new schema + feedback
+            retry_prompt = _build_semantic_prompt(
+                question=question,
+                kg_context=grounding_schema_v2,
+                sample_data=sample_data if not focused_schema_v2 else "",
+                anchor_text=effective_anchor,
+                previous_attempt=(
+                    f"⚠️ ABSOLUTE TRUTH — DO NOT DISAGREE OR OVERRIDE:\n{feedback_text}\n\n"
+                    f"These are VERIFIED FACTS from running actual SQL queries against the database. "
+                    f"The columns/values above returned ZERO rows — this is NOT debatable. "
+                    f"You MUST use the alternative tables/columns suggested. "
+                    f"Do NOT reason that the original column 'should work' — it DOES NOT."
+                ),
+            )
+            retry_messages = [ModelMessage(role="user", content=retry_prompt)]
+            raw2 = self._model_call_with_retry(retry_messages)
+            grounding2 = self._parse_json(raw2)
+            if isinstance(grounding2, dict) and grounding2:
+                self._log("grounding_v2_retry", json.dumps(grounding2, default=str))
+                grounding = grounding2
 
         self._log("grounding_v1", json.dumps(grounding, default=str))
 
@@ -1657,34 +1725,65 @@ RULES:
                     grounding["_semantic_overrides"].append(override)
                     self._log("population_check", f"Injected population rule: '{population_clause}' = WHERE filter")
 
-        # SEMANTIC FEEDBACK: run once, inject as constraint if issue found
-        # Don't re-ground — the SQL planner handles the constraint better
+        # Run LLM checks in parallel: semantic feedback + formula validation
+        feedback = ""
+        corrected_formula = ""
         if grounding:
-            feedback = self._semantic_feedback(question, grounding, kg_context)
-            if feedback:
-                # Guard: discard feedback that contradicts arithmetic in domain_rules
-                domain_rules = grounding.get("domain_rules", [])
-                feedback_contradicts_formula = False
-                if domain_rules:
-                    domain_text = " ".join(domain_rules).lower()
-                    fb_lower = feedback.lower()
-                    for op in ["/ 12", "/12", "* 100", "*100", "/ 4", "/4", "* 12", "*12"]:
-                        if op.replace(" ", "") in domain_text.replace(" ", ""):
-                            if "divid" in fb_lower or "multiply" in fb_lower or "division" in fb_lower or "without" in fb_lower:
-                                feedback_contradicts_formula = True
-                                break
-                if feedback_contradicts_formula:
-                    self._log("grounding_feedback_discarded", f"Feedback contradicts domain formula: {feedback[:100]}")
-                else:
-                    self._log("grounding_feedback", feedback)
-                    grounding["_semantic_overrides"] = [feedback]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {}
+                futures["feedback"] = pool.submit(
+                    self._semantic_feedback, question, grounding, kg_context
+                )
+                if effective_anchor:
+                    futures["formula"] = pool.submit(
+                        self._check_formula_against_domain, question, grounding, effective_anchor
+                    )
+                for key, fut in futures.items():
+                    try:
+                        if key == "feedback":
+                            feedback = fut.result()
+                        elif key == "formula":
+                            corrected_formula = fut.result()
+                    except Exception:
+                        pass
+
+        # Apply formula correction — clear domain_rules that may contradict the corrected formula
+        if corrected_formula and grounding:
+            grounding["formula"] = corrected_formula
+            grounding["domain_rules"] = []
+
+        # Apply semantic feedback
+        if grounding and feedback:
+            # Guard: discard feedback that contradicts arithmetic in domain_rules
+            domain_rules = grounding.get("domain_rules", [])
+            feedback_contradicts_formula = False
+            if domain_rules:
+                domain_text = " ".join(domain_rules).lower()
+                fb_lower = feedback.lower()
+                # Check symbolic operators
+                for op in ["/ 12", "/12", "* 100", "*100", "/ 4", "/4", "* 12", "*12"]:
+                    if op.replace(" ", "") in domain_text.replace(" ", ""):
+                        if "divid" in fb_lower or "multiply" in fb_lower or "division" in fb_lower or "without" in fb_lower or "incorrectly" in fb_lower:
+                            feedback_contradicts_formula = True
+                            break
+                # Check word-based arithmetic ("divided by 12", "multiplied by 100")
+                if not feedback_contradicts_formula:
+                    arithmetic_words = re.findall(r'(?:divided|multiplied)\s+by\s+\d+', domain_text)
+                    if arithmetic_words:
+                        if "divid" in fb_lower or "multiply" in fb_lower or "incorrectly" in fb_lower or "don't" in fb_lower:
+                            feedback_contradicts_formula = True
+            if feedback_contradicts_formula:
+                self._log("grounding_feedback_discarded", f"Feedback contradicts domain formula: {feedback[:100]}")
             else:
-                # Deterministic override: if question word matches an exact column name
-                # not used in formula SELECT, inject as override for the SQL planner
-                override = self._check_missing_select_columns(question, grounding, kg_context)
-                if override:
-                    self._log("grounding_deterministic_override", override)
-                    grounding["_semantic_overrides"] = [override]
+                self._log("grounding_feedback", feedback)
+                grounding["_semantic_overrides"] = [feedback]
+        elif grounding and not feedback:
+            # Deterministic override: if question word matches an exact column name
+            # not used in formula SELECT, inject as override for the SQL planner
+            override = self._check_missing_select_columns(question, grounding, kg_context)
+            if override:
+                self._log("grounding_deterministic_override", override)
+                grounding["_semantic_overrides"] = [override]
 
         # Deterministic column-disambiguation: if knowledge defines what a column means
         # and the question uses a word matching that column, but the formula uses a different column,
@@ -1783,6 +1882,11 @@ If the question asks for something with a superlative (lowest, highest, most, le
                         selected.append(pop_rule)
                         selected_labels.append("population")
 
+                if ("time" in q_lower or "lap" in q_lower or "duration" in q_lower) and "time_parse" not in selected_labels:
+                    tp_rule = next((r for l, r in SQL_RULES_LABELED if l == "time_parse"), None)
+                    if tp_rule:
+                        selected.append(tp_rule)
+                        selected_labels.append("time_parse")
 
                 if selected:
                     self._log("rules_selected", f"{len(selected)} rules: {selected_labels}")
@@ -1832,6 +1936,49 @@ If the question asks for something with a superlative (lowest, highest, most, le
 
         return grounding
 
+    def _extract_matching_domain_sql(self, question: str, anchor_text: str) -> str:
+        """Deterministically extract SQL from domain knowledge that matches the question.
+        Returns the SQL string if a close match is found, empty string otherwise."""
+        if not anchor_text:
+            return ""
+        # Find all SQL patterns in anchor text
+        sql_blocks: list[tuple[str, str]] = []  # (context, sql)
+        # Pattern 1: - SQL: `SELECT ...`
+        for m in re.finditer(r'-\s*SQL:\s*`([^`]+)`', anchor_text):
+            # Get surrounding context (previous 200 chars)
+            start = max(0, m.start() - 200)
+            context = anchor_text[start:m.start()].lower()
+            sql_blocks.append((context, m.group(1).strip()))
+        # Pattern 2: ```sql ... ```
+        for m in re.finditer(r'```sql\s*\n(.+?)```', anchor_text, re.DOTALL):
+            start = max(0, m.start() - 200)
+            context = anchor_text[start:m.start()].lower()
+            sql_blocks.append((context, m.group(1).strip()))
+
+        if not sql_blocks:
+            return ""
+
+        # Score each SQL block by keyword overlap with question
+        q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
+        best_sql = ""
+        best_score = 0
+        for context, sql in sql_blocks:
+            ctx_words = set(re.findall(r'\b[a-z]{3,}\b', context))
+            overlap = len(q_words & ctx_words)
+            # Bonus for matching specific values (numbers, proper nouns)
+            q_numbers = set(re.findall(r'\b\d+\b', question))
+            sql_numbers = set(re.findall(r'\b\d+\b', sql))
+            number_match = len(q_numbers & sql_numbers)
+            score = overlap + number_match * 3
+            if score > best_score:
+                best_score = score
+                best_sql = sql
+
+        # Only return if strong match (at least 5 word overlap + number match)
+        if best_score >= 5:
+            return best_sql
+        return ""
+
     def _extract_knowledge_guidance(self, question: str, knowledge_text: str) -> str:
         """Use LLM to extract relevant knowledge for this question."""
         prompt = f"""QUESTION: {question}
@@ -1851,6 +1998,172 @@ Extract the parts of DOMAIN KNOWLEDGE relevant to this question — formulas, co
         except Exception:
             return ""
 
+
+    def _grounding_select_tables(
+        self, question: str, kg_context: str, anchor_text: str, db_path: Path | None,
+        feedback: str = "",
+    ) -> list[str]:
+        """Round 1: LLM picks which tables are relevant to the question.
+
+        Shows only table names + column names (no types, no samples) to keep prompt small.
+        Returns list of selected table names.
+        """
+        if not db_path or not db_path.exists():
+            return []
+
+        # Build compact table overview: table name + column names only
+        conn = sqlite3.connect(str(db_path))
+        table_lines: list[str] = []
+        all_tables: list[str] = []
+        try:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall() if not r[0].startswith("_")]
+            all_tables = tables
+
+            if len(tables) <= 3:
+                conn.close()
+                self._log("grounding_tables_selected", f"≤3 tables, using all: {tables}")
+                return tables
+
+            for tname in tables:
+                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                row_count = conn.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
+                table_lines.append(f"- {tname} ({row_count} rows): {', '.join(cols)}")
+        except Exception:
+            conn.close()
+            return []
+        conn.close()
+
+        # Deterministic pre-pass: find tables with columns matching question words
+        q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
+        candidate_tables: list[str] = []
+        for line in table_lines:
+            tname = line.split(" (")[0].lstrip("- ")
+            line_lower = line.lower()
+            if any(w in line_lower for w in q_words):
+                candidate_tables.append(tname)
+        self._log("grounding_candidates", f"Deterministic candidates: {candidate_tables}")
+
+        feedback_section = ""
+        if feedback:
+            feedback_section = f"\n⚠️ PREVIOUS TABLE SELECTION FAILED:\n{feedback}\nYou MUST include tables that contain the needed filter data.\n"
+
+        prompt = f"""QUESTION: {question}
+
+TABLES IN DATABASE:
+{chr(10).join(table_lines)}
+
+{f"DOMAIN KNOWLEDGE:{chr(10)}{anchor_text[:800]}" if anchor_text else ""}
+{feedback_section}
+Which tables are needed to answer this question? Consider:
+- Tables whose columns match terms in the question
+- Tables needed for JOIN paths between relevant tables
+- Tables with human-readable names/labels if the question asks for names
+
+Return ONLY: {{"tables": ["table1", "table2", ...]}}
+Select 2-5 tables. Include linking/bridge tables needed for JOINs."""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        parsed = self._parse_json(raw)
+
+        if isinstance(parsed, dict) and "tables" in parsed:
+            selected = [t for t in parsed["tables"] if t in all_tables]
+            # Always include candidate tables from deterministic pass
+            for ct in candidate_tables:
+                if ct not in selected:
+                    selected.append(ct)
+            if selected:
+                self._log("grounding_tables_selected", f"{len(selected)} tables: {selected}")
+                return selected
+
+        # Fallback: return all tables
+        return all_tables
+
+    def _build_focused_schema_for_grounding(
+        self, db_path: Path, tables: list[str], question: str
+    ) -> str:
+        """Build detailed schema for selected tables with sample values and format hints."""
+        self._log("grounding_focused_schema", f"Building focused schema for: {tables}")
+        conn = sqlite3.connect(str(db_path))
+        lines: list[str] = ["=== DATABASE SCHEMA ===", ""]
+        fk_lines: list[str] = []
+
+        try:
+            for tname in tables:
+                exists = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tname,)
+                ).fetchone()
+                if not exists:
+                    continue
+
+                row_count = conn.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
+                col_info = conn.execute(f'PRAGMA table_info("{tname}")').fetchall()
+                pk_cols = [c[1] for c in col_info if c[5]]
+
+                lines.append(f"TABLE: {tname} ({row_count} rows, PK: {', '.join(pk_cols) if pk_cols else '(none)'})")
+
+                for c in col_info:
+                    col_name = c[1]
+                    col_type = c[2] or "TEXT"
+                    pk_mark = " [PK]" if c[5] else ""
+
+                    # Sample values
+                    sample = ""
+                    try:
+                        vals = conn.execute(
+                            f'SELECT DISTINCT "{col_name}" FROM "{tname}" '
+                            f'WHERE "{col_name}" IS NOT NULL AND "{col_name}" != \'\' '
+                            f'ORDER BY "{col_name}" LIMIT 6'
+                        ).fetchall()
+                        if vals:
+                            sample_vals = [v[0] for v in vals]
+                            sample = f"  e.g. {sample_vals}"
+                            # Format hint
+                            format_note = self._detect_value_format(sample_vals)
+                            if format_note:
+                                sample += format_note
+                    except Exception:
+                        pass
+
+                    lines.append(f"  - {col_name} ({col_type}){pk_mark}{sample}")
+
+                # FK info
+                try:
+                    fks = conn.execute(f'PRAGMA foreign_key_list("{tname}")').fetchall()
+                    for fk in fks:
+                        ref_table = fk[2]
+                        from_col = fk[3]
+                        to_col = fk[4]
+                        lines.append(f"  FK: {from_col} → {ref_table}.{to_col}")
+                        fk_lines.append(f"  {tname}.{from_col} = {ref_table}.{to_col}")
+                except Exception:
+                    pass
+
+                lines.append("")
+
+            # Inferred FKs between selected tables
+            kg = build_kg_from_sqlite(db_path)
+            table_set = set(t.lower() for t in tables)
+            for src_table, fk in kg.inferred_fks:
+                if src_table.lower() in table_set and fk.ref_table.lower() in table_set:
+                    fk_line = f"  {src_table}.{fk.column} = {fk.ref_table}.{fk.ref_column}"
+                    if fk_line not in fk_lines:
+                        fk_lines.append(fk_line)
+
+            if fk_lines:
+                lines.append("=== JOIN PATHS ===")
+                for fl in fk_lines:
+                    lines.append(fl)
+                lines.append("")
+
+        finally:
+            conn.close()
+
+        result = "\n".join(lines)
+        self._log("grounding_focused_schema_done", f"{len(result)} chars, {len(tables)} tables, {len(fk_lines)} FKs")
+        return result
 
     def _enrich_data_requirements(
         self, db_path: Path, question: str, grounding: dict[str, Any]
@@ -1882,6 +2195,110 @@ Extract the parts of DOMAIN KNOWLEDGE relevant to this question — formulas, co
 
         grounding["data_requirements"] = list(data_reqs)
         return grounding
+
+    def _check_column_name_priority(
+        self, db_path: Path, question: str, grounding: dict[str, Any]
+    ) -> str:
+        """LLM check: does the grounding use the right column for the question's measure?
+        Returns feedback string if there's a mismatch, empty string if OK."""
+        data_reqs = grounding.get("data_requirements", [])
+        formula = grounding.get("formula", "")
+        if not data_reqs:
+            return ""
+
+        # Get all columns in the DB
+        try:
+            conn = sqlite3.connect(str(db_path))
+            all_cols: list[str] = []
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall():
+                tname = row[0]
+                if tname.startswith("_"):
+                    continue
+                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()]
+                for col in cols:
+                    all_cols.append(f"{tname}.{col}")
+            conn.close()
+        except Exception:
+            return ""
+
+        data_reqs_str = ", ".join(str(r) for r in data_reqs)
+        prompt = f"""QUESTION: {question}
+
+GROUNDING chose these columns: {data_reqs_str}
+GROUNDING formula: {formula}
+
+ALL columns in database:
+{chr(10).join(all_cols)}
+
+Is there a column in the database that EXACTLY matches the measure/metric word in the question, but was NOT chosen by the grounding?
+
+For example: if question says "lowest cost" and there's a column "expense.cost" but grounding uses "budget.spent" — that's a mismatch.
+But if question says "race number 19" and there's a column "qualifying.number" — that's NOT a mismatch because "number" here means the race ID, not the column.
+
+Reply ONLY:
+- OK (if grounding columns are correct)
+- MISMATCH: <table.column> should be used instead of <table.column> because <reason>"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages)
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if not raw:
+                return ""
+            first_line = raw.split("\n")[0].strip()
+            if first_line.upper().startswith("OK"):
+                return ""
+            if "MISMATCH" in first_line.upper():
+                self._log("col_name_priority", first_line)
+                return first_line
+            return ""
+        except Exception:
+            return ""
+
+    def _check_formula_against_domain(
+        self, question: str, grounding: dict[str, Any], anchor_text: str
+    ) -> str:
+        """LLM check: does grounding formula match what domain knowledge defines?
+        Returns corrected formula if mismatch, empty string if OK."""
+        formula = grounding.get("formula", "")
+        if not formula or not anchor_text:
+            return ""
+
+        prompt = f"""DOMAIN KNOWLEDGE defines this formula:
+{anchor_text[:2000]}
+
+GROUNDING produced this formula for the question "{question}":
+  {formula}
+
+Find the formula definition in DOMAIN KNOWLEDGE that matches the question's metric.
+Then check: does the GROUNDING formula contain EVERY operator and number from the domain formula?
+
+IMPORTANT: Do NOT think about whether operations make mathematical sense.
+Just compare characters. If domain has "/ 12" and grounding does not have "/ 12" — that is MISSING.
+
+Reply ONLY one line:
+- OK
+- CORRECTED: <paste the formula exactly as it appears in domain knowledge>"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages)
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if not raw:
+                return ""
+            first_line = raw.split("\n")[0].strip()
+            if first_line.upper().startswith("OK"):
+                return ""
+            if "CORRECTED" in first_line.upper():
+                corrected = first_line.split(":", 1)[-1].strip()
+                if corrected:
+                    self._log("formula_check_corrected", f"{formula} → {corrected}")
+                    return corrected
+            return ""
+        except Exception:
+            return ""
 
     def _build_schema_slice(self, db_path: Path, grounding: dict[str, Any]) -> str:
         """Build a focused schema string from enriched data_requirements.
@@ -2145,6 +2562,7 @@ RULES:
 - Do NOT question WHERE filter values — they come from verified domain knowledge.
 - Do NOT suggest different filter values based on column ranges or your assumptions.
 - Do NOT question arithmetic operations (/ 12, * 100, etc.) if DOMAIN RULES define a formula. The formula IS authoritative — do not override it with your reasoning about data granularity.
+- Do NOT comment on row count, LIMIT, or whether the result should be singular/multiple. Ties may exist.
 - ONLY flag issues with which columns are in SELECT or how results are grouped/aggregated.
 - If a word in the question (e.g., "type", "status", "name") matches an actual column name in the schema, the question likely refers to THAT column directly.
 - "total value" = a single aggregated number per group, not individual line items.
@@ -2317,6 +2735,8 @@ Does this result make sense as the answer? Check:
 2. If question asks "how many" — is it a reasonable count (not None, not 0 when data clearly exists)?
 3. If result has None/NULL values — that likely means the SQL failed to find matching data.
 4. If question asks for a name/identifier — is None or empty suspicious?
+
+DO NOT judge row count. Multiple rows are valid if the entity has multiple records. "The date X paid" can have multiple dates.
 
 Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspicious>"""
 
@@ -2614,6 +3034,93 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
                             break
                     except Exception:
                         pass
+            # Generic filter coverage check: for each known_values entry, verify
+            # the column actually has matchable data. If not, find alternatives.
+            for col_name, values in list(known_values.items()):
+                if "." not in col_name:
+                    continue
+                if not values or not isinstance(values, (list, tuple)):
+                    continue
+                table_name, col_n = col_name.split(".", 1)
+                str_values = [str(v) for v in values]
+                # Check if ANY filter value matches in this column (exact or LIKE)
+                any_match = False
+                for val in str_values:
+                    try:
+                        cnt = conn.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_n}" = ?', (val,)
+                        ).fetchone()[0]
+                        if cnt > 0:
+                            any_match = True
+                            break
+                        cnt2 = conn.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_n}" LIKE ?',
+                            (f'%{val}%',)
+                        ).fetchone()[0]
+                        if cnt2 > 0:
+                            any_match = True
+                            break
+                    except Exception:
+                        pass
+                if any_match:
+                    continue
+                # None of the filter values exist in this column — find alternative tables
+                # Build semantic variants of the filter values (e.g., 2013-06-01 → 201306, 2013-06%, etc.)
+                search_variants = list(str_values)
+                for val in str_values:
+                    clean = re.sub(r'[-/]', '', val)
+                    if len(clean) >= 6 and clean[:6].isdigit():
+                        ym = clean[:6]  # YYYYMM
+                        search_variants.append(ym)
+                        search_variants.append(int(ym) if ym.isdigit() else ym)
+                        search_variants.append(f"{ym[:4]}-{ym[4:6]}")  # YYYY-MM
+                alt_tables = []
+                for tname, cols in tables_cols.items():
+                    if tname.lower() == table_name.lower():
+                        continue
+                    for c in cols:
+                        found = False
+                        for variant in search_variants:
+                            try:
+                                cnt = conn.execute(
+                                    f'SELECT COUNT(*) FROM "{tname}" WHERE "{c}" = ?', (variant,)
+                                ).fetchone()[0]
+                                if cnt > 0:
+                                    alt_tables.append((tname, c, cnt, variant))
+                                    found = True
+                                    break
+                                cnt2 = conn.execute(
+                                    f'SELECT COUNT(*) FROM "{tname}" WHERE CAST("{c}" AS TEXT) LIKE ?',
+                                    (f'{variant}%',)
+                                ).fetchone()[0]
+                                if cnt2 > 0:
+                                    alt_tables.append((tname, c, cnt2, variant))
+                                    found = True
+                                    break
+                            except Exception:
+                                pass
+                        if found:
+                            break
+                    if alt_tables:
+                        break
+                domain_rules = grounding.setdefault("domain_rules", [])
+                if alt_tables:
+                    alt_desc = ", ".join(
+                        f"{t}.{c} ({n} rows, use value={v})" for t, c, n, v in alt_tables[:3]
+                    )
+                    rule = (
+                        f"WARNING: {table_name}.{col_n} has NO rows matching filter values "
+                        f"{str_values}. Use instead: {alt_desc}. "
+                        f"JOIN to {table_name} if you still need its columns."
+                    )
+                else:
+                    rule = (
+                        f"WARNING: {table_name}.{col_n} has NO rows matching filter values "
+                        f"{str_values}. This filter will return empty results."
+                    )
+                domain_rules.append(rule)
+                self._log("filter_no_coverage", rule)
+
             # Check for mostly-NULL filter columns (indicates wrong column choice)
             for col_name, values in list(known_values.items()):
                 if "." not in col_name:
@@ -2860,47 +3367,7 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
             else:
                 for cond, count_without in blockers:
                     diagnostics.append(f"REMOVE THIS FILTER: '{cond}' (without it: {count_without} rows)")
-
-                    # Show actual values for the column in this condition
-                    remaining = [c for c in conditions if c.strip() != cond]
-                    test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}" if remaining else base_sql
-
-                    # Find column reference in the condition
-                    for part in cond.replace("(", " ").replace(")", " ").split():
-                        col_ref = part.strip("\"'`=<>!,")
-                        if not col_ref or col_ref.upper() in ("AND", "OR", "NOT", "IN", "LIKE", "IS", "NULL", "BETWEEN", "SELECT", "FROM"):
-                            continue
-                        if "." in col_ref:
-                            _, col = col_ref.split(".", 1)
-                            col = col.strip("\"'`")
-                        else:
-                            col = col_ref
-                        try:
-                            actual = conn.execute(
-                                f'SELECT DISTINCT "{col}" FROM ({test_sql}) WHERE "{col}" IS NOT NULL AND "{col}" != \'\' LIMIT 10'
-                            ).fetchall()
-                            vals = [r[0] for r in actual]
-                            if vals:
-                                diagnostics.append(f"  Actual values for '{col}' in matching rows: {vals}")
-                                # Show what the filter used vs what exists
-                                str_match = re.findall(r"'([^']*)'", cond)
-                                num_match = re.findall(r'[<>=!]+\s*(\d+)', cond)
-                                if str_match:
-                                    used_val = str_match[0]
-                                    close = [v for v in vals if isinstance(v, str) and (
-                                        used_val.lower() in v.lower() or v.lower() in used_val.lower()
-                                    )]
-                                    if close:
-                                        diagnostics.append(f"  FIX: Replace '{used_val}' with '{close[0]}' (or use LIKE '%{used_val}%')")
-                                    else:
-                                        diagnostics.append(f"  FIX: Value '{used_val}' does NOT exist. Use one of: {vals[:5]}")
-                                elif num_match:
-                                    diagnostics.append(f"  FIX: Numeric filter '{cond}' excludes all. Actual range: {min(vals)} to {max(vals)}")
-                                else:
-                                    diagnostics.append(f"  FIX: This column doesn't have values matching your filter. Remove this condition or use a different column.")
-                                break
-                        except Exception:
-                            continue
+                    diagnostics.append(f"  FIX: This filter excludes all rows. Remove it or use a different column.")
         finally:
             conn.close()
 
@@ -3200,7 +3667,8 @@ RULES:
 - If the question says "X and Y" (two values), make sure at least one hypothesis returns 2 columns
 - If the question uses "last/latest/most recent", use ORDER BY DESC LIMIT 1 in at least one hypothesis
 - For time strings like '1:36.483', try: CAST(SUBSTR(col,1,INSTR(col,':')-1) AS REAL)*60 + CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL) for conversion to seconds
-- NEVER return NULL — wrap computations in COALESCE and add WHERE ... IS NOT NULL filters{join_fix_rule}"""
+- NEVER return NULL — wrap computations in COALESCE and add WHERE ... IS NOT NULL filters
+- NEVER use AS to rename columns — SELECT the original column name directly (e.g. SELECT r.name, NOT SELECT r.name AS race_name){join_fix_rule}"""
 
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -3448,51 +3916,6 @@ Return ONLY: {{"python": "import sqlite3\\n..."}}"""
 
         q_lower = question.lower()
 
-        # Grounding-based row validation: if grounding expects "single" but we got many
-        expected_rows_match = re.search(r"EXPECTED ROWS:\s*(\S+)", grounding_context)
-        if expected_rows_match:
-            expected_rows = expected_rows_match.group(1).lower()
-            if expected_rows == "single" and len(rows) > 1:
-                self._log("shape_fix_grounding", f"Grounding expects single row but got {len(rows)}")
-                # Check if question has superlative (most/least/highest/lowest/best/worst/largest/smallest)
-                superlatives = ["most", "least", "highest", "lowest", "best", "worst",
-                                "largest", "smallest", "maximum", "minimum", "max", "min",
-                                "longest", "shortest", "fastest", "slowest", "oldest", "youngest",
-                                "top", "first", "last"]
-                has_superlative = any(s in q_lower for s in superlatives)
-
-                if has_superlative:
-                    # Superlative with multiple rows means ties — keep all rows
-                    # (the SQL should use WHERE = MIN/MAX, not LIMIT 1)
-                    self._log("shape_fixed_superlative", f"Superlative with {len(rows)} rows — keeping all (likely ties)")
-                    return data_result
-                else:
-                    # Missing filter — ask LLM to fix
-                    fix_prompt = f"""The SQL returned {len(rows)} rows but the question expects exactly ONE result.
-
-QUESTION: {question}
-CURRENT RESULT: {len(rows)} rows, columns={cols}
-FIRST 3 ROWS: {rows[:3]}
-
-The question asks about a SPECIFIC item (one match, one event, one person, etc.) but the SQL is missing a filter that would narrow it down.
-Re-read the question. What additional WHERE condition is needed to get exactly 1 row?
-
-DATABASE SCHEMA:
-{kg_context[:2000]}
-
-{grounding_context[:800]}
-
-Return ONLY: {{"sql": "SELECT ..."}}"""
-                    messages = [ModelMessage(role="user", content=fix_prompt)]
-                    raw = self._model_call_with_retry(messages)
-                    parsed = self._parse_json(raw)
-                    if isinstance(parsed, dict) and parsed.get("sql"):
-                        fix_result = self._try_sql(db_path, parsed["sql"])
-                        if fix_result and fix_result.get("rows") and 0 < len(fix_result["rows"]) < len(rows):
-                            self._log("shape_fixed_grounding", f"Narrowed from {len(rows)} to {len(fix_result['rows'])} rows")
-                            data_result = fix_result
-                            rows = data_result.get("rows", [])
-                            cols = data_result.get("columns", [])
 
         # Fix 4: Detect error strings or None/NULL values in result and retry
         first_row_str = " ".join(str(v) for v in rows[0]) if rows else ""
