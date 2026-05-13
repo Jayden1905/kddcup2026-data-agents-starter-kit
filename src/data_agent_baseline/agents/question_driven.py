@@ -1045,6 +1045,10 @@ class QuestionDrivenAgent:
                         diagnosis = self._diagnose_empty_result(db_path, current_sql)
                         if diagnosis:
                             self._log("step_diagnosis", diagnosis[:200])
+                    # Empty results are semantic issues (wrong filter values) — retrying
+                    # with same grounding constraints rarely helps. Skip to hypothesis.
+                    if is_final:
+                        break
                     step_gaps = f"- Empty result (0 rows)\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
                     if diagnosis:
                         step_gaps += f"\n- {diagnosis}"
