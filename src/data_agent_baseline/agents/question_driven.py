@@ -1667,6 +1667,9 @@ RULES:
                     except Exception:
                         pass
 
+        col_priority_patches: list[tuple[str, str, str, str]] = []  # (wrong_table, wrong_col, correct_table, correct_col)
+        grounding_before_patch = json.dumps(grounding, default=str) if grounding else ""
+
         if validation_issues:
             self._log("grounding_v1_issues", json.dumps(validation_issues))
 
@@ -1678,6 +1681,7 @@ RULES:
                 ):
                     correct_table, correct_col = m.group(1), m.group(2)
                     wrong_table, wrong_col = m.group(3), m.group(4)
+                    col_priority_patches.append((wrong_table, wrong_col, correct_table, correct_col))
                     self._log("grounding_patch", f"{wrong_table}.{wrong_col} → {correct_table}.{correct_col}")
 
                     grounding_str = json.dumps(grounding, default=str)
@@ -1826,8 +1830,30 @@ RULES:
             if feedback_contradicts_formula:
                 self._log("grounding_feedback_discarded", f"Feedback contradicts domain formula: {feedback[:100]}")
             else:
-                self._log("grounding_feedback", feedback)
-                grounding["_semantic_overrides"] = [feedback]
+                # If feedback says the patched-in column is wrong and the original was correct,
+                # reverse the patch — feedback has more context and should win.
+                fb_lower = feedback.lower() if not feedback_contradicts_formula else ""
+                patch_reversed = False
+                if col_priority_patches and fb_lower:
+                    for wrong_table, wrong_col, correct_table, correct_col in col_priority_patches:
+                        # Feedback must say the patched column (correct_col) is incorrect
+                        # AND reference the original column (wrong_col) as the right one
+                        patched_col_mentioned = correct_col.lower() in fb_lower
+                        original_col_mentioned = wrong_col.lower() in fb_lower
+                        says_patched_is_wrong = patched_col_mentioned and (
+                            "incorrectly" in fb_lower or "instead of" in fb_lower or "not" in fb_lower
+                        )
+                        if says_patched_is_wrong and original_col_mentioned:
+                            restored = self._parse_json(grounding_before_patch)
+                            if isinstance(restored, dict) and restored:
+                                grounding = restored
+                                patch_reversed = True
+                                self._log("grounding_patch_reversed",
+                                          f"Feedback contradicts col_priority patch: reverting {correct_table}.{correct_col} → {wrong_table}.{wrong_col}")
+                            break
+                if not patch_reversed:
+                    self._log("grounding_feedback", feedback)
+                    grounding["_semantic_overrides"] = [feedback]
         elif grounding and not feedback:
             # Deterministic override: if question word matches an exact column name
             # not used in formula SELECT, inject as override for the SQL planner
@@ -2723,13 +2749,16 @@ RULES:
 
         self._log("disambig_cols", f"defined={list(col_definitions.keys())[:10]} schema={sorted(list(schema_cols))[:15]}")
 
-        # Find question words that match defined columns via prefix/stem
+        # Find question words that match defined columns
         matched_col = ""
         for col_name in col_definitions:
             if col_name not in schema_cols:
                 continue
             for qw in q_words:
-                if qw == col_name or qw.startswith(col_name) or col_name.startswith(qw):
+                # Exact match or question word is an inflected form of column name
+                # (e.g., "ranked" matches "rank") — question word must start with column name.
+                # Do NOT allow column name starting with question word (e.g., "driverref" should NOT match "driver")
+                if qw == col_name or qw.startswith(col_name):
                     matched_col = col_name
                     break
             if matched_col:
@@ -3065,6 +3094,10 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
                 if not candidate_tables:
                     continue
 
+                # Skip comparison operators — can't verify with equality
+                if all(re.match(r'^[<>!=]', str(v).strip()) for v in values if v):
+                    continue
+
                 # Check each value against all candidate tables
                 for val in values:
                     found_in: list[tuple[str, int]] = []
@@ -3159,6 +3192,9 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
                     continue
                 table_name, col_n = col_name.split(".", 1)
                 str_values = [str(v) for v in values]
+                # Skip comparison operators — can't verify with equality/LIKE
+                if all(re.match(r'^[<>!=]', v.strip()) for v in str_values):
+                    continue
                 # Check if ANY filter value matches in this column (exact or LIKE)
                 any_match = False
                 for val in str_values:
