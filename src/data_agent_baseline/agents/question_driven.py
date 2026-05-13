@@ -553,7 +553,11 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     )
     formula = grounding.get("formula", "")
     if formula and not has_population_override and not has_formula_override:
-        parts.append(f"REFERENCE FORMULA (your SQL MUST use the same columns and logic):\n  {formula}")
+        # Strip LIMIT/ORDER BY from reference formulas — they belong to the domain example's
+        # question, not the current question. The planner decides its own LIMIT.
+        display_formula = re.sub(r'\s+ORDER\s+BY\s+.*$', '', formula, flags=re.IGNORECASE)
+        display_formula = re.sub(r'\s+LIMIT\s+\d+\s*$', '', display_formula, flags=re.IGNORECASE)
+        parts.append(f"REFERENCE FORMULA (your SQL MUST use the same columns and logic):\n  {display_formula.strip()}")
 
     # Join paths (factual FK relationships)
     join_paths = grounding.get("join_paths", [])
@@ -1791,6 +1795,9 @@ RULES:
                     except Exception:
                         pass
 
+        # Save original formula for disambiguation (corrected formula may be a domain example with unrelated filter values)
+        original_formula = grounding.get("formula", "") if grounding else ""
+
         # Apply formula correction — clear domain_rules that may contradict the corrected formula
         if corrected_formula and grounding:
             grounding["formula"] = corrected_formula
@@ -1832,9 +1839,13 @@ RULES:
         # Deterministic column-disambiguation: if knowledge defines what a column means
         # and the question uses a word matching that column, but the formula uses a different column,
         # fix the known_values and formula to use the correct column.
+        # Use original_formula to avoid false positives from domain example SQL with unrelated filter values.
         if grounding:
-            self._log("disambig_input", f"formula={grounding.get('formula','')[:100]} | knowledge={bool(knowledge_text)}")
-            col_override, fix_info = self._check_column_disambiguation(question, grounding, kg_context, knowledge_text)
+            disambig_grounding = grounding
+            if original_formula and original_formula != grounding.get("formula", ""):
+                disambig_grounding = {**grounding, "formula": original_formula}
+            self._log("disambig_input", f"formula={disambig_grounding.get('formula','')[:100]} | knowledge={bool(knowledge_text)}")
+            col_override, fix_info = self._check_column_disambiguation(question, disambig_grounding, kg_context, knowledge_text)
             self._log("disambig_result", f"override={col_override[:100] if col_override else 'None'} | fix_info={fix_info}")
             if col_override and fix_info:
                 self._log("grounding_col_disambig", col_override)
