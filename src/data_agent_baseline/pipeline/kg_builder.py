@@ -9,11 +9,14 @@ No LLM calls — purely code-based.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +25,7 @@ class Column:
     sql_type: str
     is_pk: bool = False
     is_nullable: bool = True
+    description: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,7 +471,8 @@ def format_kg_for_llm(kg: KnowledgeGraph, max_sample_values: int = 8) -> str:
                     stat_parts.append(f"range [{st['min']}..{st['max']}]")
                 if stat_parts:
                     stats_str = f"  ({', '.join(stat_parts)})"
-            lines.append(f"  - {col.name} ({col.sql_type}{nullable}){pk_mark}{stats_str}{sample}")
+            desc_str = f"  -- {col.description}" if col.description else ""
+            lines.append(f"  - {col.name} ({col.sql_type}{nullable}){pk_mark}{desc_str}{stats_str}{sample}")
 
         # Explicit FKs
         for fk in table.foreign_keys:
@@ -507,3 +512,103 @@ def _collect_all_relationships(kg: KnowledgeGraph) -> list[tuple[str, ForeignKey
         result.append((src_table, fk))
 
     return result
+
+
+_ENRICH_PROMPT = """\
+You are a data dictionary expert. Given a database schema with sample values and \
+optional domain knowledge, produce a short (≤12 words) semantic description for each column.
+
+Focus on disambiguating columns that could be confused with each other. \
+For columns whose meaning is obvious from the name (e.g. "id", "name"), return empty string "". \
+Only describe columns where the name is ambiguous or could be confused with another column. \
+Each description must be ≤8 words.
+
+SCHEMA:
+{schema}
+
+DOMAIN KNOWLEDGE (if available):
+{knowledge_text}
+
+Return ONLY a JSON object mapping "table.column" to its description string. \
+Omit columns that need no description (obvious from name).
+Example: {{"frpm.District Type": "district organizational category", \
+"frpm.Charter Funding Type": "charter school funding method"}}
+"""
+
+
+def enrich_kg_with_descriptions(
+    kg: KnowledgeGraph,
+    model: ModelAdapter,
+    knowledge_text: str = "",
+    log_fn: Callable[..., None] | None = None,
+) -> KnowledgeGraph:
+    """Use LLM to generate semantic descriptions for KG columns."""
+    schema_lines: list[str] = []
+    for table in kg.tables:
+        schema_lines.append(f"TABLE: {table.name}")
+        for col in table.columns:
+            sample = ""
+            if col.name in table.sample_values:
+                vals = table.sample_values[col.name][:6]
+                sample = f"  e.g. {vals}"
+            schema_lines.append(f"  - {col.name} ({col.sql_type}){sample}")
+        schema_lines.append("")
+
+    schema_text = "\n".join(schema_lines)
+    # Cap schema to avoid blowing context
+    if len(schema_text) > 6000:
+        schema_text = schema_text[:6000]
+
+    prompt = _ENRICH_PROMPT.format(
+        schema=schema_text,
+        knowledge_text=knowledge_text[:3000] if knowledge_text else "(none)",
+    )
+    messages = [ModelMessage(role="user", content=prompt)]
+    raw = model.complete(messages)
+
+    # Parse JSON from response
+    descriptions: dict[str, str] = {}
+    try:
+        # Try direct parse
+        descriptions = json.loads(raw)
+    except json.JSONDecodeError:
+        # Extract JSON from markdown fences
+        m = re.search(r"```(?:json)?\s*\n(.+?)```", raw, re.DOTALL)
+        if m:
+            try:
+                descriptions = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+
+    if not descriptions:
+        if log_fn:
+            log_fn("kg_enrich_fail", "Failed to parse column descriptions from LLM")
+        return kg
+
+    # Apply descriptions to columns
+    new_tables: list[TableSchema] = []
+    applied = 0
+    for table in kg.tables:
+        new_cols: list[Column] = []
+        for col in table.columns:
+            key = f"{table.name}.{col.name}"
+            desc = descriptions.get(key, "")
+            if desc:
+                new_cols.append(replace(col, description=desc))
+                applied += 1
+            else:
+                new_cols.append(col)
+        new_tables.append(TableSchema(
+            name=table.name,
+            columns=new_cols,
+            primary_keys=table.primary_keys,
+            foreign_keys=table.foreign_keys,
+            row_count=table.row_count,
+            sample_values=table.sample_values,
+            col_stats=table.col_stats,
+        ))
+
+    if log_fn:
+        log_fn("kg_enriched", f"{applied} column descriptions added")
+
+    return KnowledgeGraph(tables=new_tables, inferred_fks=kg.inferred_fks)

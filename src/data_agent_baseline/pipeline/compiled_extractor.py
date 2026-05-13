@@ -135,7 +135,7 @@ def _split_paragraphs(text: str) -> list[str]:
 
 
 def _batch_paragraphs(
-    paragraphs: list[str], max_batch_content_chars: int = 6000
+    paragraphs: list[str], max_batch_content_chars: int = 4000
 ) -> list[str]:
     """Pack entity paragraphs into batches respecting context budget.
 
@@ -166,7 +166,7 @@ def _batch_paragraphs(
     return batches
 
 
-def _chunk_document(text: str, max_chunk_chars: int = 6000) -> list[str]:
+def _chunk_document(text: str, max_chunk_chars: int = 4000) -> list[str]:
     """Split document into context-aware batches of entity paragraphs.
 
     Falls back to simple paragraph grouping if no entity paragraphs found.

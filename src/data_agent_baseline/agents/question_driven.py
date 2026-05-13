@@ -27,6 +27,7 @@ from data_agent_baseline.pipeline.context_scanner import TaskContext, scan_conte
 from data_agent_baseline.pipeline.kg_builder import (
     KnowledgeGraph,
     build_kg_from_sqlite,
+    enrich_kg_with_descriptions,
     format_kg_for_llm,
 )
 from data_agent_baseline.tools.knowledge_graph import consolidate_to_sqlite
@@ -496,6 +497,7 @@ def _build_semantic_prompt(
     sample_data: str = "",
     anchor_text: str = "",
     previous_attempt: str = "",
+    feedback: str = "",
 ) -> str:
     # Budget: keep total prompt under 8000 chars to avoid Qwen timeouts
     BUDGET = 8000
@@ -508,7 +510,8 @@ def _build_semantic_prompt(
     sample_budget = max(remaining - len(kg_trimmed), 500)
     sample_section = f"\nSAMPLE DATA:\n{sample_data[:sample_budget]}" if sample_data else ""
     anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1500]}" if anchor_text else ""
-    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt}" if previous_attempt else ""
+    feedback_section = f"\n⚠️ CORRECTION REQUIRED:\n{feedback}" if feedback else ""
+    prev_section = f"\nPREVIOUS ATTEMPT (fix the issues below):\n{previous_attempt}{feedback_section}" if previous_attempt else ""
     return SEMANTIC_GROUNDING_PROMPT.format(
         question=question,
         kg_context=kg_trimmed,
@@ -690,20 +693,6 @@ def _apply_null_guard(sql: str) -> str:
         return f"{prefix} WHERE {col} IS NOT NULL AND {col} != '' {suffix}"
 
 
-_SINGLE_ROW_TYPES = {"count", "count_distinct", "sum", "avg", "ratio", "percentage", "min_max", "simple_lookup", "total"}
-
-
-def _expects_single_row(grounding_context: str) -> bool:
-    """Check if grounding indicates the result should be a single row."""
-    m = re.search(r"COMPUTATION TYPE:\s*(\w+)", grounding_context)
-    if m and m.group(1).lower() in _SINGLE_ROW_TYPES:
-        return True
-    # Check for explicit single-row signals in grounding text
-    lower = grounding_context.lower()
-    if re.search(r"(single row|one row|a single|two values|one value|summary values|the total|overall total)", lower):
-        return True
-    return False
-
 
 # Agent
 # ---------------------------------------------------------------------------
@@ -798,8 +787,12 @@ class QuestionDrivenAgent:
                     structured_tables=structured_tables,
                 )
 
-            # Step 4: Build KG from full DB (deterministic)
+            # Step 4: Build KG from full DB (deterministic) + enrich with descriptions
             kg = build_kg_from_sqlite(db_path)
+            kg = enrich_kg_with_descriptions(
+                kg, model=self.model, knowledge_text=ctx.knowledge_text,
+                log_fn=self._log,
+            )
             kg_context = format_kg_for_llm(kg)
             self._log("kg_built", f"KG: {len(kg.tables)} tables, "
                       f"{len(kg.inferred_fks)} inferred FKs")
@@ -813,7 +806,7 @@ class QuestionDrivenAgent:
             # Step 5: Semantic grounding — decompose question before SQL planning
             grounding_context, schema_slice = self._call_semantic_grounding(
                 question, kg_context, sample_data, ctx.knowledge_text,
-                db_path=db_path,
+                db_path=db_path, kg=kg,
             )
             # Use schema slice for SQL planner if available, otherwise full schema
             sql_schema = schema_slice if schema_slice else kg_context
@@ -1062,20 +1055,9 @@ class QuestionDrivenAgent:
                         failed_sqls.append(current_sql)
                         step_gaps = f"- Query returned only NULL values\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
                     elif is_final:
-                        # Check if row count matches expected grain
-                        if len(rows) > 5 and _expects_single_row(grounding_context):
-                            self._log("step_grain_mismatch", f"Step {i+1}: expected 1 row but got {len(rows)}")
-                            failed_sqls.append(current_sql)
-                            step_gaps = (
-                                f"- GRAIN MISMATCH: Expected a single aggregated row but got {len(rows)} rows.\n"
-                                f"- Your GROUP BY produced per-group results instead of one overall result.\n"
-                                f"- Fix: wrap in a subquery and apply the final AVG/SUM/COUNT on the outer query.\n"
-                                f"- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
-                            )
-                        else:
-                            step_succeeded = True
-                            self._log("step_final", f"cols={cols}, rows={len(rows)}")
-                            return result, current_sql, failed_sqls
+                        step_succeeded = True
+                        self._log("step_final", f"cols={cols}, rows={len(rows)}")
+                        return result, current_sql, failed_sqls
                     else:
                         # Verification step (non-final) — record confirmed values
                         step_succeeded = True
@@ -1412,7 +1394,12 @@ RULES:
         output_names = [columns[i] for i in keep_indices]
 
         # Apply column selection to ALL rows (no LLM, no truncation)
-        filtered_rows = [[str(row[i]) for i in keep_indices] for row in rows]
+        filtered_rows = [
+            [str(row[i]) for i in keep_indices]
+            for row in rows if len(row) > max(keep_indices)
+        ]
+        if not filtered_rows:
+            return self._raw_result_to_answer(data_result)
 
         self._log("answer_schema", f"Kept columns {keep_indices} → {output_names} ({len(filtered_rows)} rows)")
         return {"columns": output_names, "rows": filtered_rows}
@@ -1571,6 +1558,7 @@ RULES:
         sample_data: str,
         knowledge_text: str,
         db_path: Path | None = None,
+        kg: KnowledgeGraph | None = None,
     ) -> str:
         """Multi-step grounding: Table Select → Focused Ground → Validate → Feedback."""
         grounding: dict[str, Any] = {}
@@ -1601,7 +1589,7 @@ RULES:
         # --- Round 2: Focused Grounding with selected table details ---
         focused_schema = ""
         if selected_tables and db_path:
-            focused_schema = self._build_focused_schema_for_grounding(db_path, selected_tables, question)
+            focused_schema = self._build_focused_schema_for_grounding(db_path, selected_tables, question, kg=kg)
 
         # Use focused schema if available, otherwise fall back to full schema
         grounding_schema = focused_schema if focused_schema else kg_context
@@ -1663,40 +1651,61 @@ RULES:
 
         if validation_issues:
             self._log("grounding_v1_issues", json.dumps(validation_issues))
-            # Restart from table selection with feedback about what failed
-            feedback_text = "\n".join(f"- {issue}" for issue in validation_issues)
-            # Round 1 retry: re-select tables with feedback
-            selected_tables_v2 = self._grounding_select_tables(
-                question, kg_context, effective_anchor, db_path,
-                feedback=feedback_text,
-            )
-            # Round 2 retry: rebuild focused schema with new tables
-            focused_schema_v2 = ""
-            if selected_tables_v2 and db_path:
-                focused_schema_v2 = self._build_focused_schema_for_grounding(
-                    db_path, selected_tables_v2, question
+            # Separate MISMATCH issues (in-place fix) from other issues (full retry)
+            mismatch_issues = [i for i in validation_issues if "MISMATCH" in i.upper()]
+            other_issues = [i for i in validation_issues if "MISMATCH" not in i.upper()]
+
+            # In-place fix for MISMATCH: string replace in grounding dict
+            for issue in mismatch_issues:
+                m = re.search(
+                    r'MISMATCH:\s*(\S+)\s+should be used instead of\s+(\S+)',
+                    issue, re.IGNORECASE,
                 )
-            grounding_schema_v2 = focused_schema_v2 if focused_schema_v2 else kg_context
-            # Round 3 retry: re-ground with new schema + feedback
-            retry_prompt = _build_semantic_prompt(
-                question=question,
-                kg_context=grounding_schema_v2,
-                sample_data=sample_data if not focused_schema_v2 else "",
-                anchor_text=effective_anchor,
-                previous_attempt=(
-                    f"⚠️ ABSOLUTE TRUTH — DO NOT DISAGREE OR OVERRIDE:\n{feedback_text}\n\n"
-                    f"These are VERIFIED FACTS from running actual SQL queries against the database. "
-                    f"The columns/values above returned ZERO rows — this is NOT debatable. "
-                    f"You MUST use the alternative tables/columns suggested. "
-                    f"Do NOT reason that the original column 'should work' — it DOES NOT."
-                ),
-            )
-            retry_messages = [ModelMessage(role="user", content=retry_prompt)]
-            raw2 = self._model_call_with_retry(retry_messages)
-            grounding2 = self._parse_json(raw2)
-            if isinstance(grounding2, dict) and grounding2:
-                self._log("grounding_v2_retry", json.dumps(grounding2, default=str))
-                grounding = grounding2
+                if m:
+                    correct_full = m.group(1)  # e.g. frpm.Charter Funding Type
+                    wrong_full = m.group(2)    # e.g. frpm.District Type
+                    # Extract just the column name (after the dot)
+                    correct_col = correct_full.split(".", 1)[-1] if "." in correct_full else correct_full
+                    wrong_col = wrong_full.split(".", 1)[-1] if "." in wrong_full else wrong_full
+                    self._log("grounding_col_swap", f"{wrong_col} → {correct_col}")
+                    grounding_str = json.dumps(grounding, default=str)
+                    grounding_str = grounding_str.replace(wrong_col, correct_col)
+                    fixed = self._parse_json(grounding_str)
+                    if isinstance(fixed, dict) and fixed:
+                        grounding = fixed
+
+            # Full retry only for non-MISMATCH issues (filter validation failures)
+            if other_issues:
+                feedback_text = "\n".join(f"- {issue}" for issue in other_issues)
+                selected_tables_v2 = self._grounding_select_tables(
+                    question, kg_context, effective_anchor, db_path,
+                    feedback=feedback_text,
+                )
+                focused_schema_v2 = ""
+                if selected_tables_v2 and db_path:
+                    focused_schema_v2 = self._build_focused_schema_for_grounding(
+                        db_path, selected_tables_v2, question, kg=kg
+                    )
+                grounding_schema_v2 = focused_schema_v2 if focused_schema_v2 else kg_context
+                retry_prompt = _build_semantic_prompt(
+                    question=question,
+                    kg_context=grounding_schema_v2,
+                    sample_data=sample_data if not focused_schema_v2 else "",
+                    anchor_text=effective_anchor,
+                    previous_attempt=(
+                        f"⚠️ ABSOLUTE TRUTH — DO NOT DISAGREE OR OVERRIDE:\n{feedback_text}\n\n"
+                        f"These are VERIFIED FACTS from running actual SQL queries against the database. "
+                        f"The columns/values above returned ZERO rows — this is NOT debatable. "
+                        f"You MUST use the alternative tables/columns suggested. "
+                        f"Do NOT reason that the original column 'should work' — it DOES NOT."
+                    ),
+                )
+                retry_messages = [ModelMessage(role="user", content=retry_prompt)]
+                raw2 = self._model_call_with_retry(retry_messages)
+                grounding2 = self._parse_json(raw2)
+                if isinstance(grounding2, dict) and grounding2:
+                    self._log("grounding_v2_retry", json.dumps(grounding2, default=str))
+                    grounding = grounding2
 
         self._log("grounding_v1", json.dumps(grounding, default=str))
 
@@ -2105,7 +2114,8 @@ Select 2-5 tables. Include linking/bridge tables needed for JOINs."""
         return all_tables
 
     def _build_focused_schema_for_grounding(
-        self, db_path: Path, tables: list[str], question: str
+        self, db_path: Path, tables: list[str], question: str,
+        kg: KnowledgeGraph | None = None,
     ) -> str:
         """Build detailed schema for selected tables with sample values and format hints."""
         self._log("grounding_focused_schema", f"Building focused schema for: {tables}")
@@ -2150,7 +2160,17 @@ Select 2-5 tables. Include linking/bridge tables needed for JOINs."""
                     except Exception:
                         pass
 
-                    lines.append(f"  - {col_name} ({col_type}){pk_mark}{sample}")
+                    # Look up description from enriched KG
+                    desc_str = ""
+                    if kg:
+                        kg_table = kg.get_table(tname)
+                        if kg_table:
+                            for kc in kg_table.columns:
+                                if kc.name == col_name and kc.description:
+                                    desc_str = f"  -- {kc.description}"
+                                    break
+
+                    lines.append(f"  - {col_name} ({col_type}){pk_mark}{desc_str}{sample}")
 
                 # FK info
                 try:
@@ -2255,9 +2275,15 @@ GROUNDING formula: {formula}
 ALL columns in database:
 {chr(10).join(all_cols)}
 
-Is there a column in the database that EXACTLY matches the measure/metric word in the question, but was NOT chosen by the grounding?
+Is there a column in the database that better matches a word/phrase in the question, but was NOT chosen by the grounding?
 
-For example: if question says "lowest cost" and there's a column "expense.cost" but grounding uses "budget.spent" — that's a mismatch.
+Check BOTH:
+1. Metric/measure columns (e.g. "up votes" should use a column with "UpVotes" in the name)
+2. Output/attribute columns (e.g. "funding types" should use a column with "Funding Type" in the name, not "District Type")
+
+A column whose name literally contains the question's keyword is a stronger match than one that doesn't.
+
+For example: if question says "funding types" and there's "frpm.Charter Funding Type" but grounding uses "frpm.District Type" — that's a MISMATCH because "Charter Funding Type" literally contains "Funding Type".
 But if question says "race number 19" and there's a column "qualifying.number" — that's NOT a mismatch because "number" here means the race ID, not the column.
 
 Reply ONLY:

@@ -36,7 +36,7 @@ def run():
         },
         "run": {
             "output_dir": "/tmp/run_output",
-            "max_workers": int(os.environ.get("MAX_WORKERS", "2")),
+            "max_workers": int(os.environ.get("MAX_WORKERS", "1")),
             "task_timeout_seconds": 500,
         },
     }
