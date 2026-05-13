@@ -1,4 +1,4 @@
-CONFIG ?= configs/react_baseline.local.yaml
+CONFIG ?= configs/react_baseline.ollama.yaml
 TASK   ?= task_11
 LIMIT  ?= 50
 TEAM   ?= 1347

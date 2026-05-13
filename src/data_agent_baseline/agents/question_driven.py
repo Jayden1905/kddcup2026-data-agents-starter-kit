@@ -555,10 +555,10 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
     )
     formula = grounding.get("formula", "")
     if formula and not has_population_override and not has_formula_override:
-        # Strip LIMIT/ORDER BY from reference formulas — they belong to the domain example's
-        # question, not the current question. The planner decides its own LIMIT.
-        display_formula = re.sub(r'\s+ORDER\s+BY\s+.*$', '', formula, flags=re.IGNORECASE)
-        display_formula = re.sub(r'\s+LIMIT\s+\d+\s*$', '', display_formula, flags=re.IGNORECASE)
+        # Strip only LIMIT from reference formulas — it belongs to the domain example's
+        # specific question, not the current one. Keep ORDER BY since the planner needs
+        # ordering direction for temporal/superlative queries.
+        display_formula = re.sub(r'\s+LIMIT\s+\d+\s*$', '', formula, flags=re.IGNORECASE)
         parts.append(f"REFERENCE FORMULA (your SQL MUST use the same columns and logic):\n  {display_formula.strip()}")
 
     # Join paths (factual FK relationships)
@@ -1826,10 +1826,13 @@ RULES:
         # Apply semantic feedback
         if grounding and feedback:
             # Guard: discard feedback that suggests aggregation for min/max lookups
+            # BUT only when the formula is a simple lookup (no existing aggregation)
             comp_type = grounding.get("computation_type", "")
-            if comp_type == "min_max" and re.search(r'\b(aggregat|group\s*by|total|sum)\b', feedback, re.IGNORECASE):
+            formula_text = grounding.get("formula", "").lower()
+            formula_has_agg = bool(re.search(r'\b(sum|avg|count|group by)\b', formula_text))
+            if comp_type == "min_max" and not formula_has_agg and re.search(r'\b(aggregat|group\s*by|total|sum)\b', feedback, re.IGNORECASE):
                 feedback = ""
-                self._log("grounding_feedback_discarded", f"Feedback suggests aggregation but computation_type=min_max")
+                self._log("grounding_feedback_discarded", f"Feedback suggests aggregation but computation_type=min_max and formula has no aggregation")
 
             # Guard: discard feedback that contradicts arithmetic in domain_rules
             domain_rules = grounding.get("domain_rules", [])
@@ -1863,7 +1866,8 @@ RULES:
                         patched_col_mentioned = correct_col.lower() in fb_lower
                         original_col_mentioned = wrong_col.lower() in fb_lower
                         says_patched_is_wrong = patched_col_mentioned and (
-                            "incorrectly" in fb_lower or "instead of" in fb_lower or "not" in fb_lower
+                            "incorrectly" in fb_lower or "instead of" in fb_lower
+                            or "should use" in fb_lower or "rather than" in fb_lower
                         )
                         if says_patched_is_wrong and original_col_mentioned:
                             restored = self._parse_json(grounding_before_patch)
@@ -1996,7 +2000,11 @@ If the question asks for something with a superlative (lowest, highest, most, le
                         selected.append(tp_rule)
                         selected_labels.append("time_parse")
 
-                if " and " in q_lower and "multi_col" not in selected_labels:
+                # Inject multi_col when question asks for multiple attributes ("X and Y")
+                # but not when "and" is used in filters ("in US and Canada")
+                if "multi_col" not in selected_labels and re.search(
+                    r'\b(list|what|give|show|find)\b.+ and ', q_lower
+                ):
                     mc_rule = next((r for l, r in SQL_RULES_LABELED if l == "multi_col"), None)
                     if mc_rule:
                         selected.append(mc_rule)
