@@ -1654,35 +1654,29 @@ RULES:
 
             # Deterministic patch: fix column references without re-grounding
             for issue in validation_issues:
-                m = re.search(
+                for m in re.finditer(
                     r'MISMATCH:\s*(\S+?)\.(\S+(?:\s+\S+)*?)\s+should be used instead of\s+(\S+?)\.(\S+(?:\s+\S+)*?)(?:\s+because|\s*$)',
                     issue, re.IGNORECASE,
-                )
-                if not m:
-                    continue
-                correct_table, correct_col = m.group(1), m.group(2)
-                wrong_table, wrong_col = m.group(3), m.group(4)
-                self._log("grounding_patch", f"{wrong_table}.{wrong_col} → {correct_table}.{correct_col}")
+                ):
+                    correct_table, correct_col = m.group(1), m.group(2)
+                    wrong_table, wrong_col = m.group(3), m.group(4)
+                    self._log("grounding_patch", f"{wrong_table}.{wrong_col} → {correct_table}.{correct_col}")
 
-                grounding_str = json.dumps(grounding, default=str)
+                    grounding_str = json.dumps(grounding, default=str)
+                    grounding_str = grounding_str.replace(
+                        f"{wrong_table}.{wrong_col}", f"{correct_table}.{correct_col}"
+                    )
+                    if wrong_col != correct_col:
+                        grounding_str = grounding_str.replace(wrong_col, correct_col)
 
-                # Replace table-qualified references
-                grounding_str = grounding_str.replace(
-                    f"{wrong_table}.{wrong_col}", f"{correct_table}.{correct_col}"
-                )
-                # Replace unqualified column name only if names differ
-                if wrong_col != correct_col:
-                    grounding_str = grounding_str.replace(wrong_col, correct_col)
-
-                fixed = self._parse_json(grounding_str)
-                if isinstance(fixed, dict) and fixed:
-                    grounding = fixed
-                    # Remove domain_rules that reference the wrong column
-                    domain_rules = grounding.get("domain_rules", [])
-                    grounding["domain_rules"] = [
-                        r for r in domain_rules
-                        if wrong_col not in r or correct_col in r
-                    ]
+                    fixed = self._parse_json(grounding_str)
+                    if isinstance(fixed, dict) and fixed:
+                        grounding = fixed
+                        domain_rules = grounding.get("domain_rules", [])
+                        grounding["domain_rules"] = [
+                            r for r in domain_rules
+                            if wrong_col not in r or correct_col in r
+                        ]
 
             # Re-validate join paths after patching (new table may need new joins)
             if db_path and grounding:
@@ -2285,6 +2279,7 @@ Check ALL of these:
 Rules:
 - A column whose name literally contains the question's keyword is a stronger match than one that doesn't.
 - When the same column name exists in multiple tables, the column belonging to the entity the question asks about takes priority.
+- Check EVERY output column in the grounding independently. Report ALL mismatches, not just the first one.
 
 For example:
 - Question asks for "X's attribute" and both TableX.attribute and TableY.attribute exist → prefer TableX (entity ownership)
@@ -2292,8 +2287,9 @@ For example:
 - A word in the question matches a column name but is clearly a filter value (e.g. "number 19") → NOT a mismatch
 
 Reply ONLY:
-- OK (if grounding columns are correct)
-- MISMATCH: <table.column> should be used instead of <table.column> because <reason>"""
+- OK (if all grounding columns are correct)
+- One or more MISMATCH lines (one per wrong column):
+  MISMATCH: <table.column> should be used instead of <table.column> because <reason>"""
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
@@ -2301,12 +2297,18 @@ Reply ONLY:
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             if not raw:
                 return ""
-            first_line = raw.split("\n")[0].strip()
-            if first_line.upper().startswith("OK"):
+            if raw.strip().upper().startswith("OK"):
                 return ""
-            if "MISMATCH" in first_line.upper():
-                self._log("col_name_priority", first_line)
-                return first_line
+            # Collect all MISMATCH lines
+            mismatches = []
+            for line in raw.split("\n"):
+                line = line.strip()
+                if "MISMATCH" in line.upper():
+                    mismatches.append(line)
+            if mismatches:
+                combined = "\n".join(mismatches)
+                self._log("col_name_priority", combined)
+                return combined
             return ""
         except Exception:
             return ""

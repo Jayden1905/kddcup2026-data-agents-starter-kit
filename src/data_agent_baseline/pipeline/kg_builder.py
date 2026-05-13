@@ -201,6 +201,86 @@ def _introspect_table(conn: sqlite3.Connection, table_name: str) -> TableSchema 
     )
 
 
+def _resolve_table_name(ref_name: str, table_names_lower: dict[str, str]) -> str | None:
+    """Try to match a reference name to an actual table (handles plural/singular)."""
+    if ref_name in table_names_lower:
+        return ref_name
+    # Plural forms
+    if ref_name + "s" in table_names_lower:
+        return ref_name + "s"
+    if ref_name + "es" in table_names_lower:
+        return ref_name + "es"
+    if ref_name + "ies" in table_names_lower:
+        return ref_name + "ies"
+    # Singular forms
+    if ref_name.endswith("s") and ref_name[:-1] in table_names_lower:
+        return ref_name[:-1]
+    if ref_name.endswith("es") and ref_name[:-2] in table_names_lower:
+        return ref_name[:-2]
+    if ref_name.endswith("ies") and ref_name[:-3] + "y" in table_names_lower:
+        return ref_name[:-3] + "y"
+    # Underscore/space variants: "order_item" ↔ "order_items", "orderitem"
+    if "_" in ref_name:
+        joined = ref_name.replace("_", "")
+        if joined in table_names_lower:
+            return joined
+    else:
+        for tname in table_names_lower:
+            if tname.replace("_", "") == ref_name:
+                return tname
+    return None
+
+
+def _find_id_column(
+    ref_table_name: str, src_col_name: str, tables: list[TableSchema]
+) -> str:
+    """Find the best ID column in the referenced table.
+
+    Priority: "id" > same column name as source > "_id" > first column.
+    """
+    ref_table = next((t for t in tables if t.name == ref_table_name), None)
+    if not ref_table:
+        return "id"
+    col_names = {c.name.lower(): c.name for c in ref_table.columns}
+    if "id" in col_names:
+        return col_names["id"]
+    if src_col_name.lower() in col_names:
+        return col_names[src_col_name.lower()]
+    if "_id" in col_names:
+        return col_names["_id"]
+    # Try PK columns
+    for c in ref_table.columns:
+        if c.is_pk:
+            return c.name
+    return ref_table.columns[0].name if ref_table.columns else "id"
+
+
+def _extract_ref_name(col_name: str) -> str | None:
+    """Extract referenced entity name from various FK naming conventions.
+
+    Handles: customer_id, customerId, CustomerID, customer_key, customer_no,
+    customer_code, fk_customer, ref_customer, id_customer
+    """
+    col_lower = col_name.lower()
+
+    # <table>_id / <table>_key / <table>_no / <table>_code / <table>_num
+    m = re.match(r"^(.+?)_(?:id|key|no|num|code)$", col_lower)
+    if m:
+        return m.group(1)
+
+    # fk_<table> / ref_<table> / id_<table>
+    m = re.match(r"^(?:fk|ref|id)_(.+)$", col_lower)
+    if m:
+        return m.group(1)
+
+    # camelCase: customerId, CustomerID, eventID
+    m = re.match(r"^(.+?)(?:Id|ID|Key|Code|No|Num)$", col_name)
+    if m and len(m.group(1)) > 1:
+        return m.group(1).lower()
+
+    return None
+
+
 def _infer_foreign_keys(
     conn: sqlite3.Connection, tables: list[TableSchema]
 ) -> list[tuple[str, ForeignKey]]:
@@ -237,42 +317,34 @@ def _infer_foreign_keys(
             if col_lower in explicit_fk_cols.get(table.name, set()):
                 continue
 
-            # Pattern 1: column "<table>_id" → table "<table>", column "id"
-            m = re.match(r"^(.+?)_id$", col_lower)
-            if m:
-                ref_name = m.group(1)
-                if ref_name in table_names_lower and ref_name != table.name.lower():
+            # Pattern 1: naming convention → referenced table
+            # Handles: customer_id, customerId, CustomerID, customer_key,
+            #          fk_customer, ref_customer, id_customer, customer_code
+            ref_name = _extract_ref_name(col.name)
+            if ref_name:
+                ref_match = _resolve_table_name(ref_name, table_names_lower)
+                if ref_match and ref_match != table.name.lower():
+                    ref_col = _find_id_column(
+                        table_names_lower[ref_match], col.name, tables
+                    )
                     candidates.append((
                         table.name, col.name,
-                        table_names_lower[ref_name], "id", True,
+                        table_names_lower[ref_match], ref_col, True,
                     ))
 
-            # Pattern 2: camelCase "eventId" → table "event"
-            m2 = re.match(r"^(.+?)Id$", col.name)
-            if m2:
-                ref_name = m2.group(1).lower()
-                if ref_name in table_names_lower and ref_name != table.name.lower():
-                    candidates.append((
-                        table.name, col.name,
-                        table_names_lower[ref_name], "id", True,
-                    ))
-
-            # Pattern 2b: "link_to_<table>" → table's ID column
+            # Pattern 2: "link_to_<table>" → table's ID column
             m3 = re.match(r"^link_to_(.+)$", col_lower)
             if m3:
-                ref_name = m3.group(1)
-                if ref_name in table_names_lower and ref_name != table.name.lower():
-                    ref_actual = table_names_lower[ref_name]
-                    # Try common ID column names in the referenced table
-                    for ref_col_candidate in [f"{ref_name}_id", "id", "_id"]:
-                        ref_cols_lower = {c.name.lower(): c.name for t in tables
-                                          if t.name == ref_actual for c in t.columns}
-                        if ref_col_candidate in ref_cols_lower:
-                            candidates.append((
-                                table.name, col.name,
-                                ref_actual, ref_cols_lower[ref_col_candidate], True,
-                            ))
-                            break
+                link_ref = m3.group(1)
+                ref_match = _resolve_table_name(link_ref, table_names_lower)
+                if ref_match and ref_match != table.name.lower():
+                    ref_col = _find_id_column(
+                        table_names_lower[ref_match], col.name, tables
+                    )
+                    candidates.append((
+                        table.name, col.name,
+                        table_names_lower[ref_match], ref_col, True,
+                    ))
 
             # Pattern 3: same column name exists in another table (shared key)
             # Only for ID-like columns to avoid false positives (e.g. "Diagnosis")
@@ -286,11 +358,50 @@ def _infer_foreign_keys(
                         _is_specific_id(col_lower),
                     ))
 
-    # Validate candidates via value overlap
+            # Pattern 4: _id ↔ ID equivalence (doc extraction uses _id, CSVs use ID)
+            if col_lower == "_id":
+                for ref_table_name, ref_col_name in unique_cols.get("id", []):
+                    if ref_table_name == table.name:
+                        continue
+                    candidates.append((
+                        table.name, col.name,
+                        ref_table_name, ref_col_name, False,
+                    ))
+            elif col_lower == "id":
+                for ref_table_name, ref_col_name in unique_cols.get("_id", []):
+                    if ref_table_name == table.name:
+                        continue
+                    candidates.append((
+                        table.name, col.name,
+                        ref_table_name, ref_col_name, False,
+                    ))
+
+    # Validate candidates via value overlap + uniqueness analysis
     inferred: list[tuple[str, ForeignKey]] = []
     seen: set[tuple[str, str, str, str]] = set()
-    # Track bidirectional pairs to avoid A->B and B->A
+    # Track bidirectional pairs to avoid A->B and B->A for same column
     linked_pairs: set[tuple[str, str, str]] = set()
+
+    # Pre-compute uniqueness ratios for smarter direction detection
+    uniqueness_cache: dict[tuple[str, str], float] = {}
+
+    def _get_uniqueness(tbl: str, col: str) -> float:
+        key = (tbl, col)
+        if key not in uniqueness_cache:
+            try:
+                row_count = conn.execute(
+                    f'SELECT COUNT(*) FROM "{tbl}"'
+                ).fetchone()[0]
+                if row_count == 0:
+                    uniqueness_cache[key] = 0.0
+                else:
+                    distinct = conn.execute(
+                        f'SELECT COUNT(DISTINCT "{col}") FROM "{tbl}"'
+                    ).fetchone()[0]
+                    uniqueness_cache[key] = distinct / row_count
+            except Exception:
+                uniqueness_cache[key] = 0.0
+        return uniqueness_cache[key]
 
     for src_table, src_col, ref_table, ref_col, name_match in candidates:
         key = (src_table, src_col, ref_table, ref_col)
@@ -298,11 +409,11 @@ def _infer_foreign_keys(
             continue
         seen.add(key)
 
-        # Skip self-references
         if src_table == ref_table:
             continue
 
-        # Skip if reverse relationship already established
+        # Normalize direction: FK should point from many-side → one-side
+        # (source has duplicates, reference is unique)
         pair = tuple(sorted([src_table, ref_table]))
         col_pair = (pair[0], pair[1], src_col.lower())
         if col_pair in linked_pairs:
@@ -311,11 +422,24 @@ def _infer_foreign_keys(
         if _check_value_overlap(
             conn, src_table, src_col, ref_table, ref_col, name_match=name_match
         ):
-            inferred.append((src_table, ForeignKey(
-                column=src_col,
-                ref_table=ref_table,
-                ref_column=ref_col,
-            )))
+            # Determine correct direction using uniqueness
+            src_uniq = _get_uniqueness(src_table, src_col)
+            ref_uniq = _get_uniqueness(ref_table, ref_col)
+
+            # If ref is more unique (PK-like), direction is correct: src → ref
+            # If src is more unique, flip direction: ref → src
+            if ref_uniq >= src_uniq:
+                inferred.append((src_table, ForeignKey(
+                    column=src_col,
+                    ref_table=ref_table,
+                    ref_column=ref_col,
+                )))
+            else:
+                inferred.append((ref_table, ForeignKey(
+                    column=ref_col,
+                    ref_table=src_table,
+                    ref_column=src_col,
+                )))
             linked_pairs.add(col_pair)
 
     return inferred
@@ -372,9 +496,12 @@ def _check_value_overlap(
                 return False
 
         # For bare "id"/"Id" columns: check if both are independent PKs
+        is_one_to_many = False
         if src_col.lower() == "id" and ref_col.lower() == "id":
             if _both_are_pks(conn, src_table, src_col, ref_table, ref_col):
                 return False
+            # One side is PK, other has duplicates → classic FK pattern, be lenient
+            is_one_to_many = True
 
         # Sample distinct non-null values from source
         src_vals = conn.execute(
@@ -397,7 +524,7 @@ def _check_value_overlap(
 
         overlap = matches / len(src_vals)
 
-        if name_match:
+        if name_match or is_one_to_many:
             return matches > 0
 
         return overlap >= min_overlap
