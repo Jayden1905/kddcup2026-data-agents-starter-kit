@@ -1651,61 +1651,61 @@ RULES:
 
         if validation_issues:
             self._log("grounding_v1_issues", json.dumps(validation_issues))
-            # Separate MISMATCH issues (in-place fix) from other issues (full retry)
-            mismatch_issues = [i for i in validation_issues if "MISMATCH" in i.upper()]
-            other_issues = [i for i in validation_issues if "MISMATCH" not in i.upper()]
 
-            # In-place fix for MISMATCH: string replace in grounding dict
-            for issue in mismatch_issues:
+            # Deterministic patch: fix column references without re-grounding
+            for issue in validation_issues:
                 m = re.search(
-                    r'MISMATCH:\s*(\S+)\s+should be used instead of\s+(\S+)',
+                    r'MISMATCH:\s*(\S+?)\.(\S+(?:\s+\S+)*?)\s+should be used instead of\s+(\S+?)\.(\S+(?:\s+\S+)*?)(?:\s+because|\s*$)',
                     issue, re.IGNORECASE,
                 )
-                if m:
-                    correct_full = m.group(1)  # e.g. frpm.Charter Funding Type
-                    wrong_full = m.group(2)    # e.g. frpm.District Type
-                    # Extract just the column name (after the dot)
-                    correct_col = correct_full.split(".", 1)[-1] if "." in correct_full else correct_full
-                    wrong_col = wrong_full.split(".", 1)[-1] if "." in wrong_full else wrong_full
-                    self._log("grounding_col_swap", f"{wrong_col} → {correct_col}")
-                    grounding_str = json.dumps(grounding, default=str)
-                    grounding_str = grounding_str.replace(wrong_col, correct_col)
-                    fixed = self._parse_json(grounding_str)
-                    if isinstance(fixed, dict) and fixed:
-                        grounding = fixed
+                if not m:
+                    continue
+                correct_table, correct_col = m.group(1), m.group(2)
+                wrong_table, wrong_col = m.group(3), m.group(4)
+                self._log("grounding_patch", f"{wrong_table}.{wrong_col} → {correct_table}.{correct_col}")
 
-            # Full retry only for non-MISMATCH issues (filter validation failures)
-            if other_issues:
-                feedback_text = "\n".join(f"- {issue}" for issue in other_issues)
-                selected_tables_v2 = self._grounding_select_tables(
-                    question, kg_context, effective_anchor, db_path,
-                    feedback=feedback_text,
+                grounding_str = json.dumps(grounding, default=str)
+
+                # Replace table-qualified references
+                grounding_str = grounding_str.replace(
+                    f"{wrong_table}.{wrong_col}", f"{correct_table}.{correct_col}"
                 )
-                focused_schema_v2 = ""
-                if selected_tables_v2 and db_path:
-                    focused_schema_v2 = self._build_focused_schema_for_grounding(
-                        db_path, selected_tables_v2, question, kg=kg
-                    )
-                grounding_schema_v2 = focused_schema_v2 if focused_schema_v2 else kg_context
-                retry_prompt = _build_semantic_prompt(
-                    question=question,
-                    kg_context=grounding_schema_v2,
-                    sample_data=sample_data if not focused_schema_v2 else "",
-                    anchor_text=effective_anchor,
-                    previous_attempt=(
-                        f"⚠️ ABSOLUTE TRUTH — DO NOT DISAGREE OR OVERRIDE:\n{feedback_text}\n\n"
-                        f"These are VERIFIED FACTS from running actual SQL queries against the database. "
-                        f"The columns/values above returned ZERO rows — this is NOT debatable. "
-                        f"You MUST use the alternative tables/columns suggested. "
-                        f"Do NOT reason that the original column 'should work' — it DOES NOT."
-                    ),
-                )
-                retry_messages = [ModelMessage(role="user", content=retry_prompt)]
-                raw2 = self._model_call_with_retry(retry_messages)
-                grounding2 = self._parse_json(raw2)
-                if isinstance(grounding2, dict) and grounding2:
-                    self._log("grounding_v2_retry", json.dumps(grounding2, default=str))
-                    grounding = grounding2
+                # Replace unqualified column name only if names differ
+                if wrong_col != correct_col:
+                    grounding_str = grounding_str.replace(wrong_col, correct_col)
+
+                fixed = self._parse_json(grounding_str)
+                if isinstance(fixed, dict) and fixed:
+                    grounding = fixed
+                    # Remove domain_rules that reference the wrong column
+                    domain_rules = grounding.get("domain_rules", [])
+                    grounding["domain_rules"] = [
+                        r for r in domain_rules
+                        if wrong_col not in r or correct_col in r
+                    ]
+
+            # Re-validate join paths after patching (new table may need new joins)
+            if db_path and grounding:
+                data_reqs = grounding.get("data_requirements", [])
+                tables_needed = set()
+                for req in data_reqs:
+                    req_str = req if isinstance(req, str) else str(req)
+                    if "." in req_str:
+                        tables_needed.add(req_str.split(".")[0].lower())
+                if len(tables_needed) >= 2:
+                    try:
+                        join_paths = []
+                        tables_list = sorted(tables_needed)
+                        for i, t1 in enumerate(tables_list):
+                            for t2 in tables_list[i + 1:]:
+                                path = _find_join_path(db_path, t1, t2)
+                                if path:
+                                    join_paths.append(path)
+                        if join_paths:
+                            grounding["join_paths"] = join_paths
+                            self._log("grounding_patch_joins", str(join_paths))
+                    except Exception:
+                        pass
 
         self._log("grounding_v1", json.dumps(grounding, default=str))
 
@@ -2277,14 +2277,19 @@ ALL columns in database:
 
 Is there a column in the database that better matches a word/phrase in the question, but was NOT chosen by the grounding?
 
-Check BOTH:
+Check ALL of these:
 1. Metric/measure columns (e.g. "up votes" should use a column with "UpVotes" in the name)
 2. Output/attribute columns (e.g. "funding types" should use a column with "Funding Type" in the name, not "District Type")
+3. Entity ownership: when the question asks for a property of an entity (e.g. "the patient's diagnosis"), prefer the column from that entity's own table (e.g. Patient.Diagnosis) over the same column in a related table (e.g. Examination.Diagnosis)
 
-A column whose name literally contains the question's keyword is a stronger match than one that doesn't.
+Rules:
+- A column whose name literally contains the question's keyword is a stronger match than one that doesn't.
+- When the same column name exists in multiple tables, the column belonging to the entity the question asks about takes priority.
 
-For example: if question says "funding types" and there's "frpm.Charter Funding Type" but grounding uses "frpm.District Type" — that's a MISMATCH because "Charter Funding Type" literally contains "Funding Type".
-But if question says "race number 19" and there's a column "qualifying.number" — that's NOT a mismatch because "number" here means the race ID, not the column.
+For example:
+- Question asks for "X's attribute" and both TableX.attribute and TableY.attribute exist → prefer TableX (entity ownership)
+- Column name literally contains the question's keyword but grounding uses a different column → MISMATCH
+- A word in the question matches a column name but is clearly a filter value (e.g. "number 19") → NOT a mismatch
 
 Reply ONLY:
 - OK (if grounding columns are correct)

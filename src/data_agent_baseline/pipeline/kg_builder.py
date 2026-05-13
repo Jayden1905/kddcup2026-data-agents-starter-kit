@@ -519,8 +519,8 @@ You are a data dictionary expert. Given a database schema with sample values and
 optional domain knowledge, produce a short (≤12 words) semantic description for each column.
 
 Focus on disambiguating columns that could be confused with each other. \
-For columns whose meaning is obvious from the name (e.g. "id", "name"), return empty string "". \
-Only describe columns where the name is ambiguous or could be confused with another column. \
+For columns whose meaning is obvious AND unique across all tables, return empty string "". \
+ALWAYS describe columns that appear in MULTIPLE tables — explain how each table's version differs. \
 Each description must be ≤8 words.
 
 SCHEMA:
