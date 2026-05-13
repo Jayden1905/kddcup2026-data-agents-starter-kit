@@ -13,6 +13,7 @@ Score = Recall - λ * (Extra Columns / Predicted Columns)
 """
 
 import csv
+import json
 import re
 import sys
 from collections import Counter
@@ -151,10 +152,14 @@ def main():
         print(f"No task_* directories found in {pred_dir}")
         sys.exit(1)
 
+    input_dir = Path("data/public/input")
+
     scores: list[tuple[str, float]] = []
     perfect: list[str] = []
     partial: list[tuple[str, float, int, int, int]] = []
     zero: list[tuple[str, str]] = []
+    # Difficulty tracking: {difficulty: [scores]}
+    difficulty_scores: dict[str, list[float]] = {}
 
     for task in tasks:
         pred_file = pred_dir / task / "prediction.csv"
@@ -162,9 +167,21 @@ def main():
 
         if not gold_file.exists():
             continue
+
+        # Get difficulty
+        difficulty = "unknown"
+        task_json = input_dir / task / "task.json"
+        if task_json.exists():
+            try:
+                with open(task_json) as f:
+                    difficulty = json.load(f).get("difficulty", "unknown")
+            except Exception:
+                pass
+
         if not pred_file.exists():
             scores.append((task, 0.0))
             zero.append((task, "NO PREDICTION"))
+            difficulty_scores.setdefault(difficulty, []).append(0.0)
             continue
 
         try:
@@ -174,6 +191,7 @@ def main():
                 pred_cols, pred_rows, gold_cols, gold_rows
             )
             scores.append((task, score))
+            difficulty_scores.setdefault(difficulty, []).append(score)
             if score >= 1.0:
                 perfect.append(task)
             elif score > 0:
@@ -182,6 +200,7 @@ def main():
                 zero.append((task, f"matched=0/{g_count} pred_cols={p_count}"))
         except Exception as e:
             scores.append((task, 0.0))
+            difficulty_scores.setdefault(difficulty, []).append(0.0)
             zero.append((task, str(e)))
 
     if not scores:
@@ -217,6 +236,18 @@ def main():
     print(f"  Partial (0<s<1): {len(partial)}")
     print(f"  Zero (0.0):      {len(zero)}")
     print(f"{'='*60}")
+
+    if difficulty_scores:
+        print(f"\n{'='*60}")
+        print(f"  By Difficulty")
+        print(f"{'='*60}")
+        for diff in sorted(difficulty_scores.keys()):
+            d_scores = difficulty_scores[diff]
+            d_total = len(d_scores)
+            d_perfect = sum(1 for s in d_scores if s >= 1.0)
+            d_avg = sum(d_scores) / d_total if d_total else 0.0
+            print(f"  {diff:10s}: {d_perfect}/{d_total} perfect, avg={d_avg:.3f} ({d_avg*100:.1f}%)")
+        print(f"{'='*60}")
 
 
 if __name__ == "__main__":

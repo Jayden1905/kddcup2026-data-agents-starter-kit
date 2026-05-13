@@ -5,7 +5,7 @@ TEAM   ?= 1347
 VERSION ?= v1
 IMAGE  ?= $(TEAM):$(VERSION)
 
-.PHONY: install tui run run-bench status inspect lint fmt test docker-build docker-test docker-save
+.PHONY: install tui run run-bench status inspect lint fmt test score docker-build docker-test docker-save
 
 install:
 	uv sync
@@ -33,6 +33,12 @@ fmt:
 
 test:
 	uv run pytest
+
+PRED_DIR ?= artifacts/runs/local_output/local_output
+GOLD_DIR ?= data/public/output
+
+score:
+	uv run python score.py $(PRED_DIR) $(GOLD_DIR)
 
 docker-build:
 	podman build --no-cache --platform linux/amd64 -t $(IMAGE) .
