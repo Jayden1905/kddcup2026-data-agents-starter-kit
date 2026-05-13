@@ -634,8 +634,9 @@ QUESTION being answered: {question}""")
 
 
 # ---------------------------------------------------------------------------
-def _find_join_path(db_path: Path, table_a: str, table_b: str) -> str:
-    """Use BFS on FK graph to find join path between two tables. Returns e.g. 'expense.link_to_budget = budget.budget_id, budget.link_to_event = event.event_id'."""
+def _find_join_path(db_path: Path, table_a: str, table_b: str, allowed_tables: set[str] | None = None) -> str:
+    """Use BFS on FK graph to find join path between two tables. Returns e.g. 'expense.link_to_budget = budget.budget_id, budget.link_to_event = event.event_id'.
+    If allowed_tables is set, only traverse through those tables (start/end are always allowed)."""
     from collections import deque
     kg = build_kg_from_sqlite(db_path)
     # Build undirected graph: edges are (neighbor, join_clause)
@@ -661,6 +662,8 @@ def _find_join_path(db_path: Path, table_a: str, table_b: str) -> str:
                 joins = [c for _, c in path[1:]] + [clause]
                 return ", ".join(joins)
             if neighbor not in visited:
+                if allowed_tables and neighbor not in allowed_tables:
+                    continue
                 visited.add(neighbor)
                 queue.append(path + [(neighbor, clause)])
     return ""
@@ -1714,13 +1717,16 @@ RULES:
                     req_str = req if isinstance(req, str) else str(req)
                     if "." in req_str:
                         tables_needed.add(req_str.split(".")[0].lower())
+                allowed = {t.lower() for t in selected_tables} if selected_tables else None
                 if len(tables_needed) >= 2:
                     try:
                         join_paths = []
                         tables_list = sorted(tables_needed)
                         for i, t1 in enumerate(tables_list):
                             for t2 in tables_list[i + 1:]:
-                                path = _find_join_path(db_path, t1, t2)
+                                path = _find_join_path(db_path, t1, t2, allowed_tables=allowed)
+                                if not path:
+                                    path = _find_join_path(db_path, t1, t2)
                                 if path:
                                     join_paths.append(path)
                         if join_paths:
@@ -1732,19 +1738,23 @@ RULES:
         self._log("grounding_v1", json.dumps(grounding, default=str))
 
         # DETERMINISTIC: compute join paths from data_requirements using BFS on FK graph
+        # Restrict BFS to selected tables so it doesn't route through unrelated tables
         if db_path:
             data_reqs = grounding.get("data_requirements", [])
             tables_needed = set()
             for req in data_reqs:
                 if "." in req:
                     tables_needed.add(req.split(".")[0].lower())
+            allowed = {t.lower() for t in selected_tables} if selected_tables else None
             if len(tables_needed) >= 2:
                 try:
                     join_paths = []
                     tables_list = sorted(tables_needed)
                     for i, t1 in enumerate(tables_list):
                         for t2 in tables_list[i + 1:]:
-                            path = _find_join_path(db_path, t1, t2)
+                            path = _find_join_path(db_path, t1, t2, allowed_tables=allowed)
+                            if not path:
+                                path = _find_join_path(db_path, t1, t2)
                             if path:
                                 join_paths.append(path)
                     if join_paths:
@@ -1987,6 +1997,12 @@ If the question asks for something with a superlative (lowest, highest, most, le
                     if mc_rule:
                         selected.append(mc_rule)
                         selected_labels.append("multi_col")
+
+                if "singular_plural" not in selected_labels:
+                    sp_rule = next((r for l, r in SQL_RULES_LABELED if l == "singular_plural"), None)
+                    if sp_rule:
+                        selected.append(sp_rule)
+                        selected_labels.append("singular_plural")
 
                 if selected:
                     self._log("rules_selected", f"{len(selected)} rules: {selected_labels}")
@@ -3533,7 +3549,30 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
             else:
                 for cond, count_without in blockers:
                     diagnostics.append(f"REMOVE THIS FILTER: '{cond}' (without it: {count_without} rows)")
-                    diagnostics.append(f"  FIX: This filter excludes all rows. Remove it or use a different column.")
+                    # Show distinct values for the column in this filter so LLM can pick alternatives
+                    col_match = re.match(r"(\w+\.)?(\w+)\s*=\s*'([^']*)'", cond.strip())
+                    if col_match:
+                        tbl_prefix = col_match.group(1) or ""
+                        col_name = col_match.group(2)
+                        # Find which table has this column in the base SQL
+                        for tbl_row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                            tbl = tbl_row[0]
+                            if tbl_prefix and tbl_prefix.rstrip(".").lower() not in sql.lower():
+                                continue
+                            try:
+                                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()]
+                                if col_name in cols:
+                                    vals = conn.execute(
+                                        f'SELECT DISTINCT "{col_name}" FROM "{tbl}" WHERE "{col_name}" IS NOT NULL AND "{col_name}" != \'\' LIMIT 10'
+                                    ).fetchall()
+                                    if vals:
+                                        distinct = [str(v[0]) for v in vals]
+                                        diagnostics.append(f"  FIX: Available values in {tbl}.{col_name}: {distinct}")
+                                    break
+                            except Exception:
+                                pass
+                    else:
+                        diagnostics.append(f"  FIX: This filter excludes all rows. Remove it or use a different column.")
         finally:
             conn.close()
 
