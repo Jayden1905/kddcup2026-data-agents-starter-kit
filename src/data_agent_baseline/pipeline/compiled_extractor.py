@@ -1,13 +1,16 @@
-"""Multi-agent chunked extraction pipeline.
+"""Semantic extraction pipeline with context-window-aware batching.
 
 Architecture:
-  1. PLANNER — analyzes doc structure + question, determines schema and chunking
-  2. WORKERS — extract records from chunks in parallel (8 threads)
-  3. VALIDATOR — checks completeness, finds IDs with missing fields
-  4. REPAIR — retries gaps with few-shot examples from successful extractions
+  1. PLANNER — analyzes doc structure + question, determines schema
+  2. BATCHER — splits by entity boundaries (paragraphs), packs into batches
+     respecting a context budget (prompt + content + output headroom)
+  3. WORKERS — extract records from batches in parallel (8 threads)
+  4. VALIDATOR — checks completeness, finds IDs with missing fields
+  5. REPAIR — retries gaps with few-shot examples from successful extractions
 
-Each LLM call is small (~1-3KB). Robust because LLM handles format variations
-natively. Multi-pass ensures high coverage.
+Batching is context-window aware: each batch fills up to `max_batch_content_chars`
+(default 6000) of entity paragraphs, leaving room for prompt template (~2K) and
+output (~2K). Short paragraphs get more entities per batch; long paragraphs fewer.
 """
 
 from __future__ import annotations
@@ -41,10 +44,12 @@ DOCUMENT SAMPLE (from different sections of the document):
 ---
 
 First, reason step by step inside <think> tags:
-- What entity does each record represent?
+- What entity does each record represent? (One paragraph = one entity record)
 - What column names appear in the EXISTING DATABASE TABLES or RELEVANT KNOWLEDGE above? List them ALL exactly as written.
 - Which of those columns can be populated from this document?
 - What does the _id look like in this document? Does it match any foreign key in the database tables?
+- Does the document contain CORRECTIONS (e.g. "initially X, corrected to Y")? If so, the FINAL value should be used.
+- Are there NaN/missing values? Those become NULL.
 
 Then return ONLY a JSON object:
 {{"entity": "name of entity", "fields": ["_id", "field1", "field2", ...], "id_description": "how _id appears in text"}}
@@ -55,9 +60,10 @@ CRITICAL RULES:
 - CATEGORICAL FIELDS: If the document assigns each record to a category/type/class (e.g. "categorized as X", "designated for Y", "classified as Z"), you MUST include that as a field. Name it to match the knowledge/schema (e.g. "category", "type").
 - FOREIGN KEYS: If records reference entities from the existing database (e.g. event names, member IDs), include a link field (e.g. "link_to_event", "event_id") matching the schema convention.
 - AMOUNTS: If the knowledge defines a field name for monetary values (e.g. "amount"), use that name — not synonyms like "allocation" or "budget_value".
+- If a field has DATE values in prose (e.g. "tenth of February, 1986"), include it — workers will convert to ISO format.
 - Always include "_id" as the first field."""
 
-WORKER_PROMPT = """Extract ALL records from this chunk as JSON array.
+WORKER_PROMPT = """Extract ALL records from this text as a JSON array.
 
 ENTITY: {entity}
 FIELDS TO EXTRACT: {fields}
@@ -69,23 +75,26 @@ ID FORMAT: {id_description}
 
 {schema_hint}
 
-TEXT CHUNK:
+TEXT (each section separated by --- is ONE record):
 ---
 {chunk_text}
 ---
 
 RULES:
-1. Return a JSON array. Each object = one {entity}.
-2. Extract EVERY {entity} — each paragraph typically describes one. Do NOT skip any.
+1. Return a JSON array. Each object = one {entity}. Each section between --- separators = one record.
+2. Extract EVERY {entity} — do NOT skip any section.
 3. ONLY use the field names listed above. Do NOT add extra fields.
 4. "_id" must be the EXACT identifier from the text — preserve original format.
-5. If text has corrections ("initially X, corrected/amended to Y"), use the FINAL corrected value only.
-6. Values should be clean atomic data (numbers, names, IDs), not prose.
-7. For FK/link fields: if VALID REFERENCES are listed above, use the ID value (e.g. "recXYZ"), NOT the name.
-8. For category/type fields: look for phrases like "categorized as X", "classified as X", "designated for X", "type of X". Extract ONLY the short label (e.g. "Advertisement", "Food"), NOT surrounding prose.
-9. For numeric fields (amount, cost, spent, remaining): extract the NUMBER only. Look for "amount of 75", "spent value of 67.81", "balance of 7.19" etc.
-10. If a value is described as placeholder, missing, or 0.0 with a note it's inaccurate, use null.
-11. If no records in this chunk, return: []
+5. CORRECTIONS: When text says "initially X" / "first logged as X" then "corrected to Y" / "amended to Y" / "confirmed at Y" / "rectified to Y", use ONLY the FINAL corrected value Y.
+6. MISSING DATA: If a value is "not available", "NaN", "not recorded", "unavailable", or entire panel is missing, use null for that field.
+7. NOISE FILTERING: Ignore irrelevant sentences about hobbies, library books, parking, furniture, weather, travel, exercise, diet, or office logistics. Only extract the actual data fields.
+8. Values should be clean atomic data (numbers, names, IDs), not prose.
+9. For FK/link fields: if VALID REFERENCES are listed above, use the ID value (e.g. "recXYZ"), NOT the name.
+10. For category/type fields: look for phrases like "categorized as X", "classified as X", "designated for X". Extract ONLY the short label (e.g. "Advertisement", "Food").
+11. For numeric fields: extract the NUMBER only. Look for "amount of 75", "value of 67.81", "level at 28.0" etc.
+12. DATES: Convert natural language dates to ISO format (YYYY-MM-DD). "tenth of February, 1986" → "1986-02-10".
+13. PARTIAL RECORDS ARE VALID: If some fields are not mentioned in the text, use null for those fields. Still extract the record with _id and whatever fields ARE present. Do NOT skip a record just because some fields are missing.
+14. If no entities at all in this text, return: []
 
 Return ONLY the JSON array, nothing else."""
 
@@ -109,40 +118,72 @@ If none of these IDs appear in this chunk, return: []"""
 
 
 # ---------------------------------------------------------------------------
-# Document chunking
+# Document chunking — entity-boundary aware, context-window constrained
 # ---------------------------------------------------------------------------
 
-def _chunk_document(text: str, max_chunk_chars: int = 3000) -> list[str]:
-    """Split a markdown document into chunks, respecting structure."""
+def _split_paragraphs(text: str) -> list[str]:
+    """Split document into paragraphs. LLM decides what's an entity vs noise."""
     sections = re.split(r"(?=^#{1,4}\s)", text, flags=re.MULTILINE)
 
     paragraphs: list[str] = []
     for section in sections:
         parts = [p.strip() for p in re.split(r"\n\s*\n", section)]
         for p in parts:
-            if len(p) < 60:
-                continue
-            paragraphs.append(p)
+            if len(p) >= 60:
+                paragraphs.append(p)
+    return paragraphs
 
+
+def _batch_paragraphs(
+    paragraphs: list[str], max_batch_content_chars: int = 6000
+) -> list[str]:
+    """Pack entity paragraphs into batches respecting context budget.
+
+    Each batch contains multiple paragraphs separated by \\n\\n---\\n\\n
+    so the LLM can clearly see entity boundaries. The budget ensures
+    total content fits within the model's context window alongside
+    prompt template (~2K chars) and output headroom (~2K chars).
+    """
     if not paragraphs:
         return []
 
-    chunks: list[str] = []
+    batches: list[str] = []
     current: list[str] = []
     current_len = 0
 
     for para in paragraphs:
-        if current_len + len(para) > max_chunk_chars and current:
-            chunks.append("\n\n".join(current))
+        para_len = len(para) + 7  # account for \n\n---\n\n separator
+        if current and current_len + para_len > max_batch_content_chars:
+            batches.append("\n\n---\n\n".join(current))
             current = []
             current_len = 0
         current.append(para)
-        current_len += len(para) + 2
+        current_len += para_len
 
     if current:
-        chunks.append("\n\n".join(current))
+        batches.append("\n\n---\n\n".join(current))
 
-    return chunks
+    return batches
+
+
+def _chunk_document(text: str, max_chunk_chars: int = 6000) -> list[str]:
+    """Split document into context-aware batches of entity paragraphs.
+
+    Falls back to simple paragraph grouping if no entity paragraphs found.
+    """
+    paragraphs = _split_paragraphs(text)
+    if paragraphs:
+        return _batch_paragraphs(paragraphs, max_batch_content_chars=max_chunk_chars)
+
+    # Fallback: any paragraph over 60 chars, batched
+    all_paras = [
+        p.strip()
+        for p in re.split(r"\n\s*\n", text)
+        if len(p.strip()) >= 60
+    ]
+    if not all_paras:
+        return []
+    return _batch_paragraphs(all_paras, max_batch_content_chars=max_chunk_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +553,7 @@ def _run_workers(
             db_context=db_context,
             fk_lookup=fk_lookup,
             schema_hint=schema_hint,
-            chunk_text=chunk[:3000],
+            chunk_text=chunk,
         )
         messages = [ModelMessage(role="user", content=prompt)]
         try:
@@ -528,32 +569,42 @@ def _run_workers(
                 log_fn("worker_error", f"chunk {i+1}: {str(e)[:150]}")
             return i, []
 
-    # First chunk sequentially to get an example
+    # First batch sequentially to get an example for schema hint
     if chunks:
+        expected_entities = chunks[0].count("\n\n---\n\n") + 1
         _, first_records = _extract_chunk((0, chunks[0]))
         if first_records:
             all_records.extend(first_records)
         else:
             failed_chunks.append(0)
         if log_fn:
-            log_fn("worker_done", f"chunk 1/{len(chunks)}: {len(first_records)} records")
+            log_fn(
+                "worker_done",
+                f"batch 1/{len(chunks)}: {len(first_records)}/{expected_entities} records extracted"
+                + (f" | sample: {json.dumps(first_records[0], default=str)[:200]}" if first_records else ""),
+            )
 
-    # Remaining chunks in parallel
+    # Remaining batches in parallel
     remaining = [(i, chunk) for i, chunk in enumerate(chunks) if i > 0]
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(_extract_chunk, ic): ic for ic in remaining}
         for future in as_completed(futures):
             i, records = future.result()
+            expected = chunks[i].count("\n\n---\n\n") + 1
             if records:
                 all_records.extend(records)
             else:
                 failed_chunks.append(i)
             if log_fn:
-                log_fn("worker_done", f"chunk {i+1}/{len(chunks)}: {len(records)} records")
+                log_fn("worker_done", f"batch {i+1}/{len(chunks)}: {len(records)}/{expected} records")
 
     if log_fn:
-        log_fn("workers_complete", f"{len(all_records)} records, {len(failed_chunks)} empty chunks")
+        log_fn(
+            "workers_complete",
+            f"{len(all_records)} total records from {len(chunks)} batches "
+            f"({len(failed_chunks)} empty batches)",
+        )
 
     # Normalize _id: if most IDs are numeric, strip surrounding text from non-numeric ones
     id_values = [str(r.get("_id", "")) for r in all_records if r.get("_id")]
@@ -656,7 +707,7 @@ def _run_repair(
             missing_ids=missing_summary,
             example_record=example_str,
             fields=fields_str,
-            chunk_text=chunk[:3000],
+            chunk_text=chunk,
         )
         messages = [ModelMessage(role="user", content=prompt)]
         try:
@@ -714,14 +765,28 @@ def chunked_extract(
     if len(text) < 100:
         return 0
 
-    chunks = _chunk_document(text)
+    # Entity-boundary splitting + context-aware batching
+    entity_paras = _split_paragraphs(text)
+    if entity_paras:
+        chunks = _batch_paragraphs(entity_paras)
+    else:
+        chunks = _chunk_document(text)
+
     if not chunks:
         if log_fn:
-            log_fn("chunk_skip", f"{doc_path.stem}: no paragraphs")
+            log_fn("chunk_skip", f"{doc_path.stem}: no entity paragraphs found")
         return 0
 
     if log_fn:
-        log_fn("orchestrator_start", f"{doc_path.stem}: {len(text)} chars, {len(chunks)} chunks")
+        avg_para_len = sum(len(p) for p in entity_paras) // max(1, len(entity_paras)) if entity_paras else 0
+        batch_sizes = [batch.count("\n\n---\n\n") + 1 for batch in chunks]
+        log_fn(
+            "batching",
+            f"{doc_path.stem}: {len(text)} chars, {len(entity_paras)} entities "
+            f"(avg {avg_para_len} chars/entity) → {len(chunks)} batches "
+            f"(entities/batch: min={min(batch_sizes)}, max={max(batch_sizes)}, "
+            f"avg={sum(batch_sizes)//len(batch_sizes)})",
+        )
 
     knowledge_hint = _build_knowledge_hint(question, knowledge_text)
     db_context = _get_existing_db_context(db_path)
@@ -860,7 +925,7 @@ def _write_records(
                 merged[rid_str] = dict(r)
             else:
                 for k, v in r.items():
-                    if v is not None:
+                    if v is not None and v != "":
                         merged[rid_str][k] = v
         if log_fn:
             all_fields = set()
@@ -981,14 +1046,23 @@ def compiled_extract_docs(
     log_fn: Callable[[str, str], None] | None = None,
     structured_tables: list[str] | None = None,
 ) -> int:
-    """Extract all docs using multi-agent approach."""
+    """Extract all docs using semantic entity-boundary extraction."""
     if not doc_paths:
         return 0
+
+    import time
 
     protected = {t.lower() for t in structured_tables} if structured_tables else set()
     total = 0
 
+    if log_fn:
+        log_fn(
+            "extraction_start",
+            f"{len(doc_paths)} docs to extract: {[p.name for p in doc_paths]}",
+        )
+
     for doc_path in doc_paths:
+        t0 = time.time()
         n = chunked_extract(
             doc_path=doc_path,
             db_path=db_path,
@@ -998,7 +1072,13 @@ def compiled_extract_docs(
             log_fn=log_fn,
             protected_tables=protected,
         )
+        elapsed = time.time() - t0
         total += n
+        if log_fn:
+            log_fn(
+                "doc_extracted",
+                f"{doc_path.name}: {n} records in {elapsed:.1f}s",
+            )
 
     if log_fn:
         log_fn("extraction_done", f"Total: {total} records from {len(doc_paths)} docs")

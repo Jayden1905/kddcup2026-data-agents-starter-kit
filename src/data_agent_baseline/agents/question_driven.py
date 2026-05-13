@@ -229,9 +229,19 @@ DATABASE SCHEMA:
 {sample_section}
 {anchor_section}
 {previous_attempt}
-Decompose the question into a structured plan. Return ONLY a JSON object:
+Decompose the question into a structured plan.
+
+FIRST, break down the question phrase by phrase:
+- For EACH noun/phrase the user asks for, identify which SPECIFIC table.column it maps to.
+- "type of X" → does a column literally named "type" exist? In which table? Is it a label on the entity or a GROUP BY dimension?
+- "total value" / "total cost" → SUM of which column?
+- "for event X" → filter condition on which table?
+- Distinguish lookup vs aggregation: "Identify the type" = SELECT type (lookup). "for each type" / "by type" = GROUP BY.
+
+Return ONLY a JSON object:
 {{
   "what_user_wants": "restate EXACTLY what output the user expects — only columns explicitly mentioned",
+  "phrase_mapping": {{"quoted phrase from question": "table.column it maps to — with reasoning if ambiguous"}},
   "expected_output": {{"columns": "number", "description": "brief"}},
   "computation_type": "one of: simple_lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | comparison | multi_step",
   "formula": "plain-language formula — WHAT to compute, not SQL. e.g. 'event with lowest cost', 'AVG(Consumption) / 12'",
@@ -267,6 +277,7 @@ RULES:
 - RATIO: "How many times X more than Y" = X/Y (division, not subtraction).
 - AGGREGATION GRAIN: AVG of entity attribute → query entity table with subquery filter. Don't join to detail tables (duplicates).
 - OUTPUT: "X and Y?" = TWO columns. Each requested value = one column.
+- GRAIN CONSISTENCY: All requested outputs must be at the same level of detail. If the question does NOT say "for each", "per", "by", or "breakdown", assume all outputs are at the SAME grain (no GROUP BY on any of them). Only GROUP BY when the question explicitly asks for a per-group result.
 - TEMPORAL: "last/most recent" = ORDER BY DESC LIMIT 1.
 - MONTHLY vs YEARLY: If DOMAIN KNOWLEDGE defines a formula with /12, ALWAYS include /12. Do NOT skip it based on data granularity.
 - HAVING: "where the average exceeds N" = GROUP BY + HAVING, not per-row WHERE.
@@ -275,6 +286,7 @@ RULES:
 - COLUMN NAME PRIORITY: If a column name in ANY table exactly matches a word in the question, prefer it over semantically similar columns in other tables. Literal name match > inferred meaning.
 - PARTIAL MATCH: "X-related" / "from X" with proper noun → LIKE '%X%'. Exact match only for "named X" / "is X".
 - SAME-NAME COLUMNS: When multiple tables have the SAME column name, read the question language to decide which table to SELECT from. "the patient's X" → Patient.X. "the exam's X" → Exam.X. The subject/possessive in the question is authoritative.
+- PHRASE MAPPING: "the type of X" / "identify the type" = SELECT the literal `type` column of the entity being asked about. This is a LOOKUP, not a GROUP BY. Only use GROUP BY if the question says "for each type" / "by type" / "per type" / "breakdown".
 """.strip()
 
 def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, anchor_text: str = "") -> str:
@@ -678,6 +690,19 @@ def _apply_null_guard(sql: str) -> str:
         return f"{prefix} WHERE {col} IS NOT NULL AND {col} != '' {suffix}"
 
 
+_SINGLE_ROW_TYPES = {"count", "count_distinct", "sum", "avg", "ratio", "percentage", "min_max", "simple_lookup", "total"}
+
+
+def _expects_single_row(grounding_context: str) -> bool:
+    """Check if grounding indicates the result should be a single row."""
+    m = re.search(r"COMPUTATION TYPE:\s*(\w+)", grounding_context)
+    if m and m.group(1).lower() in _SINGLE_ROW_TYPES:
+        return True
+    # Check for explicit single-row signals in grounding text
+    lower = grounding_context.lower()
+    if re.search(r"(single row|one row|a single|two values|one value|summary values|the total|overall total)", lower):
+        return True
+    return False
 
 
 # Agent
@@ -757,7 +782,7 @@ class QuestionDrivenAgent:
                 except Exception:
                     pass
 
-            # Step 3: Doc extraction (compiled: LLM writes rules, engine runs them)
+            # Step 3: Doc extraction (batch LLM with entity-boundary awareness)
             if ctx.doc_sources:
                 doc_paths = [doc.path for doc in ctx.doc_sources]
                 from data_agent_baseline.pipeline.compiled_extractor import (
@@ -772,19 +797,6 @@ class QuestionDrivenAgent:
                     log_fn=self._log,
                     structured_tables=structured_tables,
                 )
-                # Fallback: if compiled extraction got nothing, try hybrid LLM approach
-                if n_extracted == 0:
-                    from data_agent_baseline.pipeline.llm_extractor import (
-                        hybrid_extract_docs,
-                    )
-                    hybrid_extract_docs(
-                        doc_paths=doc_paths,
-                        db_path=db_path,
-                        model=self.model,
-                        knowledge_text=ctx.knowledge_text,
-                        log_fn=self._log,
-                        structured_tables=structured_tables,
-                    )
 
             # Step 4: Build KG from full DB (deterministic)
             kg = build_kg_from_sqlite(db_path)
@@ -1050,9 +1062,20 @@ class QuestionDrivenAgent:
                         failed_sqls.append(current_sql)
                         step_gaps = f"- Query returned only NULL values\n- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
                     elif is_final:
-                        step_succeeded = True
-                        self._log("step_final", f"cols={cols}, rows={len(rows)}")
-                        return result, current_sql, failed_sqls
+                        # Check if row count matches expected grain
+                        if len(rows) > 5 and _expects_single_row(grounding_context):
+                            self._log("step_grain_mismatch", f"Step {i+1}: expected 1 row but got {len(rows)}")
+                            failed_sqls.append(current_sql)
+                            step_gaps = (
+                                f"- GRAIN MISMATCH: Expected a single aggregated row but got {len(rows)} rows.\n"
+                                f"- Your GROUP BY produced per-group results instead of one overall result.\n"
+                                f"- Fix: wrap in a subquery and apply the final AVG/SUM/COUNT on the outer query.\n"
+                                f"- CONFIRMED FACTS: {'; '.join(confirmed_facts)}"
+                            )
+                        else:
+                            step_succeeded = True
+                            self._log("step_final", f"cols={cols}, rows={len(rows)}")
+                            return result, current_sql, failed_sqls
                     else:
                         # Verification step (non-final) — record confirmed values
                         step_succeeded = True

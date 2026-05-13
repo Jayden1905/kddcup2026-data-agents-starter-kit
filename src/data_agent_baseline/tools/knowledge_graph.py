@@ -549,6 +549,34 @@ def _attach_sqlite_db(conn: sqlite3.Connection, db_path: Path, alias: str) -> li
         return []
 
 
+_QUANTITY_KW = re.compile(
+    r"(count|total|num|score|votes|views|amount|quantity|likes|followers|"
+    r"impressions|clicks|visits|downloads|subscribers|reactions|shares|posts|"
+    r"comments|answers|favorites|bounty|points|rating)",
+    re.IGNORECASE,
+)
+_ID_COLUMN = re.compile(r"(^id$|_id$|Id$|ID$|key$|Key$|index$|Index$)", re.IGNORECASE)
+_INTEGER_TYPES = re.compile(r"^(int|integer|numeric|real|float|double|decimal)", re.IGNORECASE)
+
+
+def _coalesce_quantity_nulls(conn: sqlite3.Connection) -> None:
+    """Replace NULL with 0 for quantity/accumulator columns (INTEGER-typed with quantity-like names)."""
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    for (table,) in tables:
+        cols = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        for col_info in cols:
+            col_name = col_info[1]
+            col_type = col_info[2] or ""
+            if (_INTEGER_TYPES.match(col_type) and _QUANTITY_KW.search(col_name)
+                    and not _ID_COLUMN.search(col_name)):
+                conn.execute(
+                    f'UPDATE "{table}" SET "{col_name}" = 0 WHERE "{col_name}" IS NULL'
+                )
+    conn.commit()
+
+
 def consolidate_to_sqlite(context_dir: Path, output_dir: Path | None = None) -> Path | None:
     csv_files = sorted(
         p for p in context_dir.rglob("*.csv") if not p.name.startswith("_")
@@ -607,6 +635,7 @@ def consolidate_to_sqlite(context_dir: Path, output_dir: Path | None = None) -> 
             for t in tables:
                 loaded_tables.append(f"{t} (from {existing_db.name})")
 
+        _coalesce_quantity_nulls(conn)
         conn.close()
     except Exception:
         conn.close()
