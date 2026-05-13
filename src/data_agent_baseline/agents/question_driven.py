@@ -1634,7 +1634,7 @@ RULES:
                         self._validate_filter_values, db_path, grounding
                     )
                 futures["col_priority"] = pool.submit(
-                    self._check_column_name_priority, db_path, question, grounding
+                    self._check_column_name_priority, db_path, question, grounding, knowledge_guidance
                 )
                 for key, fut in futures.items():
                     try:
@@ -1663,11 +1663,15 @@ RULES:
                     self._log("grounding_patch", f"{wrong_table}.{wrong_col} → {correct_table}.{correct_col}")
 
                     grounding_str = json.dumps(grounding, default=str)
-                    grounding_str = grounding_str.replace(
-                        f"{wrong_table}.{wrong_col}", f"{correct_table}.{correct_col}"
+                    table_col_pattern = re.compile(
+                        re.escape(f"{wrong_table}.{wrong_col}"), re.IGNORECASE
+                    )
+                    grounding_str = table_col_pattern.sub(
+                        f"{correct_table}.{correct_col}", grounding_str
                     )
                     if wrong_col != correct_col:
-                        grounding_str = grounding_str.replace(wrong_col, correct_col)
+                        pattern = r'(?<![a-zA-Z0-9_])' + re.escape(wrong_col) + r'(?![a-zA-Z0-9_])'
+                        grounding_str = re.sub(pattern, correct_col, grounding_str, flags=re.IGNORECASE)
 
                     fixed = self._parse_json(grounding_str)
                     if isinstance(fixed, dict) and fixed:
@@ -1815,26 +1819,31 @@ RULES:
         # and the question uses a word matching that column, but the formula uses a different column,
         # fix the known_values and formula to use the correct column.
         if grounding:
+            self._log("disambig_input", f"formula={grounding.get('formula','')[:100]} | knowledge={bool(knowledge_text)}")
             col_override, fix_info = self._check_column_disambiguation(question, grounding, kg_context, knowledge_text)
+            self._log("disambig_result", f"override={col_override[:100] if col_override else 'None'} | fix_info={fix_info}")
             if col_override and fix_info:
                 self._log("grounding_col_disambig", col_override)
                 wrong_col = fix_info["wrong_col"]
                 correct_col = fix_info["correct_col"]
                 val = fix_info["val"]
+
+                # Patch the entire grounding dict with word-boundary replacement
+                grounding_str = json.dumps(grounding, default=str)
+                pattern = r'(?<![a-zA-Z0-9_])' + re.escape(wrong_col) + r'(?![a-zA-Z0-9_])'
+                grounding_str = re.sub(pattern, correct_col, grounding_str, flags=re.IGNORECASE)
+                fixed = self._parse_json(grounding_str)
+                if isinstance(fixed, dict) and fixed:
+                    grounding = fixed
+
+                # Fix known_values keys (json replace doesn't rename dict keys reliably)
                 known_values = grounding.get("known_values", {})
                 for key in list(known_values.keys()):
-                    if key.lower().endswith(f".{wrong_col}"):
+                    if key.lower().endswith(f".{wrong_col.lower()}"):
                         table = key.split(".")[0]
                         known_values[f"{table}.{correct_col}"] = known_values.pop(key)
                         break
-                formula = grounding.get("formula", "")
-                if formula:
-                    grounding["formula"] = re.sub(
-                        rf'\b{re.escape(wrong_col)}\b',
-                        correct_col,
-                        formula,
-                        flags=re.IGNORECASE,
-                    )
+
                 # Remove conflicting domain_rules that mention the wrong column
                 domain_rules = grounding.get("domain_rules", [])
                 grounding["domain_rules"] = [
@@ -2234,7 +2243,7 @@ Select 2-5 tables. Include linking/bridge tables needed for JOINs."""
         return grounding
 
     def _check_column_name_priority(
-        self, db_path: Path, question: str, grounding: dict[str, Any]
+        self, db_path: Path, question: str, grounding: dict[str, Any], knowledge_guidance: str = ""
     ) -> str:
         """LLM check: does the grounding use the right column for the question's measure?
         Returns feedback string if there's a mismatch, empty string if OK."""
@@ -2260,25 +2269,42 @@ Select 2-5 tables. Include linking/bridge tables needed for JOINs."""
         except Exception:
             return ""
 
-        data_reqs_str = ", ".join(str(r) for r in data_reqs)
-        prompt = f"""QUESTION: {question}
+        knowledge_section = ""
+        if knowledge_guidance:
+            knowledge_section = f"\n\nDOMAIN KNOWLEDGE (authoritative column definitions):\n{knowledge_guidance}\n"
 
+        data_reqs_str = ", ".join(str(r) for r in data_reqs)
+        what_user_wants = grounding.get("what_user_wants", "")
+        phrase_mapping = grounding.get("phrase_mapping", {})
+        phrase_section = ""
+        if phrase_mapping:
+            mapping_lines = [f"  \"{k}\" → {v}" for k, v in phrase_mapping.items()]
+            phrase_section = f"\nGROUNDING phrase-to-column mapping:\n" + "\n".join(mapping_lines) + "\n"
+        goal_section = ""
+        if what_user_wants:
+            goal_section = f"\nGROUNDING interpretation: {what_user_wants}\n"
+
+        prompt = f"""QUESTION (original): {question}
+{goal_section}{phrase_section}
 GROUNDING chose these columns: {data_reqs_str}
 GROUNDING formula: {formula}
 
 ALL columns in database:
-{chr(10).join(all_cols)}
+{chr(10).join(all_cols)}{knowledge_section}
 
 Is there a column in the database that better matches a word/phrase in the question, but was NOT chosen by the grounding?
 
 Check ALL of these:
-1. Metric/measure columns (e.g. "up votes" should use a column with "UpVotes" in the name)
-2. Output/attribute columns (e.g. "funding types" should use a column with "Funding Type" in the name, not "District Type")
-3. Entity ownership: when the question asks for a property of an entity (e.g. "the patient's diagnosis"), prefer the column from that entity's own table (e.g. Patient.Diagnosis) over the same column in a related table (e.g. Examination.Diagnosis)
+1. Metric/measure columns: a word in the question matches a column name better than the one chosen
+2. Output/attribute columns: the grounding uses a column that doesn't match the question's requested attribute
+3. Entity ownership: when the question asks for a property of entity X and both TableX.col and TableY.col exist, prefer TableX
+4. Domain-defined semantics: if DOMAIN KNOWLEDGE explicitly defines what a column means, and the question uses that word, the grounding MUST use the domain-defined column
 
 Rules:
 - A column whose name literally contains the question's keyword is a stronger match than one that doesn't.
 - When the same column name exists in multiple tables, the column belonging to the entity the question asks about takes priority.
+- Domain knowledge definitions are AUTHORITATIVE — they override assumptions based on general English.
+- A word in the question that matches a column name but is clearly a filter value (not a requested output) → NOT a mismatch.
 - Check EVERY output column in the grounding independently. Report ALL mismatches, not just the first one.
 
 For example:
@@ -2641,6 +2667,7 @@ RULES:
         """
         formula = grounding.get("formula", "")
         if not formula or not knowledge_text:
+            self._log("disambig_bail", f"no formula or knowledge: formula={bool(formula)} knowledge={bool(knowledge_text)}")
             return "", None
 
         q_lower = question.lower()
@@ -2658,6 +2685,7 @@ RULES:
             col_definitions[col_name] = definition
 
         if not col_definitions:
+            self._log("disambig_bail", "no col_definitions found")
             return "", None
 
         # Get all real column names from kg_context
@@ -2667,6 +2695,8 @@ RULES:
                 col = line.strip()[2:].split(" ")[0].strip().lower()
                 if col:
                     schema_cols.add(col)
+
+        self._log("disambig_cols", f"defined={list(col_definitions.keys())[:10]} schema={sorted(list(schema_cols))[:15]}")
 
         # Find question words that match defined columns via prefix/stem
         matched_col = ""
@@ -2681,16 +2711,21 @@ RULES:
                 break
 
         if not matched_col:
+            self._log("disambig_bail", f"no matched_col. q_words={sorted(q_words)}")
             return "", None
 
         # Check if the matched column is already in the formula WHERE
         where_match = re.search(r'where\b(.+)', formula_lower, re.DOTALL)
         if not where_match:
+            self._log("disambig_bail", f"no WHERE in formula: {formula_lower[:100]}")
             return "", None
 
         where_clause = where_match.group(1)
         if re.search(rf'\b{re.escape(matched_col)}\b', where_clause):
+            self._log("disambig_bail", f"matched_col '{matched_col}' already in WHERE: {where_clause[:100]}")
             return "", None
+
+        self._log("disambig_proceed", f"matched_col={matched_col} where={where_clause[:100]}")
 
         # The matched column is NOT in WHERE. Check if a DIFFERENT column with a small numeric filter
         # is being used that could be confusable (e.g., ordinal values like 1,2,3)
