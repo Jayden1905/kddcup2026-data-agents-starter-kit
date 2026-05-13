@@ -1390,6 +1390,20 @@ RULES:
             self._log("answer_schema", f"Invalid indices {keep_indices}, using raw")
             return self._raw_result_to_answer(data_result)
 
+        # Drop columns whose values look like raw FK IDs (alphanumeric hashes not asked for)
+        if len(keep_indices) > 1 and rows:
+            cleaned = []
+            for i in keep_indices:
+                col_name = columns[i].lower()
+                # Check if column name suggests FK/ID and values look like hashes
+                if ("link_to" in col_name or col_name.endswith("_id")) and col_name not in question.lower():
+                    sample_vals = [str(row[i]) for row in rows[:5] if i < len(row)]
+                    if sample_vals and all(re.match(r'^rec[A-Za-z0-9]{10,}$', v) for v in sample_vals):
+                        continue
+                cleaned.append(i)
+            if cleaned:
+                keep_indices = cleaned
+
         # Use SQL column names directly
         output_names = [columns[i] for i in keep_indices]
 
