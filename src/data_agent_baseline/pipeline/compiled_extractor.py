@@ -58,6 +58,7 @@ CRITICAL RULES:
 - Field names MUST match the database schema / knowledge definitions exactly. Copy the exact column names character for character (e.g. "height_cm" not "height", "publisher_id" not "publisher").
 - Include ALL columns that this document could populate, even if only some records have them.
 - CATEGORICAL FIELDS: If the document assigns each record to a category/type/class (e.g. "categorized as X", "designated for Y", "classified as Z"), you MUST include that as a field. Name it to match the knowledge/schema (e.g. "category", "type").
+- STATUS/QUALIFIER FIELDS: If the document assigns qualitative assessments to numeric values (e.g. "normal", "abnormal", "elevated", "impaired", "within range", "exceeds threshold", "below average"), include a corresponding status field named "<measurement>_status". This captures the document's own judgment rather than requiring threshold inference later.
 - FOREIGN KEYS: If records reference entities from the existing database (e.g. event names, member IDs), include a link field (e.g. "link_to_event", "event_id") matching the schema convention.
 - AMOUNTS: If the knowledge defines a field name for monetary values (e.g. "amount"), use that name — not synonyms like "allocation" or "budget_value".
 - If a field has DATE values in prose (e.g. "tenth of February, 1986"), include it — workers will convert to ISO format.
@@ -92,6 +93,7 @@ RULES:
 9. For FK/link fields: if VALID REFERENCES are listed above, use the ID value (e.g. "recXYZ"), NOT the name.
 10. For category/type fields: look for phrases like "categorized as X", "classified as X", "designated for X". Extract ONLY the short label (e.g. "Advertisement", "Food").
 11. For numeric fields: extract the NUMBER only. Look for "amount of 75", "value of 67.81", "level at 28.0" etc.
+15. For STATUS fields (any field ending in _status): derive from the text's qualitative assessment of that measurement. Positive/good assessments (e.g. "normal", "within range", "healthy", "unremarkable") → "normal". Negative/bad assessments (e.g. "elevated", "impaired", "compromised", "abnormal", "deficient") → "abnormal". Uncertain/edge assessments (e.g. "borderline", "upper limit") → "borderline". If the text makes no qualitative statement about that value, use null.
 12. DATES: Convert natural language dates to ISO format (YYYY-MM-DD). "tenth of February, 1986" → "1986-02-10".
 13. PARTIAL RECORDS ARE VALID: If some fields are not mentioned in the text, use null for those fields. Still extract the record with _id and whatever fields ARE present. Do NOT skip a record just because some fields are missing.
 14. If no entities at all in this text, return: []
