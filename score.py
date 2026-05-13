@@ -155,9 +155,9 @@ def main():
     input_dir = Path("data/public/input")
 
     scores: list[tuple[str, float]] = []
-    perfect: list[str] = []
-    partial: list[tuple[str, float, int, int, int]] = []
-    zero: list[tuple[str, str]] = []
+    n_perfect = 0
+    # Failed tasks: {difficulty: [(task, detail_str)]}
+    failed_by_difficulty: dict[str, list[tuple[str, str]]] = {}
     # Difficulty tracking: {difficulty: [scores]}
     difficulty_scores: dict[str, list[float]] = {}
 
@@ -180,7 +180,7 @@ def main():
 
         if not pred_file.exists():
             scores.append((task, 0.0))
-            zero.append((task, "NO PREDICTION"))
+            failed_by_difficulty.setdefault(difficulty, []).append((task, "NO PREDICTION"))
             difficulty_scores.setdefault(difficulty, []).append(0.0)
             continue
 
@@ -193,38 +193,32 @@ def main():
             scores.append((task, score))
             difficulty_scores.setdefault(difficulty, []).append(score)
             if score >= 1.0:
-                perfect.append(task)
+                n_perfect += 1
             elif score > 0:
-                partial.append((task, score, matched, g_count, p_count))
+                detail = f"score={score:.3f} (matched {matched}/{g_count} gold cols, pred has {p_count} cols)"
+                failed_by_difficulty.setdefault(difficulty, []).append((task, detail))
             else:
-                zero.append((task, f"matched=0/{g_count} pred_cols={p_count}"))
+                detail = f"score=0 (matched=0/{g_count} pred_cols={p_count})"
+                failed_by_difficulty.setdefault(difficulty, []).append((task, detail))
         except Exception as e:
             scores.append((task, 0.0))
             difficulty_scores.setdefault(difficulty, []).append(0.0)
-            zero.append((task, str(e)))
+            failed_by_difficulty.setdefault(difficulty, []).append((task, str(e)))
 
     if not scores:
         print("No tasks with gold answers found.")
         sys.exit(1)
 
     avg = sum(s for _, s in scores) / len(scores)
+    n_failed = sum(len(v) for v in failed_by_difficulty.values())
 
-    if perfect:
-        print(f"--- PERFECT ({len(perfect)}) ---")
-        for t in perfect:
-            print(f"  {t}")
-        print()
-
-    if partial:
-        print(f"--- PARTIAL ({len(partial)}) ---")
-        for t, s, m, g, p in sorted(partial, key=lambda x: -x[1]):
-            print(f"  {t}: score={s:.3f} (matched {m}/{g} gold cols, pred has {p} cols)")
-        print()
-
-    if zero:
-        print(f"--- ZERO ({len(zero)}) ---")
-        for t, reason in sorted(zero):
-            print(f"  {t}: {reason}")
+    if failed_by_difficulty:
+        print(f"--- FAILED ({n_failed}) ---")
+        for diff in sorted(failed_by_difficulty.keys()):
+            tasks_in_diff = failed_by_difficulty[diff]
+            print(f"\n  [{diff}]")
+            for t, detail in sorted(tasks_in_diff, key=lambda x: x[0]):
+                print(f"    {t}: {detail}")
         print()
 
     print(f"{'='*60}")
@@ -232,9 +226,8 @@ def main():
     print(f"{'='*60}")
     print(f"  Tasks scored:    {len(scores)}")
     print(f"  Average Score:   {avg:.4f} ({avg*100:.1f}%)")
-    print(f"  Perfect (1.0):   {len(perfect)}")
-    print(f"  Partial (0<s<1): {len(partial)}")
-    print(f"  Zero (0.0):      {len(zero)}")
+    print(f"  Perfect (1.0):   {n_perfect}")
+    print(f"  Failed (<1.0):   {n_failed}")
     print(f"{'='*60}")
 
     if difficulty_scores:
