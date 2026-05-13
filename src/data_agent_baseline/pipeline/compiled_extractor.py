@@ -587,7 +587,7 @@ def _run_workers(
     # Remaining batches in parallel
     remaining = [(i, chunk) for i, chunk in enumerate(chunks) if i > 0]
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_extract_chunk, ic): ic for ic in remaining}
         for future in as_completed(futures):
             i, records = future.result()
