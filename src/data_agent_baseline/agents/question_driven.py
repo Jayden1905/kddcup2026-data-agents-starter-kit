@@ -541,7 +541,9 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
         parts.append(f"COMPUTATION TYPE: {computation_type} (your SQL MUST produce this type of result)")
     if expected_output:
         col_expect = expected_output.get("columns", "")
-        if col_expect:
+        # Only show column expectation if it's a descriptive string, not a raw count
+        # (numeric counts mislead the planner into concatenating columns to fit)
+        if col_expect and not str(col_expect).strip().isdigit():
             parts.append(f"EXPECTED COLUMNS: {col_expect}")
 
     # Reference formula — the planner should follow this structure
@@ -1809,6 +1811,12 @@ RULES:
 
         # Apply semantic feedback
         if grounding and feedback:
+            # Guard: discard feedback that suggests aggregation for min/max lookups
+            comp_type = grounding.get("computation_type", "")
+            if comp_type == "min_max" and re.search(r'\b(aggregat|group\s*by|total|sum)\b', feedback, re.IGNORECASE):
+                feedback = ""
+                self._log("grounding_feedback_discarded", f"Feedback suggests aggregation but computation_type=min_max")
+
             # Guard: discard feedback that contradicts arithmetic in domain_rules
             domain_rules = grounding.get("domain_rules", [])
             feedback_contradicts_formula = False
@@ -1973,6 +1981,12 @@ If the question asks for something with a superlative (lowest, highest, most, le
                     if tp_rule:
                         selected.append(tp_rule)
                         selected_labels.append("time_parse")
+
+                if " and " in q_lower and "multi_col" not in selected_labels:
+                    mc_rule = next((r for l, r in SQL_RULES_LABELED if l == "multi_col"), None)
+                    if mc_rule:
+                        selected.append(mc_rule)
+                        selected_labels.append("multi_col")
 
                 if selected:
                     self._log("rules_selected", f"{len(selected)} rules: {selected_labels}")
