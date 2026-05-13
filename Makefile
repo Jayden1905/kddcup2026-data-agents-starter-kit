@@ -2,7 +2,7 @@ CONFIG ?= configs/react_baseline.local.yaml
 TASK   ?= task_11
 LIMIT  ?= 50
 TEAM   ?= 1347
-VERSION ?= v1
+VERSION ?= v4
 IMAGE  ?= $(TEAM):$(VERSION)
 
 .PHONY: install tui run run-bench status inspect lint fmt test score docker-build docker-test docker-save
@@ -34,7 +34,7 @@ fmt:
 test:
 	uv run pytest
 
-PRED_DIR ?= artifacts/runs/local_output/local_output
+PRED_DIR ?= local_output/
 GOLD_DIR ?= data/public/output
 
 score:
