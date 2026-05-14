@@ -62,6 +62,7 @@ CRITICAL RULES:
 - FOREIGN KEYS: If records reference entities from the existing database (e.g. event names, member IDs), include a link field (e.g. "link_to_event", "event_id") matching the schema convention.
 - AMOUNTS: If the knowledge defines a field name for monetary values (e.g. "amount"), use that name — not synonyms like "allocation" or "budget_value".
 - If a field has DATE values in prose (e.g. "tenth of February, 1986"), include it — workers will convert to ISO format.
+- NAME/LABEL FIELDS: If each record in the document has a proper name, title, or label (e.g. "Belgium Jupiler League", "John Smith"), include a "name" field (or matching schema field like "team_long_name"). This is critical for filtering and joining later.
 - Always include "_id" as the first field."""
 
 WORKER_PROMPT = """Extract ALL records from this text as a JSON array.
@@ -466,6 +467,7 @@ def _run_planner(
     db_context: str,
     knowledge_hint: str,
     log_fn: Callable[[str, str], None] | None,
+    doc_name: str = "",
 ) -> dict[str, Any] | None:
     """Planner analyzes doc and determines extraction schema."""
     sample = _get_sample_text(text)
@@ -475,12 +477,16 @@ def _run_planner(
         log_fn("planner_input", f"db_context={db_context[:200]}")
         log_fn("planner_input", f"sample_text (first 300 chars)={sample[:300]}")
 
+    doc_hint = ""
+    if doc_name:
+        doc_hint = f"\nDOCUMENT NAME: {doc_name}\nThe document filename indicates this file contains {doc_name} records. The entity name should be \"{doc_name}\" unless the content clearly represents something else.\n"
+
     prompt = PLANNER_PROMPT.format(
         question=question,
         sample_text=sample,
         db_context=db_context,
         knowledge_hint=knowledge_hint,
-    )
+    ) + doc_hint
     messages = [ModelMessage(role="user", content=prompt)]
 
     try:
@@ -799,7 +805,17 @@ def chunked_extract(
     # Agent 1: PLANNER
     if log_fn:
         log_fn("phase", "=== PLANNER PHASE ===")
-    plan = _run_planner(model, text, question, db_context, knowledge_hint, log_fn)
+    plan = _run_planner(model, text, question, db_context, knowledge_hint, log_fn, doc_name=doc_path.stem)
+    # Guard: if planner chose an entity that already exists as a DB table, override to doc name.
+    # The document exists to provide data NOT already in the structured DB.
+    if plan and plan.get("entity") and protected_tables:
+        planner_entity = plan["entity"].lower()
+        if planner_entity in {t.lower() for t in protected_tables} and planner_entity != doc_path.stem.lower():
+            if log_fn:
+                log_fn("planner_entity_override", f"'{plan['entity']}' conflicts with existing DB table, using '{doc_path.stem}'")
+            plan["entity"] = doc_path.stem
+            plan["fields"] = ["_id"]
+            plan["id_description"] = "unique identifier for each record"
     if not plan:
         # Build a better fallback using knowledge columns
         fallback_fields = ["_id"]
@@ -843,10 +859,14 @@ def chunked_extract(
         if entity_section:
             # Extract field names from "- **field_name (...)**:" pattern
             knowledge_fields = re.findall(r"\*\*(\w+)\s*\(", entity_section)
+            # Also extract from `entityData.field` or `entity.field` backtick patterns
+            backtick_fields = re.findall(r'`\w+\.(\w+)`', entity_section)
+            all_knowledge_fields = list(dict.fromkeys(knowledge_fields + backtick_fields))
             missing_added = []
-            for col in knowledge_fields:
+            for col in all_knowledge_fields:
                 if col not in plan_fields:
                     plan["fields"].append(col)
+                    plan_fields.add(col)
                     missing_added.append(col)
             if missing_added and log_fn:
                 log_fn("planner_augment", f"Added from knowledge entity section: {missing_added}")
