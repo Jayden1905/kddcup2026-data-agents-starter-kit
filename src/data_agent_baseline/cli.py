@@ -331,11 +331,12 @@ def run_task_command(
 def run_benchmark_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    difficulty: str | None = typer.Option(None, help="Filter tasks by difficulty (easy/medium/hard/extreme)."),
 ) -> None:
     """Run the ReAct baseline on multiple tasks from the config selection."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    task_total = len(dataset.iter_tasks())
+    task_total = len(dataset.iter_tasks(difficulty=difficulty))
     if limit is not None:
         task_total = min(task_total, limit)
     effective_workers = app_config.run.max_workers
@@ -396,6 +397,7 @@ def run_benchmark_command(
                 failed_count += 1
 
             # Score this task immediately
+            task_score: float | None = None
             pred_c: list[str] = []
             pred_r: list[list[str]] = []
             if artifact.prediction_csv_path and artifact.prediction_csv_path.exists():
@@ -412,11 +414,27 @@ def run_benchmark_command(
                 if rows_all:
                     gold_c = rows_all[0]
                     gold_r = [r for r in rows_all[1:] if r]
-                    s, _, _, _ = _score_prediction(pred_c, pred_r, gold_c, gold_r)
-                    running_score_sum += s
+                    task_score, _, _, _ = _score_prediction(pred_c, pred_r, gold_c, gold_r)
+                    running_score_sum += task_score
                     scored_count += 1
 
             score_avg = running_score_sum / scored_count if scored_count > 0 else 0.0
+
+            # Live per-task log line
+            dur = f"{artifact.duration_seconds:.1f}s"
+            if task_score is not None:
+                if task_score == 1.0:
+                    sc = f"[green]1.0[/green]"
+                elif task_score > 0:
+                    sc = f"[yellow]{task_score:.2f}[/yellow]"
+                else:
+                    sc = f"[red]0.0[/red]"
+            else:
+                sc = "[dim]?[/dim]"
+            progress.console.print(
+                f"  {artifact.task_id}: {sc} ({dur})", highlight=False
+            )
+
             progress.update(
                 progress_task_id,
                 completed=completion_count,
@@ -438,6 +456,7 @@ def run_benchmark_command(
             run_output_dir, artifacts = run_benchmark(
                 config=app_config,
                 limit=limit,
+                difficulty=difficulty,
                 progress_callback=on_task_complete,
             )
         except (ValueError, FileExistsError) as exc:
@@ -459,9 +478,11 @@ def run_benchmark_command(
                 score_avg=final_score_avg,
             ),
         )
-    console.print(f"Run output: {run_output_dir}")
+    total_elapsed = perf_counter() - start_time
+    console.print(f"\nRun output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+    console.print(f"Total time: {total_elapsed:.1f}s ({total_elapsed/60:.1f}min)")
 
     # Score all tasks against gold
     import csv as csv_mod

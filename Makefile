@@ -1,11 +1,12 @@
-CONFIG ?= configs/react_baseline.ollama.yaml
+CONFIG ?= configs/react_baseline.local.yaml
 TASK   ?= task_11
 LIMIT  ?= 50
+DIFF   ?=
 TEAM   ?= 1347
 VERSION ?= v4
 IMAGE  ?= $(TEAM):$(VERSION)
 
-.PHONY: install tui run run-bench status inspect lint fmt test score docker-build docker-test docker-save
+.PHONY: install tui run run-bench run-easy run-medium run-hard run-extreme run-diff status inspect lint fmt test score docker-build docker-test docker-save
 
 install:
 	uv sync
@@ -18,6 +19,21 @@ run:
 
 run-bench:
 	uv run dabench run-benchmark --config $(CONFIG) --limit $(LIMIT)
+
+run-easy:
+	uv run dabench run-benchmark --config $(CONFIG) --difficulty easy
+
+run-medium:
+	uv run dabench run-benchmark --config $(CONFIG) --difficulty medium
+
+run-hard:
+	uv run dabench run-benchmark --config $(CONFIG) --difficulty hard
+
+run-extreme:
+	uv run dabench run-benchmark --config $(CONFIG) --difficulty extreme
+
+run-diff:
+	uv run python run_by_difficulty.py $(DIFF) --config $(CONFIG)
 
 status:
 	uv run dabench status --config $(CONFIG)

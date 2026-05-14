@@ -28,6 +28,7 @@ class TaskRunArtifacts:
     trace_path: Path
     succeeded: bool
     failure_reason: str | None
+    duration_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,7 +243,7 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
 
 def _write_task_outputs(
     task_id: str, run_output_dir: Path, run_result: dict[str, Any],
-    dataset_root: Path | None = None,
+    dataset_root: Path | None = None, duration_seconds: float = 0.0,
 ) -> TaskRunArtifacts:
     task_output_dir = run_output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
@@ -276,6 +277,7 @@ def _write_task_outputs(
         trace_path=trace_path,
         succeeded=bool(run_result.get("succeeded")),
         failure_reason=run_result.get("failure_reason"),
+        duration_seconds=duration_seconds,
     )
 
 
@@ -292,9 +294,12 @@ def run_single_task(
         run_result = _run_single_task_with_timeout(task_id=task_id, config=config)
     else:
         run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
-    run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
+    elapsed = round(perf_counter() - started_at, 3)
+    run_result["e2e_elapsed_seconds"] = elapsed
     dataset_root = Path(config.dataset.root_path)
-    return _write_task_outputs(task_id, run_output_dir, run_result, dataset_root=dataset_root)
+    return _write_task_outputs(
+        task_id, run_output_dir, run_result, dataset_root=dataset_root, duration_seconds=elapsed
+    )
 
 
 def run_benchmark(
@@ -303,6 +308,7 @@ def run_benchmark(
     model=None,
     tools: ToolRegistry | None = None,
     limit: int | None = None,
+    difficulty: str | None = None,
     progress_callback: Callable[[TaskRunArtifacts], None] | None = None,
 ) -> tuple[Path, list[TaskRunArtifacts]]:
     effective_run_id, run_output_dir = create_run_output_dir(
@@ -310,7 +316,7 @@ def run_benchmark(
     )
 
     dataset = DABenchPublicDataset(config.dataset.root_path)
-    tasks = dataset.iter_tasks()
+    tasks = dataset.iter_tasks(difficulty=difficulty)
     if limit is not None:
         tasks = tasks[:limit]
 

@@ -52,3 +52,9 @@ The pipeline is: CLI (`cli.py`) -> Runner (`run/runner.py`) -> Agent (`react.py`
 - All tool file paths are relative to the task's `context/` directory, enforced by `resolve_context_path` (path traversal guard)
 - `data/`, `tests/`, `artifacts/`, and local configs are gitignored
 - Output structure: `artifacts/runs/<run_id>/<task_id>/{trace.json, prediction.csv}`
+
+## Development Rules
+
+- **No task-specific fixes.** When a task fails, diagnose the root cause — don't add a pattern or rule that covers just that case. All changes must be generic principles that apply broadly.
+- **Inform before, don't patch after.** Prefer giving the LLM the right evidence before it decides (pre-grounding evidence) over validating/patching its output after the fact.
+- **Never run benchmark tasks during development.** The user runs tests themselves.
