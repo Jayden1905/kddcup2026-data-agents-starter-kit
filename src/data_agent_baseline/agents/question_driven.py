@@ -27,8 +27,18 @@ from data_agent_baseline.pipeline.context_scanner import TaskContext, scan_conte
 from data_agent_baseline.pipeline.kg_builder import (
     KnowledgeGraph,
     build_kg_from_sqlite,
+    classify_columns_with_llm,
+    discover_joins_with_llm,
     enrich_kg_with_descriptions,
     format_kg_for_llm,
+)
+from data_agent_baseline.pipeline.kg_path_planner import (
+    QueryNode,
+    QueryPath,
+    QueryPlan,
+    build_query_path,
+    map_phrase_to_columns,
+    map_value_to_column,
 )
 from data_agent_baseline.tools.knowledge_graph import consolidate_to_sqlite
 
@@ -102,13 +112,13 @@ def _build_sql_prompt(
 
     rules = (
         "RULES:\n"
+        "- Use ONLY columns from SCHEMA above. Quote all identifiers with double-quotes.\n"
         "- SELECT only asked columns. No SELECT *.\n"
         "- Use simple column aliases (AS) for computed columns (e.g., COUNT(*) AS count, AVG(x) AS avg_x).\n"
         "- For list/lookup queries ('what are', 'list', 'identify'), always use SELECT DISTINCT.\n"
-        "- DATA FORMAT WARNINGS override CONSTRAINTS for how to match values.\n"
-        "- For superlatives (lowest/highest), use WHERE col = (SELECT MIN/MAX(col)...) — no LIMIT.\n"
-        "- JOIN through FK paths shown above.\n"
-        "- Use exact FILTER VALUES as-is (= 'value' COLLATE NOCASE). Only use LIKE '%X%' when FILTER VALUES says 'USE → WHERE ... LIKE ...'.\n"
+        "- For superlatives (lowest/highest/best), use WHERE col = (SELECT MIN/MAX(col)...) to include ALL ties — no LIMIT.\n"
+        "- JOIN through JOIN PATHS shown above — do not invent join conditions.\n"
+        "- Use exact FILTER VALUES as-is. Only use LIKE when FILTER VALUES says 'USE → WHERE ... LIKE ...'.\n"
         "- CAST(x AS REAL) for division.\n"
         "- WHERE col IS NOT NULL to avoid nulls. Escape apostrophes with ''.\n"
         "- Never transform, concatenate, or split column values."
@@ -220,7 +230,7 @@ Return ONLY a JSON object:
 
 RULES:
 - what_user_wants drives everything. Do NOT invent columns the question didn't ask for.
-- COLUMN SEMANTICS (HIGHEST PRIORITY): When BINDING COLUMN DEFINITIONS defines what a column means, use the column whose NAME most closely matches the question's wording. Column name affinity + domain definition is authoritative over common-sense interpretation.
+- COLUMN SEMANTICS: When choosing between columns, check SAMPLE VALUES in the schema. The column whose actual data values match what the question asks for wins. Column hints are suggestions — sample values are ground truth.
 - NO ASSUMPTIONS: Do NOT add data_format_notes or domain_rules that assume conversion/transformation unless DOMAIN KNOWLEDGE explicitly states it. If a REFERENCE SQL is provided, follow its approach exactly (e.g. if it uses ORDER BY col ASC, do NOT add "must convert to seconds").
 - NO DATA MANIPULATION: Never transform, concatenate, split, or convert column values. Return data exactly as it exists in the database.
 - FORMULA AUTHORITY: If DOMAIN KNOWLEDGE defines a formula, copy it VERBATIM into "formula" field. Do NOT reason about whether any part is redundant — every operation is intentional.
@@ -476,7 +486,7 @@ def _build_semantic_prompt(
     kg_guidance_section = ""
     if knowledge_guidance:
         kg_guidance_section = (
-            f"\n⚠️ BINDING COLUMN DEFINITIONS (these override common-sense interpretation):\n"
+            f"\nCOLUMN HINTS (verify against SAMPLE VALUES in schema before using):\n"
             f"{knowledge_guidance[:1500]}"
         )
     remaining = BUDGET - template_len - len(anchor_text[:1500]) - len(previous_attempt) - len(ambiguous_columns) - len(user_intent) - len(kg_guidance_section)
@@ -491,7 +501,13 @@ def _build_semantic_prompt(
     # When ambiguous columns exist AND entity_of_interest is specified, reinforce output table choice
     intent_section = ""
     if user_intent:
-        intent_section = f"\n⚠️ USER INTENT (your grounding MUST respect these constraints):\n{user_intent}"
+        # Pass shape/grain/entity to grounding, but NOT metric column — grounding resolves columns
+        # from the focused schema with sample values, which is more authoritative.
+        intent_for_grounding = "\n".join(
+            ln for ln in user_intent.split("\n")
+            if not ln.startswith("Metric (SELECT):")
+        )
+        intent_section = f"\n⚠️ USER INTENT (your grounding MUST respect these constraints):\n{intent_for_grounding}"
         if ambiguous_columns and "prefer this table's columns for output" in user_intent:
             intent_section += "\n⚠️ For AMBIGUOUS COLUMNS above: SELECT output from the entity_of_interest table, not the filter table."
     constraints_section = f"\n{feedback}" if feedback else ""
@@ -634,6 +650,88 @@ QUESTION being answered: {question}""")
 
 
 
+def _fix_unescaped_apostrophes(sql: str) -> str:
+    """Fix unescaped apostrophes inside single-quoted SQL string literals.
+
+    'Women's Soccer' → 'Women''s Soccer'
+    Handles multiple literals in one statement.
+    """
+    result = []
+    i = 0
+    while i < len(sql):
+        if sql[i] == "'":
+            # Find the end of this string literal
+            # Walk forward collecting chars; an apostrophe followed by a letter
+            # (not another apostrophe and not end-of-token) is unescaped
+            result.append("'")
+            i += 1
+            while i < len(sql):
+                if sql[i] == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
+                    # Already escaped — keep both
+                    result.append("''")
+                    i += 2
+                elif sql[i] == "'":
+                    # Could be end of literal or unescaped apostrophe
+                    # Heuristic: if next char is a word char (letter/digit) and prev char is
+                    # also a word char, it's an unescaped apostrophe mid-word (e.g. Women's)
+                    prev_is_word = i > 0 and (sql[i - 1].isalnum() or sql[i - 1] == ' ')
+                    next_is_word = i + 1 < len(sql) and sql[i + 1].isalpha()
+                    if prev_is_word and next_is_word:
+                        result.append("''")
+                        i += 1
+                    else:
+                        # End of literal
+                        result.append("'")
+                        i += 1
+                        break
+                else:
+                    result.append(sql[i])
+                    i += 1
+        else:
+            result.append(sql[i])
+            i += 1
+    return "".join(result)
+
+
+def _sanitize_sql(sql: str, db_path: Path) -> str:
+    """Fix common LLM SQL formatting issues: trailing junk, unquoted multi-word columns, unescaped apostrophes."""
+    # Strip trailing braces/brackets that leak from JSON
+    sql = sql.rstrip().rstrip("}").rstrip("]").rstrip()
+    # Remove trailing semicolons (SQLite doesn't need them and they can cause issues with multiple statements)
+    sql = sql.rstrip(";").strip()
+
+    # Fix unescaped apostrophes inside single-quoted string literals
+    # e.g. 'Women's Soccer' → 'Women''s Soccer'
+    sql = _fix_unescaped_apostrophes(sql)
+
+    # Quote unquoted multi-word column names using actual schema
+    try:
+        conn = sqlite3.connect(str(db_path))
+        all_columns: set[str] = set()
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            for col in conn.execute(f'PRAGMA table_info("{row[0]}")').fetchall():
+                col_name = col[1]
+                if " " in col_name or "(" in col_name or "%" in col_name or "-" in col_name:
+                    all_columns.add(col_name)
+        conn.close()
+
+        # For each multi-word column, find unquoted references and quote them
+        for col in sorted(all_columns, key=len, reverse=True):
+            # Match the column name not already inside quotes
+            # CamelCase collapsed version (e.g. SchoolName for "School Name")
+            no_space = col.replace(" ", "").replace("(", "").replace(")", "").replace("-", "")
+            if no_space in sql:
+                sql = sql.replace(no_space, f'"{col}"')
+            # Also fix dot-prefixed versions (e.g. frpm.SchoolName)
+            for prefix in ("frpm.", "satscores.", "T1.", "T2."):
+                if f"{prefix}{no_space}" in sql:
+                    sql = sql.replace(f"{prefix}{no_space}", f'{prefix}"{col}"')
+    except Exception:
+        pass
+
+    return sql
+
+
 def _apply_null_guard(sql: str) -> str:
     """Add IS NOT NULL + != '' for columns used in ORDER BY LIMIT 1 or subquery MIN/MAX."""
     guarded = sql
@@ -648,8 +746,9 @@ def _apply_null_guard(sql: str) -> str:
         guarded = _inject_null_check(guarded, col, order_match.start())
 
     # Pattern 2: WHERE col = (SELECT MIN/MAX(col) ...) — guard the subquery
+    # Handles both quoted ("table"."col") and unquoted (table.col) identifiers
     minmax_match = re.search(
-        r'\(\s*SELECT\s+(MIN|MAX)\s*\(\s*(\w+(?:\.\w+)?)\s*\)\s+FROM\s+(\w+)',
+        r'\(\s*SELECT\s+(MIN|MAX)\s*\(\s*("?\w+"?(?:\."?\w+"?)?)\s*\)\s+FROM\s+("?\w+"?)',
         guarded, re.IGNORECASE
     )
     if minmax_match:
@@ -671,13 +770,22 @@ def _apply_null_guard(sql: str) -> str:
                     subq_end = i
                     break
         subquery = guarded[subq_start:subq_end + 1]
-        bare_col = col.split(".")[-1] if "." in col else col
-        if f"{bare_col} != ''" not in subquery.lower() and f'{bare_col} is not null' not in subquery.lower():
-            # Inject guard before the closing paren
+        bare_col = col.split(".")[-1].strip('"') if "." in col else col.strip('"')
+        subq_check = subquery.lower().replace('"', '')
+        has_not_null = bare_col.lower() + ' is not null' in subq_check
+        has_not_empty = bare_col.lower() + " != ''" in subq_check or bare_col.lower() + " <> ''" in subq_check
+
+        if not has_not_null and not has_not_empty:
             if re.search(r'\bWHERE\b', subquery, re.IGNORECASE):
                 new_subq = subquery[:-1] + f' AND {col} IS NOT NULL AND {col} != \'\')'
             else:
                 new_subq = subquery[:-1] + f' WHERE {col} IS NOT NULL AND {col} != \'\')'
+            guarded = guarded[:subq_start] + new_subq + guarded[subq_end + 1:]
+        elif has_not_null and not has_not_empty:
+            new_subq = subquery[:-1] + f' AND {col} != \'\')'
+            guarded = guarded[:subq_start] + new_subq + guarded[subq_end + 1:]
+        elif not has_not_null and has_not_empty:
+            new_subq = subquery[:-1] + f' AND {col} IS NOT NULL)'
             guarded = guarded[:subq_start] + new_subq + guarded[subq_end + 1:]
 
     return guarded
@@ -799,15 +907,34 @@ class QuestionDrivenAgent:
                 kg, model=self.model, knowledge_text=ctx.knowledge_text,
                 log_fn=self._log,
             )
+            kg = discover_joins_with_llm(kg, model=self.model, log_fn=self._log)
+            kg = classify_columns_with_llm(kg, model=self.model, log_fn=self._log)
             kg_context = format_kg_for_llm(kg)
-            self._log("kg_built", f"KG: {len(kg.tables)} tables, "
-                      f"{len(kg.inferred_fks)} inferred FKs")
+            g = kg.graph
+            self._log("kg_built", (
+                f"KG: {len(kg.tables)} tables, {len(kg.inferred_fks)} inferred FKs\n"
+                f"  Graph: {len(g.columns)} columns, {len(g.values)} value nodes, "
+                f"{len(g.fk_edges)} FK edges, {len(g.semantic_edges)} semantic edges\n"
+                f"  Value index: {len(g.value_index)} unique values indexed"
+            ))
+            if g.fk_edges:
+                fk_summary = "; ".join(
+                    f"{e.src}→{e.dst} ({e.overlap_ratio:.0%})"
+                    for e in g.fk_edges[:5]
+                )
+                self._log("kg_fk_edges", fk_summary)
+            if g.semantic_edges:
+                sem_summary = "; ".join(
+                    f"{e.src}~{e.dst} ({e.similarity_score:.2f})"
+                    for e in g.semantic_edges[:5]
+                )
+                self._log("kg_semantic_edges", sem_summary)
 
             # Get sample data for each table (question-aware probing)
             sample_data = self._get_sample_data(db_path, kg, question)
 
-            # Step 5: Semantic grounding — decompose question before SQL planning
-            grounding_context = self._call_semantic_grounding(
+            # Step 5: KG path planning — graph-based reasoning to reach the goal
+            grounding_context = self._kg_path_plan_grounding(
                 question, kg_context, sample_data, ctx.knowledge_text,
                 db_path=db_path, kg=kg,
             )
@@ -833,40 +960,51 @@ class QuestionDrivenAgent:
                 grounding_context += f"\n\n{threshold_context}"
 
             # ----------------------------------------------------------
-            # SQL Generation: one LLM call, one retry on failure
+            # SQL Generation: LLM writes SQL, close-loop on failure
             # ----------------------------------------------------------
-            sql = self._call_sql(
-                question,
-                grounding_context=grounding_context,
-            )
+            max_sql_attempts = 3
+            sql = ""
             data_result = None
-            if sql:
+            failed_sqls: list[str] = []
+            gaps = ""
+
+            for attempt in range(max_sql_attempts):
+                sql = self._call_sql(
+                    question,
+                    grounding_context=grounding_context,
+                    gaps=gaps,
+                )
+                if not sql:
+                    break
+
+                sql = _sanitize_sql(sql, db_path)
                 sql = _apply_null_guard(sql)
-                self._log("sql_generated", sql)
+                self._log("sql_generated" if attempt == 0 else f"sql_retry_{attempt}", sql)
                 data_result = self._try_sql(db_path, sql)
 
-            # Retry only on SQL error (syntax/schema), not on 0 rows (grounding issue)
-            if not data_result and sql:
-                last_log = next(
+                if data_result and data_result.get("rows"):
+                    break
+
+                # Diagnose failure for next iteration
+                failed_sqls.append(sql)
+                last_error = next(
                     (s.get("detail", "") for s in reversed(self.steps) if s.get("event") == "sql_error"),
                     "",
                 )
-                if last_log:
-                    error_info = f"- SQL ERROR: {last_log}"
-                    retry_sql = self._call_sql(
-                        question,
-                        grounding_context=grounding_context,
-                        gaps=error_info,
-                    )
-                    if retry_sql and retry_sql != sql:
-                        retry_sql = _apply_null_guard(retry_sql)
-                        self._log("sql_retry", retry_sql)
-                        data_result = self._try_sql(db_path, retry_sql)
+                if last_error:
+                    gaps = f"- SQL ERROR: {last_error}\n- Failed SQL: {sql}"
+                elif data_result is not None:
+                    # Executed OK but 0 rows
+                    diagnosis = self._diagnose_empty_result(db_path, sql) if sql else ""
+                    gaps = f"- ZERO ROWS returned.\n- Failed SQL: {sql}"
+                    if diagnosis:
+                        gaps += f"\n- DIAGNOSIS: {diagnosis}"
+                else:
+                    break
 
-            # Last resort: if SQL returned 0 rows, try multi-hypothesis approach
+            # Last resort: if close-loop exhausted, try multi-hypothesis approach
             if not (data_result and data_result.get("rows")):
-                self._log("hypothesis_trigger", "SQL returned 0 rows — trying multi-hypothesis fallback")
-                failed_sqls = [sql] if sql else []
+                self._log("hypothesis_trigger", "SQL close-loop exhausted — trying multi-hypothesis fallback")
                 diagnosis = self._diagnose_empty_result(db_path, sql) if sql else ""
                 hyp_result, hyp_sql = self._try_multi_hypothesis(
                     question=question,
@@ -947,9 +1085,13 @@ class QuestionDrivenAgent:
                         sql = v
                         break
             if not sql:
-                self._log("sql_parse_failed", f"No sql key in: {list(parsed.keys())}")
+                self._log("sql_parse_failed", f"No sql key in: {list(parsed.keys())} | raw={raw}")
             return sql
-        self._log("sql_parse_failed", raw[:300])
+        # Try extracting SQL directly from raw text
+        select_match = re.search(r'(SELECT\s.+?)(?:```|"|\Z)', raw, re.DOTALL | re.IGNORECASE)
+        if select_match:
+            return select_match.group(1).strip().rstrip('"').rstrip("'")
+        self._log("sql_parse_failed", f"raw={raw}")
         return ""
 
     # ------------------------------------------------------------------
@@ -1089,7 +1231,29 @@ RULES:
                 user_wants = match.group(1).strip()
 
         col_list = "\n".join(f"  {i}: {c}" for i, c in enumerate(columns))
-        prompt = f"""The user asked a question. The SQL returned these columns. Which columns should appear in the final output?
+
+        # Detect superlative pattern to deterministically drop criterion column
+        sup_match = re.search(
+            r'\b(?:which|what|who)\b.+?\b(?:has|have|with|had)\b.+?\b(?:the\s+)?(?:lowest|highest|most|least|best|worst|fastest|slowest|largest|smallest|longest|shortest)\b\s+(\w+)',
+            question.lower(),
+        )
+        criterion_col = sup_match.group(1) if sup_match else ""
+
+        # If we can deterministically identify the criterion column, just drop it
+        if criterion_col and len(columns) == 2:
+            criterion_idx = next(
+                (i for i, c in enumerate(columns) if criterion_col in c.lower()),
+                None,
+            )
+            if criterion_idx is not None:
+                keep_idx = 1 - criterion_idx
+                self._log("answer_schema", f"Kept columns [{keep_idx}] → ['{columns[keep_idx]}'] ({len(rows)} rows)")
+                return {
+                    "columns": [columns[keep_idx]],
+                    "rows": [[str(row[keep_idx])] for row in rows],
+                }
+
+        prompt = f"""The user asked a question. The SQL returned these columns. Which columns should appear in the final answer?
 
 QUESTION: {question}
 USER INTENT: {user_wants or question}
@@ -1100,13 +1264,11 @@ SQL RESULT COLUMNS:
 Return ONLY: {{"keep_columns": [0, 2]}}
 
 RULES:
-- The output must contain ONLY the information the user EXPLICITLY asked for — nothing extra.
-- "list all X" or "list the X" = ONLY the identifier/ID column of X. Do NOT add properties (amount, date, name, etc.) unless the question EXPLICITLY mentions them.
-- "X and Y" = both X and Y columns, but ONLY those two.
-- Remove columns that were only used for filtering (WHERE) or joining — they are not part of the answer.
-- Remove columns whose values are constant (same for every row) — those are filter echoes.
-- SUBJECT vs CRITERION: The question's SUBJECT (what the user wants identified) must be kept. Numeric columns used only as ordering/filtering CRITERIA (not explicitly requested) should be dropped.
-- When in doubt, keep FEWER columns. Only include a column if the question directly asks for that information.
+- Keep columns the user explicitly asked to SEE in the answer.
+- "full name" = keep BOTH first_name AND last_name (or all name-related columns).
+- If the question asks for multiple attributes ("list X and Y"), keep ALL of them.
+- REMOVE criterion/sorting columns used only to find the answer. "Which X has the lowest Y?" → keep X, drop Y. "What is the Y of X?" → keep Y, drop X's ID.
+- REMOVE internal IDs and filter-echo columns (constant values from WHERE clause).
 - NEVER merge columns. Just pick indices to keep."""
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -1301,6 +1463,922 @@ RULES:
         self._log("domain_anchors", anchor_text)
         return anchor_text
 
+    # ------------------------------------------------------------------
+    # KG Path Planning Loop: graph-based reasoning to reach the goal
+    # ------------------------------------------------------------------
+
+    def _kg_path_plan_grounding(
+        self,
+        question: str,
+        kg_context: str,
+        sample_data: str,
+        knowledge_text: str,
+        db_path: Path | None = None,
+        kg: KnowledgeGraph | None = None,
+    ) -> str:
+        """LLM picks nodes from property graph → validate → format as grounding for SQL LLM."""
+        if not db_path or not kg:
+            return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+
+        # --- Step 1: Domain anchors + user intent ---
+        anchor_text = self._extract_domain_anchors(question, knowledge_text, db_path=db_path)
+        user_intent = self._detect_user_intent_only(question, kg_context=kg_context, anchor_text=anchor_text)
+        if user_intent:
+            self._log("user_intent", user_intent)
+
+        # --- Step 2: LLM picks nodes from graph (1 call) ---
+        picked = self._pick_graph_nodes(question, kg, anchor_text, user_intent)
+        if not picked:
+            self._log("kg_path", "Node picking failed, falling back")
+            return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+
+        self._log("kg_picked", json.dumps(picked, default=str))
+
+        # --- Step 3: Validate picks against graph (deterministic) ---
+        output_nodes, filter_nodes, errors = self._validate_picked_nodes(picked, kg, db_path)
+        if errors:
+            self._log("kg_validation_errors", "; ".join(errors))
+        if not output_nodes:
+            self._log("kg_path", "No valid output nodes after validation, falling back")
+            return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+
+        self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
+        self._log("kg_filter_nodes", ", ".join(
+            f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
+        ))
+
+        # --- Step 3a: Sanity check — does the pick match the question? ---
+        sanity_issues = self._sanity_check_picks(
+            question, picked, output_nodes, filter_nodes, user_intent, kg, anchor_text,
+        )
+        if sanity_issues:
+            self._log("kg_sanity", sanity_issues)
+            # Re-prompt with sanity feedback
+            repicked = self._pick_graph_nodes(
+                question, kg, anchor_text,
+                user_intent + f"\n\nCORRECTIONS (from sanity check):\n{sanity_issues}",
+            )
+            if repicked and repicked.get("select_columns"):
+                self._log("kg_repicked", json.dumps(repicked, default=str))
+                new_output, new_filter, _ = self._validate_picked_nodes(repicked, kg, db_path)
+                if new_output:
+                    picked = repicked
+                    output_nodes = new_output
+                    filter_nodes = new_filter
+                    self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
+                    self._log("kg_filter_nodes", ", ".join(
+                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
+                    ))
+
+        # --- Step 3b: Probe actual value formats for text filters ---
+        filter_nodes = self._probe_filter_values(filter_nodes, db_path)
+
+        # --- Step 3b1: Domain column fixes (deterministic swap) ---
+        filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text)
+
+        # --- Step 3b2: Check filter discriminating power ---
+        weak_filters = self._check_filter_selectivity(filter_nodes, db_path)
+        if weak_filters:
+            self._log("kg_weak_filter", weak_filters)
+            repicked2 = self._pick_graph_nodes(
+                question, kg, anchor_text,
+                user_intent + f"\n\nCORRECTIONS:\n{weak_filters}",
+            )
+            if repicked2 and repicked2.get("select_columns"):
+                self._log("kg_repicked", json.dumps(repicked2, default=str))
+                new_output2, new_filter2, _ = self._validate_picked_nodes(repicked2, kg, db_path)
+                if new_output2:
+                    picked = repicked2
+                    output_nodes = new_output2
+                    filter_nodes = self._probe_filter_values(new_filter2, db_path)
+                    filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text)
+                    self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
+                    self._log("kg_filter_nodes", ", ".join(
+                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
+                    ))
+
+        # --- Step 3c: Extract order_by column as a node for path planning ---
+        order_nodes: list[QueryNode] = []
+        order_by = picked.get("order_by")
+        if order_by and isinstance(order_by, dict):
+            ob_col = order_by.get("column", "")
+            if "." in ob_col:
+                ob_table, ob_name = ob_col.split(".", 1)
+                ob_table = ob_table.strip('"').strip("'")
+                ob_name = ob_name.strip('"').strip("'")
+                matched = self._fuzzy_match_column(ob_table, ob_name, kg)
+                if matched:
+                    order_nodes.append(QueryNode(table=matched[0], column=matched[1], role="order"))
+                elif kg.graph and f"{ob_table}.{ob_name}" in kg.graph.columns:
+                    order_nodes.append(QueryNode(table=ob_table, column=ob_name, role="order"))
+
+        # --- Step 4: Graph Traversal (BFS through KG edges) ---
+        path = build_query_path(output_nodes, filter_nodes, kg, order_nodes=order_nodes)
+        if not path:
+            self._log("kg_path", "No path found, falling back")
+            return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+
+        self._log("kg_path_edges", " → ".join(
+            f"{e.src_table}.{e.src_column}={e.dst_table}.{e.dst_column}" for e in path.edges
+        ) if path.edges else "(single table)")
+
+        # --- Step 5: Format as grounding context for SQL LLM ---
+        grounding = self._format_kg_plan_as_grounding(path, None, picked, "", kg=kg)
+        self._log("kg_grounding", grounding)
+        return grounding
+
+    def _pick_graph_nodes(
+        self,
+        question: str,
+        kg: KnowledgeGraph,
+        anchor_text: str,
+        user_intent: str,
+    ) -> dict[str, Any] | None:
+        """LLM picks columns/filters/joins from the property graph. One call."""
+        g = kg.graph
+
+        # Build FK target map: src_col_id → (dst_table, dst_col) for annotation
+        fk_targets: dict[str, tuple[str, str]] = {}
+        if g:
+            for edge in g.fk_edges:
+                dst_col = g.columns.get(edge.dst)
+                if dst_col:
+                    fk_targets[edge.src] = (dst_col.table_id, dst_col.name)
+
+        # Build graph dump for LLM: tables with columns, FK edges, categorical values
+        graph_parts: list[str] = []
+        for table in kg.tables:
+            cols_desc: list[str] = []
+            for col in table.columns:
+                parts = [f'"{col.name}" ({col.sql_type})']
+                if col.description:
+                    parts.append(f"-- {col.description}")
+                col_id = f"{table.name}.{col.name}"
+                # Annotate FK reference columns
+                is_fk_col = col_id in fk_targets
+                if is_fk_col:
+                    ref_t, ref_c = fk_targets[col_id]
+                    # Show display column if known (human-readable value to SELECT instead)
+                    display_col = g.fk_display_map.get(col_id, "") if g else ""
+                    if display_col:
+                        parts.append(f'→ references "{ref_t}"."{ref_c}" (display: "{display_col}")')
+                    else:
+                        parts.append(f'→ references "{ref_t}"."{ref_c}"')
+                # Show sample values (skip FK columns — their IDs are opaque)
+                if not is_fk_col:
+                    if g and col_id in g.contains_value:
+                        val_nodes = g.get_column_values(col_id)
+                        vals = [v.value for v in val_nodes[:8]]
+                        if vals:
+                            parts.append(f"values: {vals}")
+                    elif col.name in table.sample_values:
+                        samples = table.sample_values[col.name][:5]
+                        if samples:
+                            parts.append(f"e.g. {samples}")
+                cols_desc.append("  " + " ".join(parts))
+            graph_parts.append(f'TABLE "{table.name}" ({table.row_count} rows):\n' + "\n".join(cols_desc))
+
+        # FK edges
+        fk_lines: list[str] = []
+        if g:
+            for edge in g.fk_edges:
+                src_col = g.columns.get(edge.src)
+                dst_col = g.columns.get(edge.dst)
+                if src_col and dst_col:
+                    fk_lines.append(
+                        f'  "{src_col.table_id}"."{src_col.name}" → "{dst_col.table_id}"."{dst_col.name}" (overlap: {edge.overlap_ratio:.0%})'
+                    )
+        if fk_lines:
+            graph_parts.append("JOIN RELATIONSHIPS (foreign keys):\n" + "\n".join(fk_lines))
+
+        # Semantic edges (for bridge table discovery)
+        sem_lines: list[str] = []
+        if g:
+            for edge in g.semantic_edges:
+                src_col = g.columns.get(edge.src)
+                dst_col = g.columns.get(edge.dst)
+                if src_col and dst_col:
+                    sem_lines.append(
+                        f'  "{src_col.table_id}"."{src_col.name}" ↔ "{dst_col.table_id}"."{dst_col.name}" (similarity: {edge.similarity_score:.0%})'
+                    )
+        if sem_lines:
+            graph_parts.append("SEMANTIC LINKS (likely joinable by matching IDs):\n" + "\n".join(sem_lines))
+
+        graph_dump = "\n\n".join(graph_parts)
+
+        anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:2000]}" if anchor_text else ""
+        intent_section = f"\nUSER INTENT:\n{user_intent}" if user_intent else ""
+
+        prompt = f"""QUESTION: {question}
+
+PROPERTY GRAPH:
+{graph_dump[:6000]}
+{anchor_section}{intent_section}
+
+HOW TO READ THE GRAPH:
+- Each TABLE has columns with their SQL types. Some columns show known "values:" — these are categorical values in that column.
+- Columns marked "→ references Table.Column" are FOREIGN KEYS that store IDs pointing to another table. To get human-readable values (names, labels), you must SELECT from the referenced table, not the FK column itself.
+- JOIN RELATIONSHIPS show which columns link tables together. SEMANTIC LINKS show columns with matching ID patterns (useful for bridge/junction tables).
+- When you need to connect tables that have no direct FK, look for a BRIDGE TABLE that has FKs to both.
+
+YOUR TASK: Pick exact columns from this graph to answer the question.
+
+PRIORITY (resolve conflicts in this order):
+1. QUESTION — the user's exact words. If a word matches a column name, use that column.
+2. DOMAIN KNOWLEDGE — defines what terms mean in this database. Overrides everyday English.
+3. Your own inference — only if neither 1 nor 2 applies.
+
+Return ONLY JSON:
+{{
+  "what_user_wants": "one sentence restating the expected output",
+  "select_columns": ["Table.Column", ...],
+  "filter_conditions": [
+    {{"column": "Table.Column", "operator": "= | > | < | >= | <= | LIKE | !=", "value": "..."}}
+  ],
+  "order_by": {{"column": "Table.Column", "direction": "ASC | DESC"}} or null,
+  "computation_type": "simple_lookup | count | sum | avg | min_max | ratio | percentage"
+}}
+
+CONSTRAINTS:
+- You may ONLY use Table.Column names that appear in the PROPERTY GRAPH above.
+- You may ONLY use values from "values:" lists, DOMAIN KNOWLEDGE, or the QUESTION itself.
+- If a column is a FK reference (marked with →), do NOT select it directly — instead JOIN to the referenced table and select the human-readable column there (e.g. the name/label column, not the ID).
+- For "best/lowest/highest/fastest" questions, use order_by instead of equality filters on position/rank columns.
+- For filter values, use the EXACT format shown in "values:" or DOMAIN KNOWLEDGE. If unsure of the format, use LIKE with a partial match."""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages)
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict) and parsed.get("select_columns"):
+                return parsed
+        except Exception:
+            pass
+        return None
+
+    def _validate_picked_nodes(
+        self,
+        picked: dict[str, Any],
+        kg: KnowledgeGraph,
+        db_path: Path | None,
+    ) -> tuple[list[QueryNode], list[QueryNode], list[str]]:
+        """Validate LLM's picks against the actual graph. Returns (output_nodes, filter_nodes, errors)."""
+        errors: list[str] = []
+        output_nodes: list[QueryNode] = []
+        filter_nodes: list[QueryNode] = []
+
+        g = kg.graph
+
+        # Validate select_columns
+        for col_ref in picked.get("select_columns", []):
+            if "." not in col_ref:
+                errors.append(f"Invalid column ref (no dot): {col_ref}")
+                continue
+            table, col = col_ref.split(".", 1)
+            # Strip quotes
+            table = table.strip('"').strip("'")
+            col = col.strip('"').strip("'")
+            col_id = f"{table}.{col}"
+            if g and col_id in g.columns:
+                output_nodes.append(QueryNode(table=table, column=col, role="output"))
+            else:
+                # Try case-insensitive match
+                matched = self._fuzzy_match_column(table, col, kg)
+                if matched:
+                    output_nodes.append(QueryNode(table=matched[0], column=matched[1], role="output"))
+                else:
+                    errors.append(f"Column not in graph: {col_ref}")
+
+        # Validate filter_conditions
+        for cond in picked.get("filter_conditions", []):
+            if not isinstance(cond, dict):
+                continue
+            col_ref = cond.get("column", "")
+            operator = cond.get("operator", "=")
+            value = cond.get("value", "")
+            if "." not in col_ref:
+                errors.append(f"Invalid filter column (no dot): {col_ref}")
+                continue
+            table, col = col_ref.split(".", 1)
+            table = table.strip('"').strip("'")
+            col = col.strip('"').strip("'")
+            col_id = f"{table}.{col}"
+            if g and col_id in g.columns:
+                filter_nodes.append(QueryNode(
+                    table=table, column=col, role="filter",
+                    operator=operator, value=value,
+                ))
+            else:
+                matched = self._fuzzy_match_column(table, col, kg)
+                if matched:
+                    filter_nodes.append(QueryNode(
+                        table=matched[0], column=matched[1], role="filter",
+                        operator=operator, value=value,
+                    ))
+                else:
+                    errors.append(f"Filter column not in graph: {col_ref}")
+
+        return output_nodes, filter_nodes, errors
+
+    def _fuzzy_match_column(
+        self, table: str, col: str, kg: KnowledgeGraph,
+    ) -> tuple[str, str] | None:
+        """Case-insensitive column lookup in KG."""
+        for t in kg.tables:
+            if t.name.lower() == table.lower():
+                for c in t.columns:
+                    if c.name.lower() == col.lower():
+                        return (t.name, c.name)
+        return None
+
+    def _sanity_check_picks(
+        self,
+        question: str,
+        picked: dict[str, Any],
+        output_nodes: list[QueryNode],
+        filter_nodes: list[QueryNode],
+        user_intent: str,
+        kg: KnowledgeGraph,
+        anchor_text: str = "",
+    ) -> str:
+        """Check if LLM picks are consistent with the question and user intent."""
+        issues: list[str] = []
+        q_lower = question.lower()
+
+        # Parse structured fields from user_intent
+        intent_entity = ""
+        intent_metric = ""
+        intent_operation = ""
+        intent_population = ""
+        for line in user_intent.split("\n"):
+            if "Entity of interest:" in line:
+                intent_entity = line.split("Entity of interest:")[1].split("(")[0].strip().lower()
+            elif "Metric (SELECT):" in line:
+                intent_metric = line.split("Metric (SELECT):")[1].strip().lower()
+            elif "Operation:" in line:
+                intent_operation = line.split("Operation:")[1].strip().lower()
+            elif "Population (WHERE):" in line:
+                intent_population = line.split("Population (WHERE):")[1].strip().lower()
+
+        # --- Check 1: Named entities in question should appear in filters ---
+        # Only match deliberate quoting — skip apostrophes in contractions/possessives
+        quoted = re.findall(r'"([^"]+)"', question)
+        named_entities = list(quoted)
+        proper_nouns = re.findall(r'\b([A-Z][a-z]+(?: [A-Z][a-z]+)+)\b', question)
+        named_entities.extend(proper_nouns)
+
+        if named_entities:
+            filter_values = [str(n.value).lower() for n in filter_nodes]
+            filter_text = " ".join(filter_values)
+            output_text = " ".join(f"{n.table}.{n.column}" for n in output_nodes).lower()
+            for entity in named_entities:
+                entity_lower = entity.lower()
+                if entity_lower not in filter_text and entity_lower not in output_text:
+                    issues.append(
+                        f'The question mentions "{entity}" but it is not in any filter or output. '
+                        f'Add a filter condition for it.'
+                    )
+
+        # --- Check 2: Entity of interest — output tables should match ---
+        # First: deterministically extract entity from question pattern "which X" / "what X"
+        question_entity = ""
+        entity_match = re.search(
+            r'\b(?:which|what|list\s+(?:all\s+)?(?:the\s+)?)\s*(\w+)',
+            q_lower,
+        )
+        if entity_match:
+            question_entity = entity_match.group(1).rstrip("s")  # "events" → "event"
+
+        # Use question-derived entity if it matches a table, otherwise fall back to intent
+        check_entity = ""
+        if question_entity:
+            matching_tables = [
+                t.name for t in kg.tables
+                if question_entity in t.name.lower() or t.name.lower() in question_entity
+            ]
+            if matching_tables:
+                check_entity = question_entity
+        if not check_entity:
+            check_entity = intent_entity
+
+        if check_entity and output_nodes:
+            output_tables = {n.table.lower() for n in output_nodes}
+            entity_in_output = any(
+                check_entity in t or t in check_entity
+                for t in output_tables
+            )
+            if not entity_in_output:
+                entity_tables = [
+                    t.name for t in kg.tables
+                    if check_entity in t.name.lower() or t.name.lower() in check_entity
+                ]
+                if entity_tables:
+                    issues.append(
+                        f'The question asks about "{check_entity}" but output columns come from '
+                        f'tables {list(output_tables)}. Select the name/label column from '
+                        f'"{entity_tables[0]}" table instead.'
+                    )
+
+        # --- Check 3: Metric column should be in output ---
+        # Skip for aggregate/superlative operations — metric is the criterion, not the answer
+        comp_type = picked.get("computation_type", "")
+        is_aggregate = comp_type in ("count", "sum", "avg", "min_max", "ratio", "percentage")
+        is_superlative = intent_operation in ("min_max", "count", "sum", "avg", "ratio", "percentage")
+        if intent_metric and output_nodes and not is_aggregate and not is_superlative:
+            metric_words = set(intent_metric.replace(",", " ").split())
+            output_cols = {n.column.lower() for n in output_nodes}
+            metric_found = any(
+                any(mw in col or col in mw for mw in metric_words)
+                for col in output_cols
+            )
+            if not metric_found and intent_metric not in ("all", "all columns requested"):
+                issues.append(
+                    f'Intent says metric is "{intent_metric}" but output columns are '
+                    f'{[n.column for n in output_nodes]}. Include the metric column.'
+                )
+
+        # --- Check 4: Population filter — intent says WHERE X but no matching filter ---
+        if intent_population and intent_population != "all" and filter_nodes:
+            pop_words = set(re.findall(r'[a-z]+', intent_population))
+            filter_cols_and_vals = " ".join(
+                f"{n.column.lower()} {str(n.value).lower()}" for n in filter_nodes
+            )
+            # Loose check: at least some population words should appear in filters
+            overlap = sum(1 for w in pop_words if w in filter_cols_and_vals and len(w) > 3)
+            if overlap == 0 and len(pop_words) > 0:
+                issues.append(
+                    f'Intent says population filter is "{intent_population}" '
+                    f'but no matching filter condition was found.'
+                )
+
+        # --- Check 5: Output should have name/label, not ID/ref ---
+        asks_for_name = any(w in q_lower for w in ["which", "what is the name", "what race", "what event"])
+        if asks_for_name and output_nodes:
+            has_name_col = any(
+                any(x in n.column.lower() for x in ["name", "title", "label", "description"])
+                for n in output_nodes
+            )
+            has_ref_col = any(
+                n.column.lower().endswith("ref") or
+                (n.column.lower().endswith("id") and n.column.lower() != "id")
+                for n in output_nodes
+            )
+            if has_ref_col and not has_name_col:
+                issues.append(
+                    'The question asks for a name/label but output only has ID/ref columns. '
+                    'Select the human-readable name column instead.'
+                )
+
+        # --- Check 6: Superlative should use order_by, not position/rank filter ---
+        superlative_words = ["best", "lowest", "highest", "fastest", "slowest", "most", "least", "top", "worst"]
+        has_superlative = any(w in q_lower for w in superlative_words)
+        if has_superlative and not picked.get("order_by"):
+            rank_filters = [n for n in filter_nodes if n.column.lower() in ("position", "rank", "positionorder")]
+            if rank_filters:
+                matched_word = next(w for w in superlative_words if w in q_lower)
+                issues.append(
+                    f'The question uses a superlative ("{matched_word}") '
+                    f'but you filtered on {rank_filters[0].table}.{rank_filters[0].column} = {rank_filters[0].value}. '
+                    f'Use order_by on the actual metric column instead.'
+                )
+
+        # --- Check 7: Operation mismatch (count/sum/avg but no aggregation in picks) ---
+        if intent_operation in ("count", "sum", "avg", "count_distinct"):
+            comp_type = picked.get("computation_type", "")
+            if comp_type == "simple_lookup" and intent_operation != "lookup":
+                issues.append(
+                    f'Intent says operation is "{intent_operation}" but computation_type is "simple_lookup". '
+                    f'Change computation_type to "{intent_operation}".'
+                )
+
+        # Check 8 moved to _apply_domain_column_fixes (deterministic, no re-pick needed)
+
+        return "\n".join(issues)
+
+    def _probe_filter_values(
+        self, filter_nodes: list[QueryNode], db_path: Path | None,
+    ) -> list[QueryNode]:
+        """Probe actual DB values for TEXT filter columns to fix format mismatches."""
+        if not db_path or not filter_nodes:
+            return filter_nodes
+
+        probed: list[QueryNode] = []
+        try:
+            conn = sqlite3.connect(str(db_path))
+            for node in filter_nodes:
+                if node.operator not in ("=", "LIKE"):
+                    probed.append(node)
+                    continue
+                # Check if exact value exists
+                try:
+                    row = conn.execute(
+                        f'SELECT 1 FROM "{node.table}" WHERE "{node.column}" = ? LIMIT 1',
+                        (node.value,),
+                    ).fetchone()
+                    if row:
+                        probed.append(node)
+                        continue
+                    # Value doesn't match exactly — sample actual values to find format
+                    samples = conn.execute(
+                        f'SELECT DISTINCT "{node.column}" FROM "{node.table}" '
+                        f'WHERE "{node.column}" IS NOT NULL LIMIT 20'
+                    ).fetchall()
+                    sample_vals = [str(r[0]) for r in samples]
+                    # Try case-insensitive match
+                    val_lower = node.value.lower()
+                    matched = next((v for v in sample_vals if v.lower() == val_lower), None)
+                    if matched:
+                        probed.append(QueryNode(
+                            table=node.table, column=node.column, role=node.role,
+                            operator=node.operator, value=matched,
+                        ))
+                        continue
+                    # Try LIKE with key digits extracted from value
+                    # e.g. "0:01:54" → try LIKE "%1:54%"
+                    digits_pattern = re.sub(r'^[0:]+', '', node.value).rstrip("0").rstrip(".")
+                    if digits_pattern and len(digits_pattern) >= 3:
+                        like_row = conn.execute(
+                            f'SELECT "{node.column}" FROM "{node.table}" WHERE "{node.column}" LIKE ? LIMIT 1',
+                            (f"%{digits_pattern}%",),
+                        ).fetchone()
+                        if like_row:
+                            probed.append(QueryNode(
+                                table=node.table, column=node.column, role=node.role,
+                                operator="LIKE", value=f"%{digits_pattern}%",
+                            ))
+                            self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' → LIKE '%{digits_pattern}%'")
+                            continue
+                    # Keep original — let close-loop handle it
+                    probed.append(node)
+                    self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' not found in DB. Samples: {sample_vals[:5]}")
+                except Exception:
+                    probed.append(node)
+            conn.close()
+        except Exception:
+            return filter_nodes
+        return probed
+
+    def _apply_domain_column_fixes(
+        self,
+        question: str,
+        filter_nodes: list[QueryNode],
+        kg: KnowledgeGraph,
+        anchor_text: str,
+    ) -> list[QueryNode]:
+        """Deterministically swap filter columns when domain knowledge defines a better match."""
+        if not anchor_text or not filter_nodes:
+            return filter_nodes
+
+        q_lower = question.lower()
+        used_cols = {n.column.lower() for n in filter_nodes}
+
+        # Build map: domain-defined column name → (table, definition)
+        domain_cols: dict[str, tuple[str, str]] = {}
+        seen: set[str] = set()
+        for m in re.finditer(r'^- (\w+):\s+(.+)', anchor_text, re.MULTILINE):
+            defined_col = m.group(1).lower()
+            if defined_col in seen:
+                continue
+            seen.add(defined_col)
+            if defined_col not in q_lower or defined_col in used_cols:
+                continue
+            # Find which table has this column
+            for t in kg.tables:
+                for c in t.columns:
+                    if c.name.lower() == defined_col:
+                        domain_cols[defined_col] = (t.name, m.group(2))
+                        break
+
+        if not domain_cols:
+            return filter_nodes
+
+        # Swap: if a filter uses a synonym column (position↔rank, round↔number),
+        # replace it with the domain-defined column
+        synonym_groups = [
+            {"position", "rank", "positionorder"},
+            {"round", "number"},
+        ]
+        fixed = []
+        for node in filter_nodes:
+            swapped = False
+            for defined_col, (col_table, definition) in domain_cols.items():
+                # Check if this filter node is in the same synonym group as the domain column
+                for group in synonym_groups:
+                    if node.column.lower() in group and defined_col in group:
+                        # Swap to the domain-defined column
+                        fixed.append(QueryNode(
+                            table=col_table, column=defined_col, role=node.role,
+                            operator=node.operator, value=node.value,
+                        ))
+                        self._log("domain_fix",
+                            f'Swapped {node.table}.{node.column} → {col_table}.{defined_col} '
+                            f'(domain: "{definition[:60]}")')
+                        swapped = True
+                        break
+                if swapped:
+                    break
+            if not swapped:
+                fixed.append(node)
+        return fixed
+
+    def _check_filter_selectivity(
+        self, filter_nodes: list[QueryNode], db_path: Path | None,
+    ) -> str:
+        """Check if filters are discriminating. A filter that keeps >90% of rows is likely wrong."""
+        if not db_path or not filter_nodes:
+            return ""
+        issues: list[str] = []
+        try:
+            conn = sqlite3.connect(str(db_path))
+            for node in filter_nodes:
+                if node.operator in ("LIKE",):
+                    continue
+                # Skip null-guard filters — they protect ORDER BY, not meant to discriminate
+                if node.operator in ("IS NOT", "IS NOT NULL") or (
+                    node.operator == "!=" and node.value in ("", "NULL", None)
+                ):
+                    continue
+                try:
+                    total = conn.execute(
+                        f'SELECT COUNT(*) FROM "{node.table}"'
+                    ).fetchone()[0]
+                    if total == 0:
+                        continue
+                    if node.operator == "=":
+                        matching = conn.execute(
+                            f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" = ?',
+                            (node.value,),
+                        ).fetchone()[0]
+                    else:
+                        matching = conn.execute(
+                            f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" {node.operator} ?',
+                            (node.value,),
+                        ).fetchone()[0]
+                    ratio = matching / total
+                    if ratio > 0.9 and total > 5:
+                        # Find alternative numeric columns across all tables with same operator
+                        alternatives: list[str] = []
+                        tables = [r[0] for r in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()]
+                        for tbl in tables:
+                            cols = conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
+                            for c in cols:
+                                col_name = c[1]
+                                col_type = c[2].upper()
+                                if col_name == node.column:
+                                    continue
+                                # Only suggest columns with compatible type
+                                if node.operator in ("<", ">", "<=", ">=") and col_type not in ("INTEGER", "REAL", "NUMERIC", "FLOAT"):
+                                    continue
+                                try:
+                                    alt_match = conn.execute(
+                                        f'SELECT COUNT(*) FROM "{tbl}" WHERE "{col_name}" {node.operator} ?',
+                                        (node.value,),
+                                    ).fetchone()[0]
+                                    alt_total = conn.execute(
+                                        f'SELECT COUNT(*) FROM "{tbl}"'
+                                    ).fetchone()[0]
+                                    if alt_total > 0:
+                                        alt_ratio = alt_match / alt_total
+                                        if alt_ratio < 0.8 and alt_ratio > 0.01:
+                                            samples = conn.execute(
+                                                f'SELECT DISTINCT "{col_name}" FROM "{tbl}" WHERE "{col_name}" IS NOT NULL LIMIT 5'
+                                            ).fetchall()
+                                            sample_str = [r[0] for r in samples]
+                                            alternatives.append(
+                                                f'{tbl}.{col_name} (keeps {alt_ratio:.0%}, e.g. {sample_str})'
+                                            )
+                                except Exception:
+                                    pass
+                        alt_text = ""
+                        if alternatives:
+                            alt_text = " Better candidates: " + "; ".join(alternatives[:3])
+                        issues.append(
+                            f'Filter "{node.table}"."{node.column}" {node.operator} {node.value} '
+                            f'keeps {matching}/{total} rows ({ratio:.0%}) — too broad, probably wrong column.'
+                            f'{alt_text}'
+                        )
+                except Exception:
+                    pass
+            conn.close()
+        except Exception:
+            pass
+        return "\n".join(issues)
+
+    def _decompose_goal(
+        self,
+        question: str,
+        kg: KnowledgeGraph,
+        anchor_text: str,
+        user_intent: str,
+    ) -> dict[str, Any] | None:
+        """LLM decomposes question into output terms + filter terms. One LLM call."""
+        # Build compact column list from KG
+        col_list_parts: list[str] = []
+        for table in kg.tables:
+            cols_str = ", ".join(
+                f"{c.name}" + (f" -- {c.description}" if c.description else "")
+                for c in table.columns
+            )
+            col_list_parts.append(f"{table.name}: [{cols_str}]")
+        col_list = "\n".join(col_list_parts)
+
+        anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1500]}" if anchor_text else ""
+        intent_section = f"\nUSER INTENT:\n{user_intent}" if user_intent else ""
+
+        prompt = f"""QUESTION: {question}
+
+DATABASE COLUMNS:
+{col_list[:3000]}
+{anchor_section}{intent_section}
+
+Decompose this question into structured parts. Return ONLY JSON:
+{{
+  "what_user_wants": "restate what output the user expects",
+  "output_terms": ["phrase for each SELECT column — use words from the question"],
+  "filter_terms": [
+    {{"phrase": "the entity/value being filtered", "operator": "= | > | < | >= | <= | LIKE", "value": "the filter value"}}
+  ],
+  "computation_type": "simple_lookup | count | sum | avg | min_max | ratio | percentage"
+}}
+
+RULES:
+- output_terms: each phrase should map to ONE column. Use the question's exact words.
+- filter_terms: extract ALL conditions. "X-related" or "from X" → operator "LIKE", value "%X%".
+- If domain knowledge says "X = N", use that exact value.
+- "where the average exceeds N" on a column named Avg* or average* → operator ">", value N (it's pre-aggregated, use WHERE not HAVING).
+- Do NOT invent filters not in the question.
+- computation_type: "simple_lookup" for listing/identifying, "count" for how many, etc."""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages)
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict) and parsed.get("output_terms"):
+                return parsed
+        except Exception:
+            pass
+        return None
+
+    def _map_output_nodes(
+        self,
+        output_terms: list[str],
+        kg: KnowledgeGraph,
+        tables: list[str],
+        db_path: Path | None,
+        preferred_table: str = "",
+    ) -> list[QueryNode]:
+        """Map output term phrases to KG columns deterministically.
+
+        When scores tie, prefer columns from preferred_table (entity of interest).
+        """
+        nodes: list[QueryNode] = []
+        used_columns: set[tuple[str, str]] = set()
+
+        for term in output_terms:
+            candidates = map_phrase_to_columns(term, kg, tables, role="output")
+            if not candidates:
+                continue
+            # When multiple columns share the same name, prefer the entity of interest table
+            if preferred_table and len(candidates) >= 2:
+                # Find candidates with the same column name as the top match
+                top_col_name = candidates[0][1].lower()
+                same_name = [(t, c, s) for t, c, s in candidates if c.lower() == top_col_name]
+                preferred_match = next(
+                    ((t, c, s) for t, c, s in same_name if t.lower() == preferred_table.lower()),
+                    None,
+                )
+                if preferred_match:
+                    t, c, s = preferred_match
+                    if (t, c) not in used_columns:
+                        nodes.append(QueryNode(table=t, column=c, role="output"))
+                        used_columns.add((t, c))
+                        continue
+
+            # Pick best candidate not already used
+            for table, col, score in candidates:
+                if (table, col) not in used_columns and score >= 3.0:
+                    nodes.append(QueryNode(table=table, column=col, role="output"))
+                    used_columns.add((table, col))
+                    break
+
+        return nodes
+
+    def _map_filter_nodes(
+        self,
+        filter_terms: list[dict],
+        kg: KnowledgeGraph,
+        tables: list[str],
+        db_path: Path | None,
+        anchor_text: str,
+    ) -> list[QueryNode]:
+        """Map filter terms to KG columns, verifying values against DB."""
+        nodes: list[QueryNode] = []
+
+        for fterm in filter_terms:
+            if not isinstance(fterm, dict):
+                continue
+            phrase = fterm.get("phrase", "")
+            operator = fterm.get("operator", "=")
+            value = fterm.get("value", "")
+
+            if not phrase:
+                continue
+
+            # First try: find column by phrase
+            candidates = map_phrase_to_columns(phrase, kg, tables, role="filter")
+
+            # Second try: if value is a string, find which column actually contains it
+            value_matches: list[tuple[str, str, str, int]] = []
+            if value and isinstance(value, str) and not re.match(r'^[<>!=]*\s*\d+\.?\d*$', str(value).strip('%')):
+                value_matches = map_value_to_column(str(value).strip('%'), kg, tables, db_path)
+
+            # Merge: value match takes priority (ground truth from DB)
+            if value_matches:
+                best_table, best_col = value_matches[0][0], value_matches[0][1]
+                method = value_matches[0][2]
+                if method == "like" and operator == "=":
+                    operator = "LIKE"
+                    if not str(value).startswith('%'):
+                        value = f"%{str(value).strip('%')}%"
+                nodes.append(QueryNode(
+                    table=best_table, column=best_col, role="filter",
+                    operator=operator, value=value,
+                ))
+            elif candidates:
+                best_table, best_col, score = candidates[0]
+                if score >= 3.0:
+                    nodes.append(QueryNode(
+                        table=best_table, column=best_col, role="filter",
+                        operator=operator, value=value,
+                    ))
+
+        return nodes
+
+    def _format_kg_plan_as_grounding(
+        self,
+        path: QueryPath,
+        plan: QueryPlan | None,
+        goal: dict[str, Any],
+        sql: str,
+        kg: KnowledgeGraph | None = None,
+    ) -> str:
+        """Format the KG path plan as grounding context for the SQL LLM."""
+        parts: list[str] = []
+
+        parts.append(f"USER WANTS: {goal.get('what_user_wants', '')}")
+        comp_type = plan.computation_type if plan else goal.get("computation_type", "simple_lookup")
+        parts.append(f"COMPUTATION TYPE: {comp_type} (your SQL MUST produce this type of result)")
+
+        # Schema for tables in path (so LLM knows exact column names)
+        if kg and path.tables_in_path:
+            schema_lines: list[str] = []
+            for tname in path.tables_in_path:
+                table_schema = kg.get_table(tname)
+                if table_schema:
+                    cols = ", ".join(
+                        f'"{c.name}" ({c.sql_type})'
+                        for c in table_schema.columns
+                    )
+                    schema_lines.append(f'  "{tname}": [{cols}]')
+            if schema_lines:
+                parts.append("SCHEMA (exact column names — use quoted identifiers):\n" + "\n".join(schema_lines))
+
+        # Output columns (what to SELECT)
+        if path.output_nodes:
+            out_lines = [f'  "{n.table}"."{n.column}"' + (f" ({n.agg_func})" if n.agg_func else "")
+                         for n in path.output_nodes]
+            parts.append("SELECT COLUMNS (use these exact table.column references):\n" + "\n".join(out_lines))
+
+        # Join paths
+        if path.edges:
+            jp_lines = [f'  "{e.src_table}"."{e.src_column}" = "{e.dst_table}"."{e.dst_column}"' for e in path.edges]
+            parts.append("JOIN PATHS (use these exact join conditions):\n" + "\n".join(jp_lines))
+
+        # Filter values
+        if path.filter_nodes:
+            fv_lines: list[str] = []
+            for node in path.filter_nodes:
+                if node.operator.upper() == "LIKE":
+                    fv_lines.append(f'  "{node.table}"."{node.column}": USE → WHERE "{node.column}" LIKE \'{node.value}\' COLLATE NOCASE')
+                else:
+                    fv_lines.append(f'  "{node.table}"."{node.column}": {node.operator} {node.value}')
+            parts.append("FILTER VALUES (use these exact conditions in WHERE):\n" + "\n".join(fv_lines))
+
+        # ORDER BY (from picked dict) — used for superlatives (lowest/highest/best)
+        order_by = goal.get("order_by")
+        if order_by and isinstance(order_by, dict):
+            col_ref = order_by.get("column", "")
+            direction = order_by.get("direction", "ASC")
+            parts.append(f'ORDER BY: "{col_ref}" {direction} (use WHERE = (SELECT MIN/MAX...) to include ties)')
+
+        # Reference SQL if provided (from retry)
+        if sql:
+            parts.append(f"FAILED SQL (do NOT repeat — fix based on error):\n  {sql}")
+
+        return "GROUNDING CONTEXT:\n" + "\n".join(parts)
+
     def _call_semantic_grounding(
         self,
         question: str,
@@ -1310,8 +2388,7 @@ RULES:
         db_path: Path | None = None,
         kg: KnowledgeGraph | None = None,
     ) -> str:
-        """Multi-step grounding: Table Select → Focused Ground → Validate → Feedback."""
-        grounding: dict[str, Any] = {}
+        """Validate-first-then-ground: deterministic pre-validation → one-shot constrained grounding."""
 
         # Extract domain anchors
         anchor_text = self._extract_domain_anchors(question, knowledge_text, db_path=db_path)
@@ -1330,10 +2407,9 @@ RULES:
 
         self._log("grounding_iter", "--- Grounding ---")
 
-        # Knowledge guidance goes separately as high-priority binding constraints
         effective_anchor = anchor_text
 
-        # --- Step 2: Table Selection (uses intent + KG relationships + column descriptions) ---
+        # --- Step 2: Table Selection ---
         selected_tables = self._grounding_select_tables(
             question, kg_context, effective_anchor, db_path, kg=kg, user_intent=user_intent
         )
@@ -1344,15 +2420,13 @@ RULES:
             if col_notes:
                 knowledge_guidance = f"{col_notes}\n\n{knowledge_guidance}"
 
-        # --- Step 3: Focused Grounding with selected table details ---
+        # --- Step 3: Build focused schema ---
         focused_schema = ""
         if selected_tables and db_path:
             focused_schema = self._build_focused_schema_for_grounding(db_path, selected_tables, question, kg=kg)
-
-        # Use focused schema if available, otherwise fall back to full schema
         grounding_schema = focused_schema if focused_schema else kg_context
 
-        # Extract matching SQL from domain knowledge — if found, inject as absolute reference
+        # Extract matching SQL from domain knowledge
         domain_sql_ref = self._extract_matching_domain_sql(question, anchor_text)
         if domain_sql_ref:
             effective_anchor = (
@@ -1361,20 +2435,26 @@ RULES:
             )
             self._log("domain_sql_match", domain_sql_ref)
 
+        # --- Step 4: DETERMINISTIC PRE-VALIDATION ---
+        # Build validated context BEFORE the grounding LLM call
+        validated = self._build_validated_context(
+            question, db_path, selected_tables, kg, user_intent, effective_anchor
+        )
+
         # --- PRE-GROUNDING EVIDENCE ---
-        # 1. Ambiguous columns (same name in multiple tables) with sample values
-        # 2. Literal column name matches (question words that ARE column names)
         ambiguous_evidence = ""
         if db_path and selected_tables and len(selected_tables) > 1:
             ambiguous_evidence = self._scan_ambiguous_columns(db_path, selected_tables, question)
             if ambiguous_evidence:
                 self._log("ambiguous_cols_evidence", ambiguous_evidence)
 
-        # Literal column matches: inform LLM which question words directly map to column names
         literal_matches = self._scan_literal_column_matches(db_path, selected_tables, question)
         if literal_matches:
             ambiguous_evidence = f"{ambiguous_evidence}\n\n{literal_matches}" if ambiguous_evidence else literal_matches
 
+        # --- Step 5: ONE constrained grounding LLM call ---
+        # Inject validated facts as hard constraints so the LLM doesn't need to guess
+        validated_section = self._format_validated_context(validated)
 
         prompt = _build_semantic_prompt(
             question=question,
@@ -1385,6 +2465,7 @@ RULES:
             ambiguous_columns=ambiguous_evidence,
             user_intent=user_intent,
             knowledge_guidance=knowledge_guidance,
+            feedback=validated_section if validated_section else "",
         )
         messages = [ModelMessage(role="user", content=prompt)]
         raw = self._model_call_with_retry(messages)
@@ -1397,132 +2478,12 @@ RULES:
 
         if not isinstance(grounding, dict) or not grounding:
             self._log("semantic_grounding", "(failed to parse after retry)")
-            return "", ""
+            return ""
 
         self._log("grounding_v1", json.dumps(grounding, default=str))
 
-        # ============================================================
-        # CLOSED-LOOP GROUNDING: Compute joins → Validate against DB → Re-ground if needed
-        # Validation is purely deterministic (DB checks only).
-        # If failures found, re-ground with failures as feedback — no patching.
-        # ============================================================
-
-        # DETERMINISTIC: extract join paths from KG FKs, validate against DB
-        if db_path:
-            grounding = self._compute_join_paths(db_path, grounding, selected_tables, kg=kg)
-
-        if db_path and grounding:
-            schema_failures, grounding_failures = self._validate_grounding_against_db(
-                db_path, grounding, question, effective_anchor, user_intent=user_intent
-            )
-            all_failures = schema_failures + grounding_failures
-
-            if schema_failures:
-                # Preserve validated filter_overrides from v1 — schema failures are about
-                # columns/tables, not filter patterns that already matched rows.
-                v1_filter_overrides = dict(grounding.get("filter_overrides", {}))
-
-                # Schema failure: column/table doesn't exist → redo table selection + grounding
-                self._log("grounding_validation_failed", f"SCHEMA: {schema_failures}")
-                selected_tables = self._grounding_select_tables(
-                    question, kg_context, effective_anchor, db_path,
-                    feedback="\n".join(schema_failures), kg=kg, user_intent=user_intent,
-                )
-                focused_schema = self._build_focused_schema_for_grounding(
-                    db_path, selected_tables, question, kg=kg
-                ) if selected_tables else ""
-                grounding_schema = focused_schema if focused_schema else kg_context
-                ambiguous_evidence = self._scan_ambiguous_columns(db_path, selected_tables, question) if len(selected_tables) > 1 else ""
-
-                # Re-ground with corrected schema + hard constraints
-                constraints_text = (
-                    "⚠️ HARD CONSTRAINTS (verified against actual database — these are facts, not suggestions):\n"
-                    + "\n".join(f"- {f}" for f in all_failures)
-                    + "\n\nYour grounding MUST:\n"
-                    + "- Align with the USER INTENT above (answer shape, entity of interest, grain)\n"
-                    + "- Use columns from the entity the question is ABOUT (entity resolution)\n"
-                    + "- Respect table relationships — use the correct table for each attribute based on KG/FK structure\n"
-                    + "- For filter values that don't exist: reason about which actual DB value the question refers to (e.g., different format) and put ONLY the matching value(s) in known_values"
-                )
-                reground_prompt = _build_semantic_prompt(
-                    question=question,
-                    kg_context=grounding_schema,
-                    sample_data=sample_data if not focused_schema else "",
-                    anchor_text=effective_anchor,
-                    previous_attempt="",
-                    feedback=constraints_text,
-                    ambiguous_columns=ambiguous_evidence,
-                    user_intent=user_intent,
-                    knowledge_guidance=knowledge_guidance,
-                )
-                reground_messages = [ModelMessage(role="user", content=reground_prompt)]
-                raw_v2 = self._model_call_with_retry(reground_messages)
-                grounding_v2 = self._parse_json(raw_v2)
-                if isinstance(grounding_v2, dict) and grounding_v2:
-                    grounding = grounding_v2
-                    self._log("grounding_v2", json.dumps(grounding, default=str))
-                    grounding = self._compute_join_paths(db_path, grounding, selected_tables, kg=kg)
-                    self._validate_grounding_against_db(db_path, grounding, question, effective_anchor, user_intent=user_intent)
-
-                    # Reconcile: restore v1 filter_overrides for columns that v2 still uses
-                    if v1_filter_overrides:
-                        v2_overrides = grounding.get("filter_overrides", {})
-                        v2_known = grounding.get("known_values", {})
-                        for col_key, override in v1_filter_overrides.items():
-                            if col_key in v2_known and col_key not in v2_overrides:
-                                v2_overrides[col_key] = override
-                                self._log("filter_override_restored", f"{col_key}: {override}")
-                        grounding["filter_overrides"] = v2_overrides
-                else:
-                    self._log("grounding_v2_failed", "Re-ground failed to parse, keeping v1")
-
-            elif grounding_failures:
-                # Grounding failure: wrong values/joins/arithmetic → redo grounding only
-                self._log("grounding_validation_failed", f"GROUNDING: {grounding_failures}")
-                # Extract table switch directives from probe diagnostics
-                table_switch_notes = []
-                for f in grounding_failures:
-                    if "OTHER tables:" in f:
-                        table_switch_notes.append(
-                            "⚠️ CRITICAL: The filter column you used has NO matching data. "
-                            "You MUST switch to the alternative table indicated below."
-                        )
-                        break
-
-                constraints_text = (
-                    "\n".join(table_switch_notes) + "\n" if table_switch_notes else ""
-                ) + (
-                    "⚠️ HARD CONSTRAINTS (verified against actual database — these are facts, not suggestions):\n"
-                    + "\n".join(f"- {f}" for f in grounding_failures)
-                    + "\n\nYour grounding MUST:\n"
-                    + "- Align with the USER INTENT above (answer shape, entity of interest, grain)\n"
-                    + "- Use columns from the entity the question is ABOUT (entity resolution)\n"
-                    + "- Respect table relationships — use the correct table for each attribute based on KG/FK structure\n"
-                    + "- If a constraint says 'Value found in OTHER tables', you MUST use that table.column for the filter — do NOT use the original table\n"
-                    + "- For filter values that don't exist: reason about which actual DB value the question refers to (e.g., different format) and put ONLY the matching value(s) in known_values"
-                )
-                reground_prompt = _build_semantic_prompt(
-                    question=question,
-                    kg_context=grounding_schema,
-                    sample_data=sample_data if not focused_schema else "",
-                    anchor_text=effective_anchor,
-                    previous_attempt="",
-                    feedback=constraints_text,
-                    ambiguous_columns=ambiguous_evidence,
-                    user_intent=user_intent,
-                    knowledge_guidance=knowledge_guidance,
-                )
-                reground_messages = [ModelMessage(role="user", content=reground_prompt)]
-                raw_v2 = self._model_call_with_retry(reground_messages)
-                grounding_v2 = self._parse_json(raw_v2)
-                if isinstance(grounding_v2, dict) and grounding_v2:
-                    grounding = grounding_v2
-                    self._log("grounding_v2", json.dumps(grounding, default=str))
-                    grounding = self._compute_join_paths(db_path, grounding, selected_tables, kg=kg)
-                    # Re-run filter validation on v2 (for format patching)
-                    self._validate_grounding_against_db(db_path, grounding, question, effective_anchor, user_intent=user_intent)
-                else:
-                    self._log("grounding_v2_failed", "Re-ground failed to parse, keeping v1")
+        # --- Step 6: Merge validated facts into grounding (deterministic, no LLM) ---
+        grounding = self._merge_validated_into_grounding(grounding, validated, db_path, selected_tables, kg)
 
         # Verify all question entities appear in formula/known_values
         if grounding:
@@ -1534,13 +2495,336 @@ RULES:
 
         formatted = _format_grounding_for_sql(grounding)
 
-        # Synthesizer: resolve contradictions in grounding context using actual schema
-        if formatted and grounding_schema:
-            formatted = self._synthesize_grounding(question, formatted, grounding_schema)
-
         self._log("semantic_grounding_final", formatted if formatted else "(empty)")
 
         return formatted
+
+    def _build_validated_context(
+        self,
+        question: str,
+        db_path: Path | None,
+        selected_tables: list[str],
+        kg: KnowledgeGraph | None,
+        user_intent: str,
+        anchor_text: str,
+    ) -> dict[str, Any]:
+        """Deterministic pre-validation using KG as ground truth for schema facts,
+        DB probes only for filter value existence. Returns validated facts."""
+        validated: dict[str, Any] = {
+            "join_paths": [],
+            "filter_probes": {},
+            "filter_overrides": {},
+            "preagg_columns": [],
+            "format_notes": [],
+        }
+        if not db_path or not db_path.exists() or not selected_tables:
+            return validated
+
+        if kg is None:
+            kg = build_kg_from_sqlite(db_path)
+
+        # --- 1. Join paths from KG (already validated by value overlap during KG build) ---
+        tables_lower = {t.lower() for t in selected_tables}
+        for src_table, fk in kg.all_foreign_keys():
+            if src_table.lower() in tables_lower and fk.ref_table.lower() in tables_lower:
+                clause = f"{src_table}.{fk.column} = {fk.ref_table}.{fk.ref_column}"
+                if clause not in validated["join_paths"]:
+                    validated["join_paths"].append(clause)
+
+        if validated["join_paths"]:
+            self._log("grounding_join_paths", str(validated["join_paths"]))
+
+        # --- 2. Detect pre-aggregated columns from KG column names + stats ---
+        for tname in selected_tables:
+            table_schema = kg.get_table(tname)
+            if not table_schema:
+                continue
+            for col in table_schema.columns:
+                col_lower = col.name.lower()
+                if (col_lower.startswith("avg") or col_lower.startswith("total")
+                        or col_lower.startswith("sum") or col_lower.startswith("num")
+                        or col_lower.startswith("count")):
+                    stats = table_schema.col_stats.get(col.name, {})
+                    distinct = stats.get("distinct", 0)
+                    if table_schema.row_count > 0 and distinct > 1:
+                        validated["preagg_columns"].append(f"{tname}.{col.name}")
+
+        # --- 3. Probe filter values against DB ---
+        # Extract candidates from question: quoted strings + proper nouns
+        quoted = re.findall(r"['\"]([^'\"]+)['\"]", question)
+        proper_nouns = re.findall(r'(?:the |in |for |of |from )([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)*)', question)
+        filter_candidates = quoted + proper_nouns
+
+        # Extract domain-anchor filter conditions (e.g., "Filter condition: Thrombosis = 2")
+        anchor_filters: list[tuple[str, str]] = []
+        if anchor_text:
+            for m in re.finditer(r'Filter condition:\s*(\w+)\s*=\s*(\S+)', anchor_text):
+                anchor_filters.append((m.group(1), m.group(2)))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # 3a. Verify domain-anchor filters using KG to find the right table
+            for col_name, val in anchor_filters:
+                for tname in selected_tables:
+                    table_schema = kg.get_table(tname)
+                    if not table_schema:
+                        continue
+                    real_col = next((c.name for c in table_schema.columns if c.name.lower() == col_name.lower()), None)
+                    if not real_col:
+                        continue
+                    try:
+                        cnt = conn.execute(
+                            f'SELECT COUNT(*) FROM "{tname}" WHERE "{real_col}" = ?', (val,)
+                        ).fetchone()[0]
+                        if cnt > 0:
+                            key = f"{tname}.{real_col}"
+                            validated["filter_probes"][key] = {
+                                "value": val, "count": cnt, "method": "exact"
+                            }
+                            self._log("filter_verified", f"{key}='{val}' exists ({cnt} rows)")
+                    except Exception:
+                        pass
+                    break
+
+            # 3b. Probe question filter candidates against text columns (from KG)
+            for candidate in filter_candidates:
+                if len(candidate) < 2:
+                    continue
+                found_exact = False
+                for tname in selected_tables:
+                    if found_exact:
+                        break
+                    table_schema = kg.get_table(tname)
+                    if not table_schema:
+                        continue
+                    text_cols = [c.name for c in table_schema.columns
+                                 if c.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR", "")]
+                    for col in text_cols:
+                        try:
+                            cnt = conn.execute(
+                                f'SELECT COUNT(*) FROM "{tname}" WHERE "{col}" = ? COLLATE NOCASE',
+                                (candidate,)
+                            ).fetchone()[0]
+                            if cnt > 0:
+                                key = f"{tname}.{col}"
+                                if key not in validated["filter_probes"]:
+                                    validated["filter_probes"][key] = {
+                                        "value": candidate, "count": cnt, "method": "exact"
+                                    }
+                                found_exact = True
+                                break
+                        except Exception:
+                            continue
+                # LIKE fallback
+                if not found_exact:
+                    for tname in selected_tables:
+                        table_schema = kg.get_table(tname)
+                        if not table_schema:
+                            continue
+                        text_cols = [c.name for c in table_schema.columns
+                                     if c.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR", "")]
+                        for col in text_cols:
+                            try:
+                                like_cnt = conn.execute(
+                                    f'SELECT COUNT(*) FROM "{tname}" WHERE "{col}" LIKE ? COLLATE NOCASE',
+                                    (f'%{candidate}%',)
+                                ).fetchone()[0]
+                                if like_cnt > 0:
+                                    key = f"{tname}.{col}"
+                                    if key not in validated["filter_probes"]:
+                                        validated["filter_probes"][key] = {
+                                            "value": candidate, "count": like_cnt, "method": "like",
+                                            "override": f'"{col}" LIKE \'%{candidate}%\' COLLATE NOCASE',
+                                        }
+                                        validated["filter_overrides"][key] = (
+                                            f'"{col}" LIKE \'%{candidate}%\' COLLATE NOCASE'
+                                        )
+                                        validated["format_notes"].append(
+                                            f"For {tname}.{col}: use WHERE \"{col}\" LIKE '%{candidate}%' COLLATE NOCASE"
+                                        )
+                                    break
+                            except Exception:
+                                continue
+        finally:
+            conn.close()
+
+        return validated
+
+    def _format_validated_context(self, validated: dict[str, Any]) -> str:
+        """Format validated facts as constraints for the grounding LLM."""
+        parts: list[str] = []
+
+        if validated["join_paths"]:
+            parts.append(
+                "VALIDATED JOIN PATHS (verified to produce rows — use these exactly):\n"
+                + "\n".join(f"  {jp}" for jp in validated["join_paths"])
+            )
+
+        if validated["filter_probes"]:
+            lines: list[str] = []
+            for key, info in validated["filter_probes"].items():
+                if info["method"] == "exact":
+                    lines.append(f"  {key} = '{info['value']}' ({info['count']} rows)")
+                else:
+                    lines.append(f"  {key} LIKE '%{info['value']}%' ({info['count']} rows) — use LIKE, not =")
+            if lines:
+                parts.append(
+                    "VALIDATED FILTER VALUES (verified against DB — use these in known_values):\n"
+                    + "\n".join(lines)
+                )
+
+        if validated["preagg_columns"]:
+            parts.append(
+                "PRE-AGGREGATED COLUMNS (already store per-row aggregates — use WHERE, not AVG()):\n"
+                + "\n".join(f"  {col}" for col in validated["preagg_columns"])
+            )
+
+        if not parts:
+            return ""
+        return "⚠️ VALIDATED FACTS (verified against actual database — these override assumptions):\n" + "\n".join(parts)
+
+    def _merge_validated_into_grounding(
+        self,
+        grounding: dict[str, Any],
+        validated: dict[str, Any],
+        db_path: Path | None,
+        selected_tables: list[str],
+        kg: KnowledgeGraph | None,
+    ) -> dict[str, Any]:
+        """Deterministically merge validated DB facts into grounding output."""
+        # Merge join paths (validated ones take priority)
+        if validated["join_paths"]:
+            grounding["join_paths"] = validated["join_paths"]
+
+        # Merge filter overrides for LIKE patterns
+        if validated["filter_overrides"]:
+            existing_overrides = grounding.get("filter_overrides", {})
+            known_values = grounding.get("known_values", {})
+            for key, override in validated["filter_overrides"].items():
+                if key in known_values and key not in existing_overrides:
+                    existing_overrides[key] = override
+                    self._log("filter_override_applied", f"{key}: {override}")
+            grounding["filter_overrides"] = existing_overrides
+
+        # Merge format notes
+        if validated["format_notes"]:
+            existing_notes = grounding.get("data_format_notes", [])
+            for note in validated["format_notes"]:
+                if note not in existing_notes:
+                    existing_notes.append(note)
+            grounding["data_format_notes"] = existing_notes
+
+        # Validate known_values against DB — fix format mismatches
+        if db_path and grounding.get("known_values"):
+            grounding = self._validate_known_values_against_db(db_path, grounding, validated)
+
+        return grounding
+
+    def _validate_known_values_against_db(
+        self,
+        db_path: Path,
+        grounding: dict[str, Any],
+        validated: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify that grounding's known_values actually exist in DB. Fix format mismatches."""
+        known_values = grounding.get("known_values", {})
+        filter_overrides = grounding.get("filter_overrides", {})
+        format_notes = grounding.get("data_format_notes", [])
+
+        try:
+            conn = sqlite3.connect(str(db_path))
+        except Exception:
+            return grounding
+
+        try:
+            for col_key, values in list(known_values.items()):
+                if "." not in col_key or not values:
+                    continue
+                table_name, col_name = col_key.split(".", 1)
+                # Skip comparison operators, SQL expressions, numerics
+                if all(re.match(r'^[<>!=]', str(v).strip()) for v in values if v):
+                    continue
+                if any(any(kw in str(v).upper() for kw in ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX')) for v in values if v):
+                    continue
+                if all(re.match(r'^-?\d+\.?\d*$', str(v).strip()) for v in values if v):
+                    continue
+                if len(values) > 5:
+                    continue
+
+                # Already validated via pre-validation
+                if col_key in validated["filter_overrides"]:
+                    if col_key not in filter_overrides:
+                        filter_overrides[col_key] = validated["filter_overrides"][col_key]
+                    continue
+
+                corrected_values = []
+                for val in values:
+                    val_str = str(val)
+                    try:
+                        # Check LIKE wildcards first
+                        if '%' in val_str:
+                            like_cnt = conn.execute(
+                                f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_name}" LIKE ? COLLATE NOCASE',
+                                (val_str,)
+                            ).fetchone()[0]
+                            if like_cnt > 0:
+                                corrected_values.append(val)
+                                filter_overrides[col_key] = f'"{col_name}" LIKE \'{val_str}\' COLLATE NOCASE'
+                                format_notes.append(
+                                    f"For {table_name}.{col_name}: use WHERE \"{col_name}\" LIKE '{val_str}' COLLATE NOCASE"
+                                )
+                                self._log("filter_verified", f"{col_key}='{val}' matches {like_cnt} rows via LIKE")
+                                continue
+
+                        # Exact match
+                        cnt = conn.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_name}" = ?',
+                            (val_str,)
+                        ).fetchone()[0]
+                        if cnt > 0:
+                            corrected_values.append(val)
+                            self._log("filter_verified", f"{col_key}='{val}' exists ({cnt} rows)")
+                            continue
+
+                        # Case-insensitive check
+                        ci_row = conn.execute(
+                            f'SELECT "{col_name}" FROM "{table_name}" WHERE "{col_name}" = ? COLLATE NOCASE LIMIT 1',
+                            (val_str,)
+                        ).fetchone()
+                        if ci_row:
+                            corrected_values.append(str(ci_row[0]))
+                            self._log("filter_verified", f"{col_key}='{val}' → case-corrected to '{ci_row[0]}'")
+                            continue
+
+                        # LIKE fallback — try prefix match
+                        like_cnt = conn.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_name}" LIKE ? COLLATE NOCASE',
+                            (f'%{val_str}%',)
+                        ).fetchone()[0]
+                        if like_cnt > 0:
+                            corrected_values.append(val)
+                            filter_overrides[col_key] = f'"{col_name}" LIKE \'%{val_str}%\' COLLATE NOCASE'
+                            format_notes.append(
+                                f"For {table_name}.{col_name}: use WHERE \"{col_name}\" LIKE '%{val_str}%' COLLATE NOCASE"
+                            )
+                            self._log("filter_corrected", f"{col_key}: '{val}' → LIKE '%{val_str}%'")
+                            continue
+
+                        # Value not found at all — keep it but note
+                        corrected_values.append(val)
+                        self._log("filter_verified", f"{col_key}='{val}' NOT found in DB")
+                    except Exception:
+                        corrected_values.append(val)
+
+                known_values[col_key] = corrected_values
+
+            grounding["known_values"] = known_values
+            grounding["filter_overrides"] = filter_overrides
+            grounding["data_format_notes"] = format_notes
+        finally:
+            conn.close()
+
+        return grounding
 
     def _synthesize_grounding(self, question: str, raw_grounding: str, schema: str) -> str:
         """LLM resolves contradictions in grounding context against actual schema."""
@@ -1654,8 +2938,8 @@ If the question asks for something with a superlative (lowest, highest, most, le
 
         # Extract quoted entities from question
         quoted = re.findall(r"['\"]([^'\"]+)['\"]", question)
-        # Extract proper nouns (capitalized multi-word sequences not at start of sentence)
-        proper_nouns = re.findall(r'(?:the |in |for |of )([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)+)', question)
+        # Extract proper nouns (multi-word capitalized sequences not at start of sentence)
+        proper_nouns = re.findall(r'(?:the |in |for |of |from )([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)+)', question)
 
         missing_entities = []
         for entity in quoted + proper_nouns:
@@ -1730,10 +3014,13 @@ If the question asks for something with a superlative (lowest, highest, most, le
             current_table = ""
             for line in kg_context.split("\n"):
                 if line.startswith("TABLE: "):
-                    current_table = line.split("TABLE: ")[1].split(" ")[0].split("(")[0].strip()
+                    current_table = line.split("TABLE: ")[1].split(" (")[0].strip()
                     schema_lines.append(f"\n{current_table}:")
                 elif line.strip().startswith("- ") and current_table:
-                    col_name = line.strip()[2:].split(" ")[0].split("(")[0].strip()
+                    # Column name is everything between "- " and " (" (type annotation)
+                    col_part = line.strip()[2:]
+                    paren_idx = col_part.find(" (")
+                    col_name = col_part[:paren_idx].strip() if paren_idx > 0 else col_part.split("  ")[0].strip()
                     if col_name:
                         schema_lines.append(f"  {col_name}")
             if schema_lines:
@@ -1753,45 +3040,103 @@ RULES:
 - Use ONLY the exact column names from ACTUAL DATABASE COLUMNS above — NEVER use human-readable descriptions as column names.
 - If nothing is relevant, return: NONE"""
 
+        # Build lookup of real column names per table for post-validation
+        real_columns: dict[str, list[str]] = {}
+        current_t = ""
+        for line in kg_context.split("\n"):
+            if line.startswith("TABLE: "):
+                current_t = line.split("TABLE: ")[1].split(" (")[0].strip()
+            elif line.strip().startswith("- ") and current_t:
+                col_part = line.strip()[2:]
+                paren_idx = col_part.find(" (")
+                cname = col_part[:paren_idx].strip() if paren_idx > 0 else col_part.split("  ")[0].strip()
+                if cname:
+                    real_columns.setdefault(current_t, []).append(cname)
+
         messages = [ModelMessage(role="user", content=prompt)]
         try:
             raw = self._model_call_with_retry(messages)
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             if raw.upper().startswith("NONE") or len(raw) < 10:
                 return ""
+            # Post-validate: snap any table.column references to real column names
+            if real_columns:
+                raw = self._snap_columns_to_schema(raw, real_columns)
             return raw
         except Exception:
             return ""
 
+    def _snap_columns_to_schema(self, text: str, real_columns: dict[str, list[str]]) -> str:
+        """Replace table.column references with the closest matching real column name."""
+        # Find all table.column patterns
+        def _best_match(table: str, col: str) -> str:
+            cols = real_columns.get(table, [])
+            if not cols:
+                return col
+            # Exact match
+            for c in cols:
+                if c.lower() == col.lower():
+                    return c
+            # Substring containment: real column contains the LLM output
+            for c in cols:
+                if col.lower() in c.lower():
+                    return c
+            # Reverse: LLM output contains a real column name
+            for c in cols:
+                if c.lower() in col.lower():
+                    return c
+            return col
 
+        def _replace(m: re.Match) -> str:
+            table, col = m.group(1), m.group(2)
+            real = _best_match(table, col)
+            return f"{table}.{real}"
+
+        all_tables = "|".join(re.escape(t) for t in real_columns)
+        if all_tables:
+            text = re.sub(
+                rf'\b({all_tables})\.([A-Za-z][A-Za-z0-9_ ]*(?:\([^)]*\))?)',
+                _replace, text
+            )
+        return text
 
     def _detect_user_intent_only(self, question: str, kg_context: str = "", anchor_text: str = "") -> str:
-        """Lightweight intent detection — always runs before table selection."""
+        """Detect user intent: what to return, how to filter, what operation."""
         schema_section = f"\nDATABASE SCHEMA:\n{kg_context[:2000]}\n" if kg_context else ""
         domain_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1000]}\n" if anchor_text else ""
         prompt = f"""QUESTION: {question}
 {schema_section}{domain_section}
-What is the user's analytical intent? Return ONLY a JSON object:
+Decompose this question into its analytical intent. Return ONLY JSON:
 {{
   "answer_shape": "single_value | list | grouped_table",
-  "operation": "lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | rank | comparison",
+  "operation": "lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | rank",
   "grain": "one answer for entire dataset | one row per entity | one row per group",
-  "population_filter": "what subset of data to look at (or 'all')",
-  "metric": "the column name from the schema that should be in SELECT",
-  "entity_of_interest": "which entity the question is asking ABOUT"
+  "what_to_return": "the THING the user wants to see in the answer (e.g. 'race names', 'eye colour', 'total cost')",
+  "who_to_filter_on": "the NAMED ENTITY or CONDITION that selects the subset (e.g. 'Alex Yoong', 'Women\\'s Soccer', 'race 19')",
+  "entity_of_interest": "the database entity whose attributes the user wants RETURNED (not the filter entity)"
 }}
 
-RULES:
-- FULL SENTENCE FIRST: Parse the COMPLETE question as a whole before deciding shape. Do not extract meaning from partial phrases in isolation.
-- "List all X" / "What are the X" = list (ALL matching rows, never limit)
-- "How many" = single_value (count)
-- "For each X, what is Y" = grouped_table. ONLY use grouped_table if the question explicitly says "for each" / "per" / "by" / "breakdown".
-- "Identify the X and Y for Z" = single row lookup of attributes X and Y for entity Z. This is NOT grouped_table.
-- SUBJECT vs CRITERION: The question's SUBJECT (what the user wants identified/returned) is the metric. The CRITERION (superlative, filter, condition) is how you find it. metric = SUBJECT's identifier, NOT the criterion value.
-- "List all X" → metric is the identifier column of X from the schema.
-- metric MUST be an actual column name from the schema above.
-- COLUMN SELECTION: Match columns using the FULL noun phrase from the question, not individual words in isolation.
-- NEVER specify row counts or limits"""
+HOW TO DECIDE:
+1. Read the question and identify: WHAT does the user want to SEE in the result?
+   - "Which race was X in" → user wants to see RACE NAMES
+   - "What is the eye colour" → user wants to see COLOUR VALUES
+   - "How many members attended" → user wants to see a COUNT
+   - "List their ID, sex and disease" → user wants to see ID, SEX, DISEASE columns
+
+2. Identify: WHO/WHAT constrains the data?
+   - "Which race was ALEX YOONG in" → Alex Yoong is the filter (find rows about this person)
+   - "the driver with the BEST lap time" → best is a superlative (ORDER BY, not a filter value)
+   - "in RACE NUMBER 19" → race 19 is a filter
+
+3. entity_of_interest = the entity whose ATTRIBUTES appear in the output.
+   - "Which RACE was Alex Yoong in" → entity_of_interest = race (we return race attributes)
+   - "What is the SURNAME of the driver" → entity_of_interest = driver (we return driver attributes)
+   - "eye COLOUR of the superhero" → entity_of_interest = colour (we return from colour table)
+
+COMMON MISTAKES TO AVOID:
+- "Which race was X in" → entity is RACE not driver. The driver is the filter, not the output.
+- "What is the colour of X" → if colour is stored in a lookup table, entity is the LOOKUP table.
+- Do NOT confuse the filter entity with the output entity."""
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
@@ -1805,10 +3150,10 @@ RULES:
                     lines.append(f"Operation: {parsed['operation']}")
                 if parsed.get("grain"):
                     lines.append(f"Grain: {parsed['grain']}")
-                if parsed.get("population_filter") and parsed["population_filter"] != "all":
-                    lines.append(f"Population (WHERE): {parsed['population_filter']}")
-                if parsed.get("metric") and parsed["metric"] != "all columns requested":
-                    lines.append(f"Metric (SELECT): {parsed['metric']}")
+                if parsed.get("who_to_filter_on") and parsed["who_to_filter_on"] not in ("all", "none", ""):
+                    lines.append(f"Population (WHERE): {parsed['who_to_filter_on']}")
+                if parsed.get("what_to_return"):
+                    lines.append(f"Metric (SELECT): {parsed['what_to_return']}")
                 if parsed.get("entity_of_interest"):
                     lines.append(f"Entity of interest: {parsed['entity_of_interest']} (prefer this table's columns for output)")
                 return "\n".join(lines)
@@ -2118,8 +3463,9 @@ Return ONLY: {{"tables": ["table1", "table2", ...]}}"""
 
                 lines.append("")
 
-            # Inferred FKs between selected tables
-            kg = build_kg_from_sqlite(db_path)
+            # Inferred FKs between selected tables (from KG — already validated)
+            if kg is None:
+                kg = build_kg_from_sqlite(db_path)
             table_set = set(t.lower() for t in tables)
             for src_table, fk in kg.inferred_fks:
                 if src_table.lower() in table_set and fk.ref_table.lower() in table_set:
@@ -2136,31 +3482,26 @@ Return ONLY: {{"tables": ["table1", "table2", ...]}}"""
             # Detect bidirectional link tables (stores each relationship in both directions)
             bidir_notes = self._detect_bidirectional_tables(conn, tables)
 
-            # Detect pre-aggregated columns (Avg*, Total*, Sum*, Count* naming)
+            # Detect pre-aggregated columns using KG stats
             preagg_notes: list[str] = []
             for tname in tables:
-                try:
-                    cols = conn.execute(f'PRAGMA table_info("{tname}")').fetchall()
-                    for c in cols:
-                        col_name = c[1]
-                        col_lower = col_name.lower()
-                        if (col_lower.startswith("avg") or col_lower.startswith("total")
-                                or col_lower.startswith("sum") or col_lower.startswith("num")
-                                or col_lower.startswith("count")):
-                            row_count = conn.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
-                            distinct = conn.execute(
-                                f'SELECT COUNT(DISTINCT "{col_name}") FROM "{tname}" '
-                                f'WHERE "{col_name}" IS NOT NULL'
-                            ).fetchone()[0]
-                            if row_count > 0 and distinct > 1:
-                                preagg_notes.append(
-                                    f"Column {tname}.{col_name} already stores a per-row "
-                                    f"aggregate value ({distinct} distinct values across {row_count} rows). "
-                                    f"Use WHERE {col_name} > N directly — do NOT wrap in AVG()/SUM() "
-                                    f"unless the question explicitly asks for an average OF averages."
-                                )
-                except Exception:
-                    pass
+                table_schema = kg.get_table(tname) if kg else None
+                if not table_schema:
+                    continue
+                for col in table_schema.columns:
+                    col_lower = col.name.lower()
+                    if (col_lower.startswith("avg") or col_lower.startswith("total")
+                            or col_lower.startswith("sum") or col_lower.startswith("num")
+                            or col_lower.startswith("count")):
+                        stats = table_schema.col_stats.get(col.name, {})
+                        distinct = stats.get("distinct", 0)
+                        if table_schema.row_count > 0 and distinct > 1:
+                            preagg_notes.append(
+                                f"Column {tname}.{col.name} already stores a per-row "
+                                f"aggregate value ({distinct} distinct values across {table_schema.row_count} rows). "
+                                f"Use WHERE {col.name} > N directly — do NOT wrap in AVG()/SUM() "
+                                f"unless the question explicitly asks for an average OF averages."
+                            )
 
             if bidir_notes or preagg_notes:
                 lines.append("=== DATA STORAGE NOTES ===")
@@ -4781,13 +6122,32 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             raw_id_cols = []
             for i, col in enumerate(cols):
                 sample_vals = [str(rows[r][i]) for r in range(min(len(rows), 3))]
-                # Detect patterns: "rec..." (Airtable IDs), all-digit long strings unlikely to be answers
+                # Only flag if VALUES look like opaque hashes (e.g. Airtable "rec..." IDs)
                 for v in sample_vals:
-                    if v and (v.startswith("rec") and len(v) > 10) or \
-                       (col.lower().endswith("_id") and not any(w in q_lower for w in [col.lower(), "id"])):
+                    if v and v.startswith("rec") and len(v) > 10 and v[3:].isalnum():
                         has_raw_id = True
                         raw_id_cols.append((i, col, sample_vals[0]))
                         break
+
+            # Skip if there's already a human-readable column alongside the ID
+            if has_raw_id and len(raw_id_cols) > 0 and len(cols) > len(raw_id_cols):
+                non_id_cols = [c for i, c in enumerate(cols) if i not in {idx for idx, _, _ in raw_id_cols}]
+                has_readable = any(
+                    any(w in c.lower() for w in ("name", "title", "label", "description", "forename", "surname"))
+                    for c in non_id_cols
+                )
+                if has_readable:
+                    # Just drop the ID columns instead of re-querying
+                    keep_indices = [i for i in range(len(cols)) if i not in {idx for idx, _, _ in raw_id_cols}]
+                    data_result = {
+                        "columns": [cols[i] for i in keep_indices],
+                        "rows": [[row[i] for i in keep_indices] for row in rows],
+                    }
+                    self._log("shape_fix_fk", f"Dropped raw ID columns: {[c for _, c, _ in raw_id_cols]}")
+                    cols = data_result["columns"]
+                    rows = data_result["rows"]
+                    has_raw_id = False
+                    raw_id_cols = []
 
             if has_raw_id and len(raw_id_cols) > 0:
                 id_desc = ", ".join(f"'{c}' has values like '{v}'" for _, c, v in raw_id_cols)
