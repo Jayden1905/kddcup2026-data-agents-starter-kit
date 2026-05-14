@@ -376,6 +376,46 @@ def _infer_foreign_keys(
                         ref_table_name, ref_col_name, False,
                     ))
 
+
+    # Cross-table overlap: for table pairs with no candidates yet,
+    # check high-uniqueness columns for value overlap
+    candidate_pairs: set[tuple[str, str]] = set()
+    for src_t, _, ref_t, _, _ in candidates:
+        candidate_pairs.add((min(src_t, ref_t), max(src_t, ref_t)))
+
+    # Columns whose names reference an existing table (skip in cross-scan — already handled)
+    named_fk_cols: set[tuple[str, str]] = set()
+    for table in tables:
+        for col in table.columns:
+            ref = _extract_ref_name(col.name)
+            if ref and _resolve_table_name(ref, table_names_lower):
+                named_fk_cols.add((table.name, col.name))
+
+    for i, t1 in enumerate(tables):
+        for t2 in tables[i + 1:]:
+            pair_key = (min(t1.name, t2.name), max(t1.name, t2.name))
+            if pair_key in candidate_pairs:
+                continue
+            # Collect key-like columns: PKs or high-uniqueness (≥90% distinct)
+            # Exclude columns that clearly reference another table by name
+            t1_keys: list[Column] = []
+            t2_keys: list[Column] = []
+            for t, keys in [(t1, t1_keys), (t2, t2_keys)]:
+                for c in t.columns:
+                    if (t.name, c.name) in named_fk_cols:
+                        continue
+                    if c.is_pk:
+                        keys.append(c)
+                    elif t.row_count > 0:
+                        stats = t.col_stats.get(c.name, {})
+                        distinct = stats.get("distinct", 0)
+                        if distinct > 0 and distinct / t.row_count >= 0.9:
+                            keys.append(c)
+            for c1 in t1_keys:
+                for c2 in t2_keys:
+                    candidates.append((t1.name, c1.name, t2.name, c2.name, False))
+                    candidates.append((t2.name, c2.name, t1.name, c1.name, False))
+
     # Validate candidates via value overlap + uniqueness analysis
     inferred: list[tuple[str, ForeignKey]] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -446,12 +486,14 @@ def _infer_foreign_keys(
 
 
 def _is_joinable_column(col_name: str) -> bool:
-    """Check if a column name looks like a join key (for Pattern 3 — shared names)."""
+    """Check if a column name looks like a join key."""
     col_lower = col_name.lower()
     return (
         col_lower == "id"
         or col_lower.endswith("_id")
         or col_lower.endswith("id") and len(col_lower) > 2
+        or col_lower.endswith("code") or col_lower.endswith("_code")
+        or col_lower.endswith("_key") or col_lower.endswith("_no")
         or col_lower in ("key", "code", "number", "no", "num")
     )
 
@@ -511,6 +553,23 @@ def _check_value_overlap(
 
         if not src_vals:
             return False
+
+        # Reject categorical columns (low uniqueness in own table)
+        # e.g., gender_id (3 distinct / 756 rows) is NOT a FK
+        # but member.zip (33 distinct / 33 rows) IS a valid FK
+        if not name_match and not is_one_to_many:
+            try:
+                src_row_count = conn.execute(
+                    f'SELECT COUNT(*) FROM "{src_table}"'
+                ).fetchone()[0]
+                src_distinct = conn.execute(
+                    f'SELECT COUNT(DISTINCT "{src_col}") FROM "{src_table}" '
+                    f'WHERE "{src_col}" IS NOT NULL'
+                ).fetchone()[0]
+                if src_row_count > 0 and src_distinct / src_row_count < 0.5:
+                    return False
+            except Exception:
+                pass
 
         # Check how many exist in ref table
         matches = 0
