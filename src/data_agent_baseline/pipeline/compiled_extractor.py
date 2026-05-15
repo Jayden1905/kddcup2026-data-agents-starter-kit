@@ -506,8 +506,17 @@ def _run_planner(
     try:
         plan = json.loads(raw)
         if isinstance(plan, dict) and "fields" in plan:
+            # Strip table alias prefixes (e.g. "leagueData.name" → "name")
+            fields = [f.split(".")[-1] if "." in f and f != "_id" else f for f in plan["fields"]]
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for f in fields:
+                if f not in seen:
+                    seen.add(f)
+                    deduped.append(f)
+            fields = deduped
             # Ensure _id is always the first field
-            fields = plan["fields"]
             if "_id" not in fields:
                 fields.insert(0, "_id")
             elif fields[0] != "_id":
@@ -614,17 +623,17 @@ def _run_workers(
             f"({len(failed_chunks)} empty batches)",
         )
 
-    # Normalize _id: if most IDs are numeric, strip surrounding text from non-numeric ones
+    # Normalize _id: strip text prefixes from IDs that contain numbers
     id_values = [str(r.get("_id", "")) for r in all_records if r.get("_id")]
     numeric_count = sum(1 for v in id_values if v.isdigit())
-    if numeric_count > len(id_values) * 0.3:
+    has_digits_count = sum(1 for v in id_values if re.search(r"\d", v))
+    if numeric_count > len(id_values) * 0.3 or has_digits_count > len(id_values) * 0.7:
         for r in all_records:
             rid = str(r.get("_id", ""))
             if not rid.isdigit():
-                # Extract the numeric part
                 nums = re.findall(r"\d+", rid)
                 if nums:
-                    r["_id"] = nums[-1]  # Use last number (most specific)
+                    r["_id"] = nums[-1]
         if log_fn:
             normalized = sum(1 for r in all_records if str(r.get("_id", "")).isdigit())
             log_fn("id_normalize", f"{normalized}/{len(all_records)} IDs are now numeric")
@@ -845,22 +854,23 @@ def chunked_extract(
             conn.close()
         except Exception:
             pass
-    # Augment: add columns from the same entity section in knowledge.md
-    # Only add columns that were defined under the same entity heading as the planner's entity
+    # Augment: add columns from the same entity definition in knowledge.md
     if knowledge_text and plan.get("entity"):
         entity_name = plan["entity"].lower()
         plan_fields = set(plan.get("fields", []))
-        # Parse knowledge.md for fields under the matching entity heading
-        entity_section = ""
-        for section in re.split(r"###\s+", knowledge_text):
-            if entity_name in section[:50].lower():
-                entity_section = section
-                break
-        if entity_section:
-            # Extract field names from "- **field_name (...)**:" pattern
-            knowledge_fields = re.findall(r"\*\*(\w+)\s*\(", entity_section)
-            # Also extract from `entityData.field` or `entity.field` backtick patterns
-            backtick_fields = re.findall(r'`\w+\.(\w+)`', entity_section)
+        # Find the entity's own definition block (between its **Entity**: and the next **Entity**:)
+        entity_block = ""
+        pattern = re.compile(
+            r'-\s*\*\*' + re.escape(entity_name) + r'\*\*.*?(?=\n-\s*\*\*[A-Z]|\n###|\Z)',
+            re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.search(knowledge_text)
+        if match:
+            entity_block = match.group(0)
+        if entity_block:
+            # Extract from `entityData.field` backtick patterns within this entity's definition
+            backtick_fields = re.findall(r'`\w+\.(\w+)`', entity_block)
+            knowledge_fields = re.findall(r"\*\*(\w+)\s*\(", entity_block)
             all_knowledge_fields = list(dict.fromkeys(knowledge_fields + backtick_fields))
             missing_added = []
             for col in all_knowledge_fields:

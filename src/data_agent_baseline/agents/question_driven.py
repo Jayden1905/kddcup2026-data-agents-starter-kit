@@ -123,7 +123,8 @@ def _build_sql_prompt(
         "- CAST(x AS REAL) for division.\n"
         "- WHERE col IS NOT NULL to avoid nulls. Escape apostrophes with ''.\n"
         "- Never transform, concatenate, or split column values.\n"
-        "- For 'how many [entities]' with JOINs, use COUNT(DISTINCT entity.primary_key) to avoid counting duplicates from the join."
+        "- For 'how many [entities]' with JOINs, use COUNT(DISTINCT entity.primary_key) to avoid counting duplicates from the join.\n"
+        "- If a CROSS-ROW HINT is provided, you MUST use the subquery pattern shown there (WHERE id IN (SELECT ...)) — do NOT put those conditions directly in the outer WHERE."
     )
 
     if gaps:
@@ -891,21 +892,106 @@ class QuestionDrivenAgent:
                 except Exception:
                     pass
 
-            # Step 3: Doc extraction (batch LLM with entity-boundary awareness)
+            # Store doc paths for downstream access (entity resolution from docs)
+            self._doc_paths = [doc.path for doc in ctx.doc_sources] if ctx.doc_sources else []
+
+            # Step 3: Doc extraction — evidence-based decision.
+            # A doc should be extracted if:
+            #   (a) doc name overlaps an existing table (additional records for it), OR
+            #   (b) DB probe: a column contains opaque IDs that appear in the doc text
+            #       (the doc is a lookup table for that FK column), OR
+            #   (c) No structured tables exist (doc is the only data source)
             if ctx.doc_sources:
-                doc_paths = [doc.path for doc in ctx.doc_sources]
-                from data_agent_baseline.pipeline.compiled_extractor import (
-                    compiled_extract_docs,
-                )
-                n_extracted = compiled_extract_docs(
-                    doc_paths=doc_paths,
-                    db_path=db_path,
-                    model=self.model,
-                    question=question,
-                    knowledge_text=ctx.knowledge_text,
-                    log_fn=self._log,
-                    structured_tables=structured_tables,
-                )
+                docs_to_extract: list[Path] = []
+
+                # (a) Name overlap with existing tables
+                if structured_tables:
+                    tables_lower = {t.lower() for t in structured_tables}
+                    for doc in ctx.doc_sources:
+                        doc_stem = doc.path.stem.lower()
+                        if any(doc_stem in tbl or tbl in doc_stem for tbl in tables_lower):
+                            docs_to_extract.append(doc.path)
+
+                # (b) Evidence-based: probe DB columns for opaque IDs, check if they
+                #     appear in doc text. No naming conventions assumed.
+                if structured_tables and db_path.exists():
+                    # Pre-read doc texts (first 5000 chars is enough for ID detection)
+                    doc_texts: dict[Path, str] = {}
+                    for doc in ctx.doc_sources:
+                        if doc.path in docs_to_extract:
+                            continue
+                        try:
+                            doc_texts[doc.path] = doc.path.read_text(
+                                encoding="utf-8", errors="replace"
+                            )[:20000]
+                        except OSError:
+                            pass
+
+                    if doc_texts:
+                        try:
+                            _conn = sqlite3.connect(str(db_path))
+                            for tbl in structured_tables:
+                                cols = _conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
+                                for col_info in cols:
+                                    col_name = col_info[1]
+                                    col_type = (col_info[2] or "").upper()
+                                    # Skip numeric/primary columns
+                                    if col_type in ("INTEGER", "REAL", "NUMERIC"):
+                                        continue
+                                    # Sample values from this column
+                                    sample_rows = _conn.execute(
+                                        f'SELECT DISTINCT "{col_name}" FROM "{tbl}" '
+                                        f'WHERE "{col_name}" IS NOT NULL LIMIT 5'
+                                    ).fetchall()
+                                    if not sample_rows:
+                                        continue
+                                    sample_vals = [str(r[0]) for r in sample_rows if r[0]]
+                                    if not sample_vals:
+                                        continue
+                                    # Signal: values look like opaque IDs (not readable text)
+                                    # — short-ish, no spaces, alphanumeric/hash-like
+                                    is_opaque = all(
+                                        len(v) >= 5 and len(v) <= 50
+                                        and " " not in v and "@" not in v
+                                        and not v.replace(".", "").replace("-", "").isdigit()
+                                        and sum(c.isalpha() for c in v) >= 3
+                                        for v in sample_vals
+                                    )
+                                    if not is_opaque:
+                                        continue
+                                    # Probe: do these IDs appear in any doc?
+                                    for doc_path, doc_text in doc_texts.items():
+                                        matches = sum(1 for v in sample_vals if v in doc_text)
+                                        if matches >= 2 or (matches >= 1 and len(sample_vals) <= 2):
+                                            if doc_path not in docs_to_extract:
+                                                docs_to_extract.append(doc_path)
+                                                self._log(
+                                                    "doc_fk_probe",
+                                                    f"{tbl}.{col_name} IDs found in {doc_path.name} "
+                                                    f"({matches}/{len(sample_vals)} matched)",
+                                                )
+                                            break
+                            _conn.close()
+                        except Exception:
+                            pass
+
+                # (c) Fallback: if no structured tables exist, extract all docs
+                if not structured_tables and ctx.doc_sources:
+                    docs_to_extract = [doc.path for doc in ctx.doc_sources]
+
+                if docs_to_extract:
+                    from data_agent_baseline.pipeline.compiled_extractor import (
+                        compiled_extract_docs,
+                    )
+                    compiled_extract_docs(
+                        doc_paths=docs_to_extract,
+                        db_path=db_path,
+                        model=self.model,
+                        question=question,
+                        knowledge_text=ctx.knowledge_text,
+                        log_fn=self._log,
+                        structured_tables=structured_tables,
+                    )
 
             # Step 4: Build KG from full DB (deterministic) + enrich with descriptions
             kg = build_kg_from_sqlite(db_path)
@@ -1542,7 +1628,7 @@ RULES:
         ))
 
         # --- Step 3a: Sanity check — does the pick match the question? ---
-        sanity_issues = self._sanity_check_picks(
+        sanity_issues, entity_col_map = self._sanity_check_picks(
             question, picked, output_nodes, filter_nodes, user_intent, kg, anchor_text, db_path,
         )
         if sanity_issues:
@@ -1565,6 +1651,142 @@ RULES:
                     self._log("kg_filter_nodes", ", ".join(
                         f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
                     ))
+            else:
+                # Repick failed — inject filters deterministically
+                injected = False
+                if entity_col_map:
+                    existing_filter_vals = {str(n.value).lower() for n in filter_nodes}
+                    for entity_val, tbl_col in entity_col_map.items():
+                        if entity_val.lower() in existing_filter_vals:
+                            continue
+                        if "." in tbl_col:
+                            tbl, col = tbl_col.split(".", 1)
+                            filter_nodes.append(QueryNode(
+                                table=tbl, column=col, role="filter",
+                                operator="LIKE", value=f"%{entity_val}%",
+                            ))
+                            self._log("kg_inject_filter", f"Added {tbl}.{col} LIKE '%{entity_val}%' (from DB probe)")
+                            injected = True
+
+                # Fallback: search raw doc paragraphs for entity → validate IDs against DB
+                if not injected and hasattr(self, '_doc_paths') and self._doc_paths and db_path:
+                    flagged = re.findall(r'The question mentions "([^"]+)" but it is not', sanity_issues)
+                    for entity_val in flagged:
+                        entity_words = set(entity_val.lower().split())
+                        for doc_path in self._doc_paths:
+                            try:
+                                doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                continue
+                            # Split into paragraphs, find the one mentioning the entity
+                            paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
+                            best_para = ""
+                            best_score = 0
+                            for para in paragraphs:
+                                para_lower = para.lower()
+                                score = sum(1 for w in entity_words if w in para_lower)
+                                if score > best_score:
+                                    best_score = score
+                                    best_para = para
+                            if best_score < len(entity_words) - 1 or not best_para:
+                                continue
+                            # Extract all integers from that paragraph
+                            candidate_ids = re.findall(r'\b(\d+)\b', best_para)
+                            if not candidate_ids:
+                                continue
+                            # Find a FK column in the output table referencing this doc
+                            entity_table = output_nodes[0].table if output_nodes else ""
+                            doc_stem = doc_path.stem.lower()
+                            fk_col = None
+                            if kg:
+                                for t in kg.tables:
+                                    if t.name == entity_table:
+                                        for c in t.columns:
+                                            if doc_stem in c.name.lower() and "id" in c.name.lower():
+                                                fk_col = c.name
+                                                break
+                                        break
+                            if not fk_col:
+                                continue
+                            # Validate: which candidate IDs actually exist in that FK column?
+                            try:
+                                conn = sqlite3.connect(str(db_path), timeout=5)
+                                for cid in candidate_ids:
+                                    row = conn.execute(
+                                        f'SELECT 1 FROM "{entity_table}" WHERE "{fk_col}" = ? LIMIT 1',
+                                        (int(cid),),
+                                    ).fetchone()
+                                    if row:
+                                        filter_nodes.append(QueryNode(
+                                            table=entity_table, column=fk_col, role="filter",
+                                            operator="=", value=cid,
+                                        ))
+                                        self._log("kg_inject_filter", f"Added {entity_table}.{fk_col} = {cid} (from doc paragraph)")
+                                        injected = True
+                                        break
+                                conn.close()
+                            except Exception:
+                                pass
+                            if injected:
+                                break
+                        if injected:
+                            break
+
+                if injected:
+                    self._log("kg_filter_nodes", ", ".join(
+                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
+                    ))
+
+            # Knowledge-based keyword → value injection (runs regardless of repick success)
+            # e.g. anchor line "- SEX: ... denoted as 'M' for male" and population mentions "male"
+            if anchor_text and db_path:
+                pop_match = re.search(r'population filter is "([^"]+)"', sanity_issues)
+                if pop_match:
+                    pop_words = set(re.findall(r'[a-z]+', pop_match.group(1).lower()))
+                    existing_filter_vals = {str(n.value).lower() for n in filter_nodes}
+                    # Parse field definition lines: "- FIELD_NAME (type): ..." or "- FIELD_NAME: ..."
+                    anchor_lines = anchor_text.split("\n")
+                    found = False
+                    for line in anchor_lines:
+                        field_match = re.match(r"^-\s+(\w[\w\-]*)\s*(?:\([^)]*\))?\s*:", line)
+                        if not field_match:
+                            continue
+                        field_name = field_match.group(1)
+                        # Find 'VALUE' for KEYWORD patterns on this line
+                        for m in re.finditer(r"'([^']+)'\s+for\s+(\w+)", line):
+                            val, keyword = m.group(1), m.group(2).lower()
+                            if keyword not in pop_words or val.lower() in existing_filter_vals:
+                                continue
+                            # Find the column matching field_name that contains this value
+                            found = False
+                            try:
+                                conn = sqlite3.connect(str(db_path), timeout=5)
+                                field_lower = field_name.lower()
+                                for t in kg.tables:
+                                    for c in t.columns:
+                                        if c.name.lower() != field_lower:
+                                            continue
+                                        row = conn.execute(
+                                            f'SELECT 1 FROM "{t.name}" WHERE "{c.name}" = ? LIMIT 1',
+                                            (val,),
+                                        ).fetchone()
+                                        if row:
+                                            filter_nodes.append(QueryNode(
+                                                table=t.name, column=c.name, role="filter",
+                                                operator="=", value=val,
+                                            ))
+                                            self._log("kg_inject_filter", f"Added {t.name}.{c.name} = '{val}' (from knowledge: '{val}' for {keyword})")
+                                            found = True
+                                            break
+                                    if found:
+                                        break
+                                conn.close()
+                            except Exception:
+                                pass
+                            if found:
+                                break
+                        if found:
+                            break
 
         # --- Step 3a2: Detect "per unit" computed filters ---
         filter_nodes = self._detect_per_unit_filters(question, filter_nodes, kg)
@@ -1574,6 +1796,8 @@ RULES:
 
         # --- Step 3b1: Domain column fixes (deterministic swap) ---
         filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text)
+
+        # (Impossible threshold fix moved to rules engine — Step 3d)
 
         # --- Step 3b2: Check filter discriminating power ---
         weak_filters = self._check_filter_selectivity(filter_nodes, db_path)
@@ -1613,8 +1837,13 @@ RULES:
                     _operation = _line.split("Operation:")[1].strip().lower()
             if _shape == "list" and _operation == "lookup":
                 entity_table = output_nodes[0].table
+                current_out_col = output_nodes[0].column.lower()
+                already_display = (
+                    current_out_col != "id"
+                    and not current_out_col.endswith("_id")
+                )
                 table_schema = kg.get_table(entity_table)
-                if table_schema:
+                if table_schema and not already_display:
                     q_tokens_pk = set(re.findall(r'[a-z]{3,}', question.lower()))
                     pk_names = {c.name.lower() for c in table_schema.columns if c.is_pk}
                     if not pk_names and table_schema.primary_keys:
@@ -1660,6 +1889,25 @@ RULES:
                 elif kg.graph and f"{ob_table}.{ob_name}" in kg.graph.columns:
                     order_nodes.append(QueryNode(table=ob_table, column=ob_name, role="order"))
 
+        # --- Step 3d: Rules Engine (evidence-based filter/structure decisions) ---
+        from data_agent_baseline.pipeline.rules_engine import run_rules_engine
+        comp_type = picked.get("computation_type", "simple_lookup")
+        engine_out = run_rules_engine(
+            question=question,
+            user_intent=user_intent,
+            comp_type=comp_type,
+            filter_nodes=filter_nodes,
+            output_nodes=output_nodes,
+            kg=kg,
+            db_path=db_path,
+            knowledge_text=knowledge_text,
+            anchor_text=anchor_text,
+            model_call=self._model_call_with_retry,
+        )
+        filter_nodes = engine_out.filter_nodes
+        for tag, msg in engine_out.log_entries:
+            self._log(tag, msg)
+
         # --- Step 4: Graph Traversal (BFS through KG edges) ---
         path = build_query_path(output_nodes, filter_nodes, kg, order_nodes=order_nodes)
         if not path:
@@ -1672,6 +1920,10 @@ RULES:
 
         # --- Step 5: Format as grounding context for SQL LLM ---
         grounding = self._format_kg_plan_as_grounding(path, None, picked, "", kg=kg, db_path=db_path)
+
+        # Inject rules engine directives into grounding
+        if engine_out.sql_directives:
+            grounding += "\n" + "\n".join(engine_out.sql_directives)
 
         # --- Step 5a: Surface domain formulas relevant to this question ---
         # Skip if independent ratio already produced the SQL pattern
@@ -1735,6 +1987,13 @@ RULES:
                         samples = table.sample_values[col.name][:5]
                         if samples:
                             parts.append(f"e.g. {samples}")
+                    # For numeric columns: always show range (helps LLM reason about normal/abnormal)
+                    if col.sql_type.upper() in ("REAL", "FLOAT", "INTEGER", "INT", "NUMERIC"):
+                        if col.name.lower() not in ("id",) and not col.name.lower().endswith("_id"):
+                            if hasattr(table, 'col_stats') and col.name in table.col_stats:
+                                s = table.col_stats[col.name]
+                                if "min" in s and "max" in s:
+                                    parts.append(f"range: [{s['min']}, {s['max']}]")
                 cols_desc.append("  " + " ".join(parts))
             graph_parts.append(f'TABLE "{table.name}" ({table.row_count} rows):\n' + "\n".join(cols_desc))
 
@@ -1805,7 +2064,8 @@ CONSTRAINTS:
 - If a column is a FK reference (marked with →), do NOT select it directly — instead JOIN to the referenced table and select the human-readable column there (e.g. the name/label column, not the ID).
 - For "best/lowest/highest/fastest" questions, use order_by instead of equality filters on position/rank columns.
 - For filter values, use the EXACT format shown in "values:" or DOMAIN KNOWLEDGE. If unsure of the format, use LIKE with a partial match.
-- "List all X" / "What are the X" without specifying WHICH columns to show → select ONLY the primary key or identifier column of the entity (e.g. trans_id, Id, order_id). Do NOT guess descriptive columns unless the question explicitly asks for them (e.g. "list the names", "show dates and amounts")."""
+- "List all X" / "What are the X" without specifying WHICH columns to show → select ONLY the primary key or identifier column of the entity (e.g. trans_id, Id, order_id). Do NOT guess descriptive columns unless the question explicitly asks for them (e.g. "list the names", "show dates and amounts").
+- "Normal level" means the value falls WITHIN the healthy range — use TWO conditions: >= lower_bound AND <= upper_bound (e.g. WBC >= 3.5 AND WBC <= 9.0 keeps only normal values). "Abnormal level" means the value falls OUTSIDE the healthy range — use a SINGLE condition on whichever side the data actually falls (e.g. Column < lower OR Column > upper), OR use IS NOT NULL if the column's data range (shown above) is entirely outside the standard normal range."""
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
@@ -2120,8 +2380,9 @@ CONSTRAINTS:
         kg: KnowledgeGraph,
         anchor_text: str = "",
         db_path: Path | None = None,
-    ) -> str:
-        """Check if LLM picks are consistent with the question and user intent."""
+    ) -> tuple[str, dict[str, str]]:
+        """Check if LLM picks are consistent with the question and user intent.
+        Returns (issues_text, entity_found_in) where entity_found_in maps entity values to table.column."""
         issues: list[str] = []
         q_lower = question.lower()
 
@@ -2326,9 +2587,21 @@ CONSTRAINTS:
             # Loose check: at least some population words should appear in filters
             overlap = sum(1 for w in pop_words if w in filter_cols_and_vals and len(w) > 3)
             if overlap == 0 and len(pop_words) > 0:
+                hint = ""
+                if "normal" in pop_words:
+                    hint = (
+                        ' Remember: "normal level" means value is WITHIN the healthy range '
+                        '(use >= lower AND <= upper). Check that your filters keep values '
+                        'inside normal bounds, not outside.'
+                    )
+                elif "abnormal" in pop_words:
+                    hint = (
+                        ' Remember: "abnormal level" means value is OUTSIDE the healthy range. '
+                        'If the data range is entirely outside normal, use IS NOT NULL.'
+                    )
                 issues.append(
                     f'Intent says population filter is "{intent_population}" '
-                    f'but no matching filter condition was found.'
+                    f'but no matching filter condition was found.{hint}'
                 )
 
         # --- Check 5: Output should have name/label, not ID/ref ---
@@ -2442,7 +2715,7 @@ CONSTRAINTS:
                         f'Remove it unless the question explicitly asks for this filter.'
                     )
 
-        return "\n".join(issues)
+        return "\n".join(issues), entity_found_in
 
     def _probe_filter_values(
         self, filter_nodes: list[QueryNode], db_path: Path | None,
@@ -2774,18 +3047,18 @@ CONSTRAINTS:
 
         best_id = None
         best_match = ""
+        q_lower = question.lower()
+        candidates = []
         for row_id, display_val in rows:
             dv_lower = str(display_val).lower()
-            # Exact word match in question
             if dv_lower in q_words:
-                best_id = str(row_id)
-                best_match = str(display_val)
-                break
-            # Check if display value appears as substring in question
-            if len(dv_lower) >= 3 and dv_lower in question.lower():
-                best_id = str(row_id)
-                best_match = str(display_val)
-                break
+                candidates.append((len(dv_lower), str(row_id), str(display_val)))
+            elif len(dv_lower) >= 3 and re.search(r'\b' + re.escape(dv_lower) + r'\b', q_lower):
+                candidates.append((len(dv_lower), str(row_id), str(display_val)))
+        if candidates:
+            candidates.sort(key=lambda x: -x[0])
+            best_id = candidates[0][1]
+            best_match = candidates[0][2]
 
         if best_id and best_id != str(node.value):
             self._log("fk_resolve", f"{node.table}.{node.column}: '{node.value}' → '{best_id}' (matched '{best_match}' in {disp_table}.{disp_col})")
@@ -2990,7 +3263,8 @@ CONSTRAINTS:
             if defined_col in seen:
                 continue
             seen.add(defined_col)
-            if defined_col not in q_lower or defined_col in used_cols:
+            q_words_dc = re.findall(r'\b[a-z]+', q_lower)
+            if not any(w.startswith(defined_col) for w in q_words_dc) or defined_col in used_cols:
                 continue
             # Find which table has this column
             for t in kg.tables:
@@ -3435,6 +3709,7 @@ RULES:
             and len(filter_tables_set) >= 2
             and path.edges
         )
+
         if path.filter_nodes and not is_independent_ratio:
             if is_single_table_ratio:
                 tbl = path.output_nodes[0].table
@@ -3529,6 +3804,8 @@ RULES:
                     if node.column.startswith("_expr:"):
                         expr_sql = node.column[len("_expr:"):]
                         fv_lines.append(f'  COMPUTED: WHERE {expr_sql} {node.operator} {node.value}')
+                    elif node.operator.upper() == "IS NOT NULL":
+                        fv_lines.append(f'  "{node.table}"."{node.column}": IS NOT NULL')
                     elif node.operator.upper() == "LIKE":
                         fv_lines.append(f'  "{node.table}"."{node.column}": USE → WHERE "{node.column}" LIKE \'{node.value}\' COLLATE NOCASE')
                     else:
@@ -3652,6 +3929,9 @@ RULES:
                 f'counting duplicate rows created by the JOIN.'
             )
 
+        # (Cross-row hint moved to rules engine — injected via engine_out.sql_directives)
+
+
         # --- Temporal scope propagation ---
         # If date filters exist on one table but joined tables also have date columns,
         # the output table's date column likely needs the same temporal constraint.
@@ -3723,6 +4003,42 @@ RULES:
             col_ref = order_by.get("column", "")
             direction = order_by.get("direction", "ASC")
             parts.append(f'ORDER BY: "{col_ref}" {direction} (use WHERE = (SELECT MIN/MAX...) to include ties)')
+
+        # --- Data distribution for numeric filter columns ---
+        # Show actual min/max so the LLM can judge whether thresholds are meaningful
+        if db_path and path.filter_nodes:
+            dist_lines: list[str] = []
+            seen_cols: set[str] = set()
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=5)
+                for f in path.filter_nodes:
+                    key = f"{f.table}.{f.column}"
+                    if key in seen_cols or f.operator in ("=", "IS NOT NULL", "LIKE"):
+                        continue
+                    seen_cols.add(key)
+                    try:
+                        row = conn.execute(
+                            f'SELECT MIN(CAST("{f.column}" AS REAL)), '
+                            f'MAX(CAST("{f.column}" AS REAL)), '
+                            f'COUNT(*), COUNT(DISTINCT "ID") '
+                            f'FROM "{f.table}" WHERE "{f.column}" IS NOT NULL'
+                        ).fetchone()
+                        if row and row[2] > 0:
+                            dist_lines.append(
+                                f'  "{f.table}"."{f.column}": min={row[0]}, max={row[1]}, '
+                                f'{row[2]} records across {row[3]} patients'
+                            )
+                    except Exception:
+                        pass
+                conn.close()
+            except Exception:
+                pass
+            if dist_lines:
+                parts.append(
+                    "DATA DISTRIBUTION (use to validate your threshold choices — "
+                    "if ALL values fall outside a standard normal range, then having "
+                    "ANY non-null value means 'abnormal'):\n" + "\n".join(dist_lines)
+                )
 
         # Reference SQL if provided (from retry)
         if sql:
@@ -7600,12 +7916,17 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             raw_id_cols = []
             for i, col in enumerate(cols):
                 sample_vals = [str(rows[r][i]) for r in range(min(len(rows), 3))]
-                # Only flag if VALUES look like opaque hashes (e.g. Airtable "rec..." IDs)
-                for v in sample_vals:
-                    if v and v.startswith("rec") and len(v) > 10 and v[3:].isalnum():
-                        has_raw_id = True
-                        raw_id_cols.append((i, col, sample_vals[0]))
-                        break
+                col_lower = col.lower()
+                is_id_col = col_lower == "id" or col_lower.endswith("_id")
+                all_int = all(v.lstrip("-").isdigit() for v in sample_vals if v and v.lstrip("-").isdigit())
+                all_opaque = all(
+                    len(v) >= 5 and not v.replace(".", "").replace("-", "").isdigit()
+                    and " " not in v
+                    for v in sample_vals if v
+                )
+                if sample_vals and ((is_id_col and all_int) or (all_opaque and not all_int)):
+                    has_raw_id = True
+                    raw_id_cols.append((i, col, sample_vals[0]))
 
             # Skip if there's already a human-readable column alongside the ID
             if has_raw_id and len(raw_id_cols) > 0 and len(cols) > len(raw_id_cols):
