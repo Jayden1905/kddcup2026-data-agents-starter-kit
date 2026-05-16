@@ -120,11 +120,22 @@ class EngineContext:
             return -1
         try:
             conn = sqlite3.connect(str(self.db_path), timeout=5)
-            row = conn.execute(
-                f'SELECT COUNT(*) FROM "{table}" '
-                f'WHERE "{column}" IS NOT NULL AND "{column}" {operator} ?',
-                (value,),
-            ).fetchone()
+            if operator.upper() == "IN":
+                vals = re.findall(r"'([^']*)'", str(value))
+                if not vals:
+                    return -1
+                placeholders = ",".join("?" * len(vals))
+                row = conn.execute(
+                    f'SELECT COUNT(*) FROM "{table}" '
+                    f'WHERE "{column}" IN ({placeholders})',
+                    vals,
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f'SELECT COUNT(*) FROM "{table}" '
+                    f'WHERE "{column}" IS NOT NULL AND "{column}" {operator} ?',
+                    (value,),
+                ).fetchone()
             conn.close()
             return row[0] if row else 0
         except Exception:
@@ -1325,6 +1336,12 @@ def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = No
         for f in detail_filters:
             if f.operator == "IS NOT NULL":
                 parts.append(f'"{f.column}" IS NOT NULL')
+            elif f.operator.upper() == "IN":
+                vals = re.findall(r"'([^']*)'", str(f.value))
+                if vals:
+                    placeholders = ",".join("?" * len(vals))
+                    parts.append(f'"{f.column}" IN ({placeholders})')
+                    params.extend(vals)
             elif f.operator in ("=", "LIKE"):
                 parts.append(f'"{f.column}" {f.operator} ?')
                 params.append(f.value)
@@ -1537,9 +1554,32 @@ def _generate_hypotheses(
     # match rows but together match 0 (e.g. col < X AND col > Y where X < Y)
     col_groups: dict[str, list[tuple[int, QueryNode]]] = {}
     for i, n in enumerate(ctx.filter_nodes):
-        if n.table == entity_table and n.operator not in ("=", "LIKE", "IS NOT NULL"):
+        if n.table == entity_table and n.operator not in ("LIKE", "IS NOT NULL"):
             col_groups.setdefault(n.column, []).append((i, n))
     for col, group in col_groups.items():
+        if len(group) < 2:
+            continue
+        # Detect impossible equality AND: col = 'X' AND col = 'Y' (different values → must be OR)
+        eq_nodes = [(i, n) for i, n in group if n.operator == "="]
+        if len(eq_nodes) >= 2:
+            values = [str(n.value) for _, n in eq_nodes]
+            if len(set(values)) > 1:
+                in_list = ", ".join(f"'{v}'" for v in values)
+                keep_indices = {i for i, _ in eq_nodes}
+                or_nodes = [n for j, n in enumerate(ctx.filter_nodes) if j not in keep_indices]
+                or_nodes.append(QueryNode(
+                    table=entity_table, column=col, role="filter",
+                    operator="IN", value=f"({in_list})",
+                ))
+                hypotheses.append(Hypothesis(
+                    label=f"equality_or_{col}",
+                    filter_nodes=or_nodes,
+                    sql_directives=[
+                        f'OR FILTER: "{col}" has multiple values connected by OR. '
+                        f'Use: WHERE "{col}" IN ({in_list})'
+                    ],
+                    reasoning=f"col = '{values[0]}' AND col = '{values[1]}' is impossible — use IN ({in_list})",
+                ))
         if len(group) != 2:
             continue
         (i0, n0), (i1, n1) = group
@@ -1584,7 +1624,7 @@ def _generate_hypotheses(
             continue
         # If equality produces 0 or very few matches on a wide-spread column
         matching = ctx.count_matching(n.table, n.column, "=", n.value)
-        if matching <= 1 and fe.get("distinct_values", 0) > 20:
+        if matching <= 1 and (fe.get("distinct_values") or 0) > 20:
             try:
                 val = float(n.value)
                 data_range = fe["data_max"] - fe["data_min"]
@@ -1751,7 +1791,7 @@ def _generate_hypotheses(
             # If column has min=0 and many 0s, "have" might mean > 0
             if fe["data_min"] == 0:
                 zero_count = ctx.count_matching(n.table, n.column, "=", 0)
-                total = fe.get("total_non_null", 0)
+                total = fe.get("total_non_null") or 0
                 if total > 0 and zero_count > total * 0.3:
                     nonzero_nodes = list(ctx.filter_nodes)
                     nonzero_nodes[i] = QueryNode(table=n.table, column=n.column, role="filter",
@@ -1769,7 +1809,7 @@ def _generate_hypotheses(
         fe = next((f for f in evidence.get("filters", []) if f["column"] == n.column), None)
         if not fe:
             continue
-        distinct = fe.get("distinct_values", 0)
+        distinct = fe.get("distinct_values") or 0
         if distinct == 2:
             # Binary column treated as numeric — should probably use = with one of the values
             stats = ctx.col_stats(n.table, n.column)
@@ -2212,10 +2252,10 @@ def _llm_generate_hypotheses(
         if "data_min" in fe:
             desc += f"\n    Data: [{fe['data_min']}, {fe['data_max']}], avg={fe['data_avg']}, distinct={fe['distinct_values']}"
             desc += f"\n    Matching: {fe['rows_matching']}/{fe.get('total_non_null', '?')} rows"
-            desc += f"\n    Null ratio: {fe.get('null_ratio', 0)*100:.0f}%, Sparse: {fe.get('is_sparse', False)}"
+            desc += f"\n    Null ratio: {(fe.get('null_ratio') or 0)*100:.0f}%, Sparse: {fe.get('is_sparse', False)}"
             desc += f"\n    Spread: {fe.get('spread', '?')}, Cardinality: {fe.get('cardinality_ratio', '?')}"
         elif fe["operator"] == "IS NOT NULL":
-            desc += f"\n    Non-null rows: {fe.get('total_non_null', '?')}, Null ratio: {fe.get('null_ratio', 0)*100:.0f}%"
+            desc += f"\n    Non-null rows: {fe.get('total_non_null', '?')}, Null ratio: {(fe.get('null_ratio') or 0)*100:.0f}%"
         filter_desc.append(desc)
 
     drop_one = evidence.get("drop_one_analysis", {})
@@ -2392,7 +2432,6 @@ def _apply_domain_column_fixes(ctx: EngineContext) -> list[QueryNode]:
         for defined_col, (col_table, _) in domain_cols.items():
             for group in synonym_groups:
                 if node.column.lower() in group and defined_col in group:
-                    # Only swap if domain column has data for this filter value
                     domain_count = ctx.count_matching(col_table, defined_col, node.operator, node.value)
                     if domain_count > 0:
                         fixed.append(QueryNode(
@@ -2405,6 +2444,42 @@ def _apply_domain_column_fixes(ctx: EngineContext) -> list[QueryNode]:
                 break
         if not swapped:
             fixed.append(node)
+
+    # Second pass: correct filter values using domain-defined mappings
+    # e.g. "Use bond_type = '#' for triple bonds" or "'M' for male"
+    value_map: dict[str, list[tuple[str, str]]] = {}
+    for m in re.finditer(r"['\"`]([^'\"` ]+)['\"`]\s+for\s+(\w+)", ctx.anchor_text):
+        domain_val, keyword = m.group(1), m.group(2).lower()
+        value_map.setdefault(keyword, []).append((domain_val, keyword))
+    for m in re.finditer(r"(\w[\w_]+)\s*=\s*['\"`]([^'\"` ]+)['\"`]\s+for\s+(\w+)", ctx.anchor_text):
+        col_name, domain_val, keyword = m.group(1).lower(), m.group(2), m.group(3).lower()
+        value_map.setdefault(keyword, []).append((domain_val, col_name))
+
+    if value_map:
+        q_words_val = set(re.findall(r'\b[a-z]+', ctx.question_lower))
+        corrected = []
+        for node in fixed:
+            replaced = False
+            node_val_lower = str(node.value).lower()
+            # Check if the current value is a natural-language word that has a domain mapping
+            for keyword, mappings in value_map.items():
+                if keyword in q_words_val and node_val_lower in (keyword, keyword + "s"):
+                    for domain_val, mapped_col in mappings:
+                        if mapped_col == node.column.lower() or mapped_col == keyword:
+                            count = ctx.count_matching(node.table, node.column, node.operator, domain_val)
+                            if count > 0:
+                                corrected.append(QueryNode(
+                                    table=node.table, column=node.column, role=node.role,
+                                    operator=node.operator, value=domain_val,
+                                ))
+                                replaced = True
+                                break
+                    if replaced:
+                        break
+            if not replaced:
+                corrected.append(node)
+        fixed = corrected
+
     return fixed
 
 
@@ -2537,28 +2612,8 @@ def run_rules_engine(
     all_directives: list[str] = []
     all_logs: list[tuple[str, str]] = []
 
-    # Phase 0: Resolve subquery filter values to concrete values
-    if db_path:
-        resolved_nodes = []
-        for node in ctx.filter_nodes:
-            val_str = str(node.value).strip()
-            if val_str.upper().startswith("(SELECT") or val_str.upper().startswith("SELECT"):
-                sql = val_str.strip("()")
-                try:
-                    conn = sqlite3.connect(str(db_path), timeout=5)
-                    row = conn.execute(sql).fetchone()
-                    conn.close()
-                    if row and row[0] is not None:
-                        resolved_nodes.append(QueryNode(
-                            table=node.table, column=node.column, role=node.role,
-                            operator=node.operator, value=str(row[0]),
-                        ))
-                        all_logs.append(("subquery_resolve", f"{node.table}.{node.column}: resolved to {row[0]}"))
-                        continue
-                except Exception:
-                    pass
-            resolved_nodes.append(node)
-        ctx.filter_nodes = resolved_nodes
+    # Phase 0: Skip subquery filter values — they encode scope internally
+    # and should be passed through to the SQL LLM as-is
 
     # Phase 1: Deterministic rules (fast, no LLM)
     for rule_fn in RULES:

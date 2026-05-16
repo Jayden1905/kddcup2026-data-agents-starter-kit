@@ -1428,15 +1428,21 @@ RULES:
         )
         use_cases = use_case_pattern.findall(knowledge_text)
 
-        # Also extract inline SQL patterns: "- SQL: `SELECT ...`" with preceding Metric/Explanation
-        inline_sql_pattern = re.compile(
-            r'-\s*(?:Metric|Explanation)[:\s]*(.+?)\n(?:.*?\n)*?-\s*SQL:\s*`([^`]+)`',
-            re.IGNORECASE,
-        )
-        for match in inline_sql_pattern.finditer(knowledge_text):
-            title = match.group(1).strip()
-            sql = match.group(2).strip()
-            use_cases.append((title, sql, title))
+        # Extract any inline SQL in backticks, paired with nearby context lines
+        lines = knowledge_text.split("\n")
+        for i, line in enumerate(lines):
+            sql_match = re.search(r'`(SELECT\s[^`]+)`', line, re.IGNORECASE)
+            if not sql_match:
+                continue
+            sql = sql_match.group(1).strip()
+            # Use preceding non-empty lines as context/title
+            context_lines = []
+            for j in range(max(0, i - 3), i):
+                stripped = re.sub(r'[*#\-`]', '', lines[j]).strip()
+                if stripped:
+                    context_lines.append(stripped)
+            title = context_lines[-1] if context_lines else f"use_case_line_{i}"
+            use_cases.append((title, sql, " ".join(context_lines)))
 
         # Score each use case by relevance to question
         # Prioritize use cases whose WHERE/filter condition matches the question's filter intent
@@ -1622,6 +1628,21 @@ RULES:
             self._log("kg_path", "No valid output nodes after validation, falling back")
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
 
+        # Disambiguate: prefer entity-of-interest table for columns that exist in multiple tables
+        _entity_pref_match = re.search(r'Entity of interest:\s*(\w+)', user_intent)
+        if _entity_pref_match and kg:
+            _pref_table = _entity_pref_match.group(1)
+            _pref_schema = kg.get_table(_pref_table)
+            if _pref_schema:
+                _pref_col_names = {c.name.lower() for c in _pref_schema.columns}
+                _new_output = []
+                for node in output_nodes:
+                    if node.table.lower() != _pref_table.lower() and node.column.lower() in _pref_col_names:
+                        _new_output.append(QueryNode(table=_pref_table, column=node.column, role="output"))
+                    else:
+                        _new_output.append(node)
+                output_nodes = _new_output
+
         self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
         self._log("kg_filter_nodes", ", ".join(
             f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
@@ -1653,7 +1674,6 @@ RULES:
                     ))
             else:
                 # Repick failed — inject filters deterministically
-                injected = False
                 if entity_col_map:
                     existing_filter_vals = {str(n.value).lower() for n in filter_nodes}
                     for entity_val, tbl_col in entity_col_map.items():
@@ -1666,76 +1686,73 @@ RULES:
                                 operator="LIKE", value=f"%{entity_val}%",
                             ))
                             self._log("kg_inject_filter", f"Added {tbl}.{col} LIKE '%{entity_val}%' (from DB probe)")
-                            injected = True
 
-                # Fallback: search raw doc paragraphs for entity → validate IDs against DB
-                if not injected and hasattr(self, '_doc_paths') and self._doc_paths and db_path:
-                    flagged = re.findall(r'The question mentions "([^"]+)" but it is not', sanity_issues)
-                    for entity_val in flagged:
-                        entity_words = set(entity_val.lower().split())
-                        for doc_path in self._doc_paths:
-                            try:
-                                doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
-                            except OSError:
-                                continue
-                            # Split into paragraphs, find the one mentioning the entity
-                            paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
-                            best_para = ""
-                            best_score = 0
-                            for para in paragraphs:
-                                para_lower = para.lower()
-                                score = sum(1 for w in entity_words if w in para_lower)
-                                if score > best_score:
-                                    best_score = score
-                                    best_para = para
-                            if best_score < len(entity_words) - 1 or not best_para:
-                                continue
-                            # Extract all integers from that paragraph
-                            candidate_ids = re.findall(r'\b(\d+)\b', best_para)
-                            if not candidate_ids:
-                                continue
-                            # Find a FK column in the output table referencing this doc
-                            entity_table = output_nodes[0].table if output_nodes else ""
-                            doc_stem = doc_path.stem.lower()
-                            fk_col = None
-                            if kg:
-                                for t in kg.tables:
-                                    if t.name == entity_table:
-                                        for c in t.columns:
-                                            if doc_stem in c.name.lower() and "id" in c.name.lower():
-                                                fk_col = c.name
-                                                break
-                                        break
-                            if not fk_col:
-                                continue
-                            # Validate: which candidate IDs actually exist in that FK column?
-                            try:
-                                conn = sqlite3.connect(str(db_path), timeout=5)
-                                for cid in candidate_ids:
-                                    row = conn.execute(
-                                        f'SELECT 1 FROM "{entity_table}" WHERE "{fk_col}" = ? LIMIT 1',
-                                        (int(cid),),
-                                    ).fetchone()
-                                    if row:
-                                        filter_nodes.append(QueryNode(
-                                            table=entity_table, column=fk_col, role="filter",
-                                            operator="=", value=cid,
-                                        ))
-                                        self._log("kg_inject_filter", f"Added {entity_table}.{fk_col} = {cid} (from doc paragraph)")
-                                        injected = True
-                                        break
-                                conn.close()
-                            except Exception:
-                                pass
-                            if injected:
-                                break
+            # Doc-based injection: resolve entities mentioned in question but missing from filters
+            # Runs after both repick success and failure — checks if flagged entities are still unresolved
+            if hasattr(self, '_doc_paths') and self._doc_paths and db_path:
+                flagged = re.findall(r'The question mentions "([^"]+)" but it is not', sanity_issues)
+                current_filter_text = " ".join(str(n.value).lower() for n in filter_nodes)
+                for entity_val in flagged:
+                    if entity_val.lower() in current_filter_text:
+                        continue
+                    entity_words = set(entity_val.lower().split())
+                    injected = False
+                    for doc_path in self._doc_paths:
+                        try:
+                            doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
+                        best_para = ""
+                        best_score = 0
+                        for para in paragraphs:
+                            para_lower = para.lower()
+                            score = sum(1 for w in entity_words if w in para_lower)
+                            if score > best_score:
+                                best_score = score
+                                best_para = para
+                        if best_score < len(entity_words) - 1 or not best_para:
+                            continue
+                        candidate_ids = re.findall(r'\b(\d+)\b', best_para)
+                        if not candidate_ids:
+                            continue
+                        entity_table = output_nodes[0].table if output_nodes else ""
+                        doc_stem = doc_path.stem.lower()
+                        fk_col = None
+                        if kg:
+                            for t in kg.tables:
+                                if t.name == entity_table:
+                                    for c in t.columns:
+                                        if doc_stem in c.name.lower() and "id" in c.name.lower():
+                                            fk_col = c.name
+                                            break
+                                    break
+                        if not fk_col:
+                            continue
+                        try:
+                            conn = sqlite3.connect(str(db_path), timeout=5)
+                            for cid in candidate_ids:
+                                row = conn.execute(
+                                    f'SELECT 1 FROM "{entity_table}" WHERE "{fk_col}" = ? LIMIT 1',
+                                    (int(cid),),
+                                ).fetchone()
+                                if row:
+                                    filter_nodes.append(QueryNode(
+                                        table=entity_table, column=fk_col, role="filter",
+                                        operator="=", value=cid,
+                                    ))
+                                    self._log("kg_inject_filter", f"Added {entity_table}.{fk_col} = {cid} (from doc paragraph)")
+                                    injected = True
+                                    break
+                            conn.close()
+                        except Exception:
+                            pass
                         if injected:
                             break
-
-                if injected:
-                    self._log("kg_filter_nodes", ", ".join(
-                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
-                    ))
+                    if injected:
+                        self._log("kg_filter_nodes", ", ".join(
+                            f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
+                        ))
 
             # Knowledge-based keyword → value injection (runs regardless of repick success)
             # e.g. anchor line "- SEX: ... denoted as 'M' for male" and population mentions "male"
@@ -7924,7 +7941,7 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                     and " " not in v
                     for v in sample_vals if v
                 )
-                if sample_vals and ((is_id_col and all_int) or (all_opaque and not all_int)):
+                if sample_vals and ((is_id_col and all_int and len(cols) == 1) or (all_opaque and not all_int)):
                     has_raw_id = True
                     raw_id_cols.append((i, col, sample_vals[0]))
 
