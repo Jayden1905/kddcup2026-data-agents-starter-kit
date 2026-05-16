@@ -47,7 +47,7 @@ First, reason step by step inside <think> tags:
 - What entity does each record represent? (One paragraph = one entity record)
 - What column names appear in the EXISTING DATABASE TABLES or RELEVANT KNOWLEDGE above? List them ALL exactly as written.
 - Which of those columns can be populated from this document?
-- What does the _id look like in this document? Does it match any foreign key in the database tables?
+- What does the _id look like in this document? Does it match any foreign key in the database tables? If yes, this doc is a LOOKUP TABLE — extract the entity's own attributes (name, label, properties), not the FK column name from the referencing table.
 - Does the document contain CORRECTIONS (e.g. "initially X, corrected to Y")? If so, the FINAL value should be used.
 - Are there NaN/missing values? Those become NULL.
 
@@ -60,6 +60,7 @@ CRITICAL RULES:
 - CATEGORICAL FIELDS: If the document assigns each record to a category/type/class (e.g. "categorized as X", "designated for Y", "classified as Z"), you MUST include that as a field. Name it to match the knowledge/schema (e.g. "category", "type").
 - STATUS/QUALIFIER FIELDS: If the document assigns qualitative assessments to numeric values (e.g. "normal", "abnormal", "elevated", "impaired", "within range", "exceeds threshold", "below average"), include a corresponding status field named "<measurement>_status". This captures the document's own judgment rather than requiring threshold inference later.
 - FOREIGN KEYS: If records reference entities from the existing database (e.g. event names, member IDs), include a link field (e.g. "link_to_event", "event_id") matching the schema convention.
+- LOOKUP TABLE vs FK SOURCE: If the document describes the ENTITY ITSELF that other tables reference via FK (e.g. doc="major.md" and DB has member.link_to_major), then this doc is a LOOKUP TABLE. Extract the entity's OWN attributes (_id, name/label) — NOT the FK column name from the referencing table. The _id here IS the FK target value. Use knowledge-defined field names (e.g. "major_name") for the descriptive attribute.
 - AMOUNTS: If the knowledge defines a field name for monetary values (e.g. "amount"), use that name — not synonyms like "allocation" or "budget_value".
 - If a field has DATE values in prose (e.g. "tenth of February, 1986"), include it — workers will convert to ISO format.
 - NAME/LABEL FIELDS: If each record in the document has a proper name, title, or label (e.g. "Belgium Jupiler League", "John Smith"), include a "name" field (or matching schema field like "team_long_name"). This is critical for filtering and joining later.
@@ -96,8 +97,8 @@ RULES:
 11. For numeric fields: extract the NUMBER only. Look for "amount of 75", "value of 67.81", "level at 28.0" etc.
 15. For STATUS fields (any field ending in _status): derive from the text's qualitative assessment of that measurement. Positive/good assessments (e.g. "normal", "within range", "healthy", "unremarkable") → "normal". Negative/bad assessments (e.g. "elevated", "impaired", "compromised", "abnormal", "deficient") → "abnormal". Uncertain/edge assessments (e.g. "borderline", "upper limit") → "borderline". If the text makes no qualitative statement about that value, use null.
 12. DATES: Convert natural language dates to ISO format (YYYY-MM-DD). "tenth of February, 1986" → "1986-02-10".
-13. PARTIAL RECORDS ARE VALID: If some fields are not mentioned in the text, use null for those fields. Still extract the record with _id and whatever fields ARE present. Do NOT skip a record just because some fields are missing.
-14. If no entities at all in this text, return: []
+13. CRITICAL — PARTIAL RECORDS ARE MANDATORY: You MUST extract EVERY entity that has an _id, even if only 1-2 fields can be filled. Use null for all unknown fields. A record with just {{"_id": 7, "name": "X"}} and nulls for everything else is CORRECT output. NEVER return [] if the text mentions any entity IDs.
+14. If the text truly contains NO entity identifiers at all, return: []
 
 Return ONLY the JSON array, nothing else."""
 
@@ -138,7 +139,8 @@ def _split_paragraphs(text: str) -> list[str]:
 
 
 def _batch_paragraphs(
-    paragraphs: list[str], max_batch_content_chars: int = 4000
+    paragraphs: list[str], max_batch_content_chars: int = 4000,
+    max_entities_per_batch: int = 15,
 ) -> list[str]:
     """Pack entity paragraphs into batches respecting context budget.
 
@@ -156,7 +158,8 @@ def _batch_paragraphs(
 
     for para in paragraphs:
         para_len = len(para) + 7  # account for \n\n---\n\n separator
-        if current and current_len + para_len > max_batch_content_chars:
+        if current and (current_len + para_len > max_batch_content_chars
+                        or len(current) >= max_entities_per_batch):
             batches.append("\n\n---\n\n".join(current))
             current = []
             current_len = 0
@@ -522,6 +525,23 @@ def _run_planner(
             elif fields[0] != "_id":
                 fields.remove("_id")
                 fields.insert(0, "_id")
+            # Drop FK-like fields only when they reference this entity itself
+            # (e.g. extracting "event" entity → drop "link_to_event" since that's
+            # a column from a REFERENCING table, not this entity's own attribute).
+            # Keep link_to_X when X is a DIFFERENT entity (outgoing FK).
+            entity_name = (plan.get("entity") or "").lower()
+            fields = [
+                f for f in fields
+                if not f.lower().startswith("link_to_")
+                or f.lower()[8:] != entity_name
+            ]
+            # Ensure a "name" field exists — every entity has a human-readable label
+            has_name = any(
+                "name" in f.lower() or "title" in f.lower() or "label" in f.lower()
+                for f in fields if f != "_id"
+            )
+            if not has_name:
+                fields.append("name")
             plan["fields"] = fields
             if log_fn:
                 log_fn("planner_done", f"entity={plan.get('entity')}, fields={plan.get('fields')}, id_description={plan.get('id_description')}")
@@ -624,10 +644,18 @@ def _run_workers(
         )
 
     # Normalize _id: strip text prefixes from IDs that contain numbers
+    # BUT skip normalization if IDs look like opaque tokens (base62, UUIDs)
     id_values = [str(r.get("_id", "")) for r in all_records if r.get("_id")]
     numeric_count = sum(1 for v in id_values if v.isdigit())
     has_digits_count = sum(1 for v in id_values if re.search(r"\d", v))
-    if numeric_count > len(id_values) * 0.3 or has_digits_count > len(id_values) * 0.7:
+    token_like = sum(
+        1 for v in id_values
+        if (len(v) >= 10 and re.match(r"^[a-zA-Z0-9]+$", v) and not v.isdigit())
+        or (len(v) >= 4 and re.match(r"^[a-zA-Z]+\d+$", v))
+    )
+    if token_like > len(id_values) * 0.2:
+        pass
+    elif numeric_count > len(id_values) * 0.3 or has_digits_count > len(id_values) * 0.7:
         for r in all_records:
             rid = str(r.get("_id", ""))
             if not rid.isdigit():
@@ -857,7 +885,7 @@ def chunked_extract(
     # Augment: add columns from the same entity definition in knowledge.md
     if knowledge_text and plan.get("entity"):
         entity_name = plan["entity"].lower()
-        plan_fields = set(plan.get("fields", []))
+        plan_fields = set(f.lower() for f in plan.get("fields", []))
         # Find the entity's own definition block (between its **Entity**: and the next **Entity**:)
         entity_block = ""
         pattern = re.compile(
@@ -874,12 +902,88 @@ def chunked_extract(
             all_knowledge_fields = list(dict.fromkeys(knowledge_fields + backtick_fields))
             missing_added = []
             for col in all_knowledge_fields:
-                if col not in plan_fields:
+                if col.lower() not in plan_fields:
                     plan["fields"].append(col)
-                    plan_fields.add(col)
+                    plan_fields.add(col.lower())
                     missing_added.append(col)
             if missing_added and log_fn:
                 log_fn("planner_augment", f"Added from knowledge entity section: {missing_added}")
+
+        # Fallback: if doc contains categorization patterns, ensure a type/category
+        # field exists in the plan. This is a fundamental entity attribute.
+        if "type" not in plan_fields and "category" not in plan_fields:
+            # Check first ~5000 chars for categorization language
+            sample_check = text[:5000].lower()
+            has_categories = any(
+                phrase in sample_check for phrase in
+                ("categorized as", "classified as", "designated for", "category of", "categorized under")
+            )
+            if has_categories:
+                plan["fields"].append("type")
+                plan_fields.add("type")
+                if log_fn:
+                    log_fn("planner_augment", f"Added 'type' — doc contains categorization patterns")
+
+    # Structural FK field injection: if the doc contains opaque IDs from a
+    # structured table's PK, the doc entity has an outgoing FK. Ensure the field exists.
+    # Skip if the IDs belong to the entity itself (lookup table pattern).
+    if plan and db_path and db_path.exists():
+        entity_name = (plan.get("entity") or "").lower()
+        plan_fields_lower = {f.lower() for f in plan.get("fields", [])}
+        try:
+            conn = sqlite3.connect(str(db_path))
+            tables = [r[0] for r in conn.execute(
+                r"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\_%' ESCAPE '\'"
+            ).fetchall()]
+            for tbl in tables:
+                if tbl.lower() == entity_name:
+                    continue
+                cols = conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
+                if not cols:
+                    continue
+                pk_col = cols[0][1]
+                pk_type = (cols[0][2] or "").upper()
+                if pk_type in ("INTEGER", "REAL", "NUMERIC"):
+                    continue
+                # Skip if the PK column references this entity (e.g. attendance.link_to_event
+                # contains event IDs — these are the entity's OWN IDs, not outgoing FKs)
+                if entity_name in pk_col.lower():
+                    continue
+                sample_rows = conn.execute(
+                    f'SELECT DISTINCT "{pk_col}" FROM "{tbl}" WHERE "{pk_col}" IS NOT NULL LIMIT 20'
+                ).fetchall()
+                sample_vals = [str(r[0]) for r in sample_rows if r[0]]
+                if not sample_vals:
+                    continue
+                is_opaque = all(
+                    len(v) >= 5 and len(v) <= 50
+                    and " " not in v and "@" not in v
+                    and not v.replace(".", "").replace("-", "").isdigit()
+                    and any(c.isalpha() for c in v)
+                    and any(c.isdigit() for c in v)
+                    for v in sample_vals
+                )
+                if not is_opaque:
+                    continue
+                matches = sum(1 for v in sample_vals if v in text)
+                if matches >= 2 or (matches >= 1 and len(sample_vals) <= 2):
+                    fk_field = f"link_to_{tbl}"
+                    if fk_field.lower() not in plan_fields_lower:
+                        plan["fields"].append(fk_field)
+                        plan_fields_lower.add(fk_field.lower())
+                        # Remove redundant <table>_name field — the name is
+                        # accessible via FK join, and workers would fill it
+                        # with wrong values since the doc has IDs, not names
+                        redundant = f"{tbl}_name"
+                        plan["fields"] = [
+                            f for f in plan["fields"]
+                            if f.lower() != redundant.lower()
+                        ]
+                        if log_fn:
+                            log_fn("fk_field_injected", f"Added '{fk_field}' (replaced '{redundant}') — {tbl}.{pk_col} IDs found in doc ({matches}/{len(sample_vals)})")
+            conn.close()
+        except Exception:
+            pass
 
     # Build FK lookup for workers
     fk_lookup = _build_fk_lookup(db_path)
@@ -974,6 +1078,20 @@ def _write_records(
             raw_with_pub = sum(1 for r in records if r.get("publisher_id") is not None)
             log_fn("dedup_fill_check", f"raw records with publisher_id: {raw_with_pub}/{len(records)}")
         records = list(merged.values())
+
+    # Auto-fill <table>_id column from _id when it's the natural PK alias
+    # (e.g., molecule table's "molecule_id" column should equal the _id value
+    # since _id IS the molecule's identifier — workers often leave it null)
+    pk_alias = f"{table_name}_id"
+    if any(pk_alias in r for r in records):
+        filled_count = sum(1 for r in records if r.get(pk_alias) not in (None, ""))
+        if filled_count < len(records) * 0.5:
+            for r in records:
+                if r.get(pk_alias) in (None, "") and r.get("_id") not in (None, ""):
+                    r[pk_alias] = str(r["_id"])
+            if log_fn:
+                new_filled = sum(1 for r in records if r.get(pk_alias) not in (None, ""))
+                log_fn("pk_alias_fill", f"Filled {pk_alias} from _id: {new_filled}/{len(records)}")
 
     # Filter columns: keep only fields that appear in at least 10% of records
     col_counts: dict[str, int] = {}
@@ -1095,6 +1213,7 @@ def compiled_extract_docs(
 
     for doc_path in doc_paths:
         t0 = time.time()
+
         n = chunked_extract(
             doc_path=doc_path,
             db_path=db_path,

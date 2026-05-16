@@ -113,8 +113,7 @@ def _build_sql_prompt(
     rules = (
         "RULES:\n"
         "- Use ONLY columns from SCHEMA above. Quote all identifiers with double-quotes.\n"
-        "- SELECT only asked columns. No SELECT *.\n"
-        "- Use simple column aliases (AS) for computed columns (e.g., COUNT(*) AS count, AVG(x) AS avg_x).\n"
+        "- Prefer the columns listed in SELECT COLUMNS above.\n"
         "- For list/lookup queries ('what are', 'list', 'identify'), always use SELECT DISTINCT.\n"
         "- For superlatives (lowest/highest/best), use WHERE col = (SELECT MIN/MAX(col)...) to include ALL ties — no LIMIT.\n"
         "- JOIN through JOIN PATHS shown above — do not invent join conditions.\n"
@@ -707,6 +706,36 @@ def _sanitize_sql(sql: str, db_path: Path) -> str:
     # Remove trailing semicolons (SQLite doesn't need them and they can cause issues with multiple statements)
     sql = sql.rstrip(";").strip()
 
+    # Strip trailing column alias when the SELECT has no top-level FROM (scalar expression only).
+    # Avoids CAST(...AS REAL) / column-alias AS ambiguity in SQLite.
+    stripped_upper = sql.upper().strip()
+    if stripped_upper.startswith("SELECT") and "CAST(" in stripped_upper:
+        # Check if there's a top-level FROM (not inside a subquery)
+        depth = 0
+        has_top_from = False
+        for token in re.finditer(r'\(|\)|FROM', sql, re.IGNORECASE):
+            if token.group() == '(':
+                depth += 1
+            elif token.group() == ')':
+                depth -= 1
+            elif depth == 0 and token.group().upper() == 'FROM':
+                has_top_from = True
+                break
+        if not has_top_from:
+            sql = re.sub(r'\s+AS\s+"[^"]*"\s*$', '', sql, flags=re.IGNORECASE)
+            sql = re.sub(r'\s+AS\s+[a-z_]\w*\s*$', '', sql, flags=re.IGNORECASE)
+
+    # Fix unbalanced parentheses (common LLM mistake in nested scalar subqueries)
+    open_count = sql.count('(')
+    close_count = sql.count(')')
+    if open_count > close_count:
+        sql = sql + ')' * (open_count - close_count)
+    elif close_count > open_count:
+        excess = close_count - open_count
+        for _ in range(excess):
+            if sql.endswith(')'):
+                sql = sql[:-1]
+
     # Fix unescaped apostrophes inside single-quoted string literals
     # e.g. 'Women's Soccer' → 'Women''s Soccer'
     sql = _fix_unescaped_apostrophes(sql)
@@ -737,6 +766,7 @@ def _sanitize_sql(sql: str, db_path: Path) -> str:
         pass
 
     return sql
+
 
 
 def _apply_null_guard(sql: str) -> str:
@@ -836,6 +866,7 @@ class QuestionDrivenAgent:
     def run(self, task: PublicTask) -> AgentRunResult:
         """Execute the question-driven pipeline."""
         self._start_time = time.monotonic()
+        self._decomposition_steps: list = []
         context_dir = task.context_dir
         question = task.question
         self._log_file: Path | None = None
@@ -915,7 +946,6 @@ class QuestionDrivenAgent:
                 # (b) Evidence-based: probe DB columns for opaque IDs, check if they
                 #     appear in doc text. No naming conventions assumed.
                 if structured_tables and db_path.exists():
-                    # Pre-read doc texts (first 5000 chars is enough for ID detection)
                     doc_texts: dict[Path, str] = {}
                     for doc in ctx.doc_sources:
                         if doc.path in docs_to_extract:
@@ -923,7 +953,7 @@ class QuestionDrivenAgent:
                         try:
                             doc_texts[doc.path] = doc.path.read_text(
                                 encoding="utf-8", errors="replace"
-                            )[:20000]
+                            )
                         except OSError:
                             pass
 
@@ -941,7 +971,7 @@ class QuestionDrivenAgent:
                                     # Sample values from this column
                                     sample_rows = _conn.execute(
                                         f'SELECT DISTINCT "{col_name}" FROM "{tbl}" '
-                                        f'WHERE "{col_name}" IS NOT NULL LIMIT 5'
+                                        f'WHERE "{col_name}" IS NOT NULL LIMIT 20'
                                     ).fetchall()
                                     if not sample_rows:
                                         continue
@@ -949,12 +979,13 @@ class QuestionDrivenAgent:
                                     if not sample_vals:
                                         continue
                                     # Signal: values look like opaque IDs (not readable text)
-                                    # — short-ish, no spaces, alphanumeric/hash-like
+                                    # — short-ish, no spaces, mixed alphanumeric
                                     is_opaque = all(
                                         len(v) >= 5 and len(v) <= 50
                                         and " " not in v and "@" not in v
                                         and not v.replace(".", "").replace("-", "").isdigit()
-                                        and sum(c.isalpha() for c in v) >= 3
+                                        and any(c.isalpha() for c in v)
+                                        and any(c.isdigit() for c in v)
                                         for v in sample_vals
                                     )
                                     if not is_opaque:
@@ -979,11 +1010,119 @@ class QuestionDrivenAgent:
                 if not structured_tables and ctx.doc_sources:
                     docs_to_extract = [doc.path for doc in ctx.doc_sources]
 
+                # (c2) FK-referenced docs: if structured tables have FK columns
+                # pointing to tables not in DB, check if a doc matches that table name
+                if structured_tables and db_path.exists():
+                    try:
+                        _fk_conn = sqlite3.connect(str(db_path))
+                        existing_tables = {
+                            r[0].lower()
+                            for r in _fk_conn.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table'"
+                            ).fetchall()
+                        }
+                        for tbl in structured_tables:
+                            cols = _fk_conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
+                            for col_info in cols:
+                                col_name = col_info[1]
+                                # Detect FK naming: ends with Id/_id and references missing table
+                                ref_table = ""
+                                cn_lower = col_name.lower()
+                                if cn_lower.endswith("id") and cn_lower != "id":
+                                    ref_table = cn_lower[:-2].rstrip("_")
+                                elif cn_lower.endswith("_id"):
+                                    ref_table = cn_lower[:-3]
+                                if ref_table and ref_table not in existing_tables:
+                                    for doc in ctx.doc_sources:
+                                        if doc.path in docs_to_extract:
+                                            continue
+                                        doc_stem = doc.path.stem.lower()
+                                        if ref_table in doc_stem or doc_stem in ref_table:
+                                            docs_to_extract.append(doc.path)
+                                            self._log(
+                                                "doc_fk_ref",
+                                                f"'{doc.path.name}' matches FK column {tbl}.{col_name} (missing table '{ref_table}')",
+                                            )
+                        _fk_conn.close()
+                    except Exception:
+                        pass
+
+                # (d) Question-referenced: if the question mentions a term that
+                # matches a doc file stem, that doc likely holds the primary data
+                if structured_tables:
+                    q_lower = question.lower()
+                    for doc in ctx.doc_sources:
+                        if doc.path in docs_to_extract:
+                            continue
+                        stem = doc.path.stem.lower()
+                        if len(stem) < 4:
+                            continue
+                        # Check if the doc stem (or its plural/singular) appears in the question
+                        variants = [stem, stem + "s", stem + "es"]
+                        if stem.endswith("s"):
+                            variants.append(stem[:-1])
+                        if any(re.search(r'\b' + re.escape(v) + r'\b', q_lower) for v in variants):
+                            docs_to_extract.append(doc.path)
+                            self._log(
+                                "doc_question_match",
+                                f"'{doc.path.name}' matches question term",
+                            )
+
+                # (e) Knowledge-referenced: if knowledge mentions columns (format, status)
+                # that appear in the question but NOT in any loaded table, extract docs
+                # whose stem matches a table name from knowledge SQL examples
+                if structured_tables and ctx.knowledge_text:
+                    q_lower = question.lower()
+                    # Get all column names from loaded tables
+                    loaded_cols: set[str] = set()
+                    if db_path.exists():
+                        try:
+                            _kconn = sqlite3.connect(str(db_path), timeout=5)
+                            for tbl in structured_tables:
+                                for col in _kconn.execute(f'PRAGMA table_info("{tbl}")').fetchall():
+                                    loaded_cols.add(col[1].lower())
+                            _kconn.close()
+                        except Exception:
+                            pass
+                    # Find knowledge-defined field names that are in the question but not loaded
+                    missing_fields: list[str] = []
+                    for km in re.finditer(
+                        r"[-*]\s+\*{0,2}(\w[\w\s\-]*?)\s*(?:\((\w+)\))?\s*\*{0,2}\s*:",
+                        ctx.knowledge_text,
+                    ):
+                        kf = km.group(1).strip().lower().replace(" ", "_")
+                        if kf and kf not in loaded_cols and kf in q_lower:
+                            missing_fields.append(kf)
+                    # Also check knowledge SQL for table names matching doc stems
+                    if missing_fields:
+                        knowledge_tables: set[str] = set()
+                        for tm in re.finditer(
+                            r'\bFROM\s+(\w+)|JOIN\s+(\w+)',
+                            ctx.knowledge_text, re.IGNORECASE,
+                        ):
+                            t = (tm.group(1) or tm.group(2)).lower()
+                            if t not in {s.lower() for s in structured_tables}:
+                                knowledge_tables.add(t)
+                        for doc in ctx.doc_sources:
+                            if doc.path in docs_to_extract:
+                                continue
+                            doc_stem = doc.path.stem.lower()
+                            if doc_stem in knowledge_tables or any(
+                                doc_stem.startswith(t) or t.startswith(doc_stem)
+                                for t in knowledge_tables
+                            ):
+                                docs_to_extract.append(doc.path)
+                                self._log(
+                                    "doc_knowledge_ref",
+                                    f"'{doc.path.name}' matches knowledge table "
+                                    f"(missing fields: {missing_fields})",
+                                )
+
                 if docs_to_extract:
-                    from data_agent_baseline.pipeline.compiled_extractor import (
-                        compiled_extract_docs,
+                    from data_agent_baseline.pipeline.regex_extractor import (
+                        regex_extract_docs,
                     )
-                    compiled_extract_docs(
+                    regex_extract_docs(
                         doc_paths=docs_to_extract,
                         db_path=db_path,
                         model=self.model,
@@ -1032,11 +1171,15 @@ class QuestionDrivenAgent:
             )
 
             # Step 5b: Value Discovery — probe DB for actual filter values
+            # Patch grounding in-place so corrections override original FILTER VALUES
             value_discovery = self._discover_filter_values(
                 question, db_path, kg, grounding_context, ctx.knowledge_text,
             )
             if value_discovery:
                 self._log("value_discovery", value_discovery)
+                grounding_context = self._patch_grounding_with_discoveries(
+                    grounding_context, value_discovery,
+                )
 
             # Step 5c: Threshold inference — infer normal/abnormal ranges if needed
             threshold_context = self._infer_thresholds(
@@ -1044,23 +1187,35 @@ class QuestionDrivenAgent:
             )
             if threshold_context:
                 self._log("threshold_inference", threshold_context)
-
-            # Inject discovered values into grounding context
-            if value_discovery:
-                grounding_context += f"\n\nDISCOVERED VALUES (actual DB values for filter terms):\n{value_discovery}"
-            if threshold_context:
                 grounding_context += f"\n\n{threshold_context}"
+
+            # ----------------------------------------------------------
+            # Multi-step decomposition (if rule engine emitted steps)
+            # ----------------------------------------------------------
+            data_result = None
+            if self._decomposition_steps:
+                data_result = self._execute_decomposition(
+                    question, db_path, grounding_context, kg_context, sample_data, ctx.knowledge_text,
+                )
+                if data_result and data_result.get("rows"):
+                    self._log("decomposition_success", f"rows={len(data_result['rows'])}")
 
             # ----------------------------------------------------------
             # SQL Generation: LLM writes SQL, close-loop on failure
             # ----------------------------------------------------------
-            max_sql_attempts = 3
+            max_sql_attempts = 4
             sql = ""
-            data_result = None
             failed_sqls: list[str] = []
             gaps = ""
 
+            if data_result and data_result.get("rows"):
+                pass  # decomposition already produced result, skip single-shot
+            else:
+                data_result = None
+
             for attempt in range(max_sql_attempts):
+                if data_result and data_result.get("rows"):
+                    break
                 sql = self._call_sql(
                     question,
                     grounding_context=grounding_context,
@@ -1075,6 +1230,20 @@ class QuestionDrivenAgent:
                 data_result = self._try_sql(db_path, sql)
 
                 if data_result and data_result.get("rows"):
+                    # Semantic validation: skip for value comparisons (grounding is sufficient),
+                    # on final attempt, or when time is tight
+                    elapsed = time.monotonic() - self._start_time
+                    skip_semantic = "VALUE COMPARISON" in grounding_context
+                    if not skip_semantic and attempt < max_sql_attempts - 1 and elapsed < 90:
+                        semantic_issue = self._semantic_validate_result(
+                            question, sql, data_result, grounding_context,
+                        )
+                        if semantic_issue:
+                            self._log("semantic_invalid", semantic_issue)
+                            failed_sqls.append(sql)
+                            gaps = f"- SEMANTIC ERROR: {semantic_issue}\n- Failed SQL (returned wrong data): {sql}"
+                            data_result = None
+                            continue
                     break
 
                 # Diagnose failure for next iteration
@@ -1097,7 +1266,14 @@ class QuestionDrivenAgent:
             # Last resort: if close-loop exhausted, try multi-hypothesis approach
             if not (data_result and data_result.get("rows")):
                 self._log("hypothesis_trigger", "SQL close-loop exhausted — trying multi-hypothesis fallback")
-                diagnosis = self._diagnose_empty_result(db_path, sql) if sql else ""
+                # Diagnose the first valid (non-erroring) SQL that returned 0 rows
+                diag_sql = sql
+                for fs in failed_sqls:
+                    test_r = self._try_sql(db_path, fs)
+                    if test_r is not None:
+                        diag_sql = fs
+                        break
+                diagnosis = self._diagnose_empty_result(db_path, diag_sql) if diag_sql else ""
                 hyp_result, hyp_sql = self._try_multi_hypothesis(
                     question=question,
                     db_path=db_path,
@@ -1110,6 +1286,7 @@ class QuestionDrivenAgent:
                 if hyp_result and hyp_result.get("rows"):
                     data_result = hyp_result
                     self._log("hypothesis_success", f"Hypothesis produced {len(hyp_result['rows'])} rows")
+
 
             # Shape validation before formatting
             if data_result and data_result.get("rows"):
@@ -1185,6 +1362,243 @@ class QuestionDrivenAgent:
             return select_match.group(1).strip().rstrip('"').rstrip("'")
         self._log("sql_parse_failed", f"raw={raw}")
         return ""
+
+    # ------------------------------------------------------------------
+    # Multi-step decomposition executor
+    # ------------------------------------------------------------------
+
+    def _execute_decomposition(
+        self,
+        question: str,
+        db_path: Path,
+        grounding_context: str,
+        kg_context: str,
+        sample_data: str,
+        knowledge_text: str,
+    ) -> dict[str, Any] | None:
+        """Execute decomposed steps: get values separately, compute final answer."""
+        steps = self._decomposition_steps
+        if not steps or len(steps) < 3:
+            return None
+
+        # Steps: [get_value_a, get_value_b, compute]
+        values: dict[str, float] = {}
+        descriptions: dict[str, str] = {}
+
+        for step in steps:
+            if step.sql_template == "__compute__":
+                if len(values) < 2:
+                    return None
+                # Use SQL for full-precision arithmetic instead of LLM
+                compute_result = self._decomposition_compute_sql(
+                    question, db_path, values, descriptions,
+                )
+                if compute_result is None:
+                    # Fallback to LLM compute
+                    compute_result = self._decomposition_compute(question, values, descriptions)
+                if compute_result is not None:
+                    self._log("decomposition_compute", f"result={compute_result}")
+                    return {"columns": ["result"], "rows": [[compute_result]]}
+                return None
+
+            # Close-loop per step: retry up to 3 times on failure
+            max_step_attempts = 3
+            step_gaps = ""
+            step_value = None
+
+            for attempt in range(max_step_attempts):
+                sql = self._decomposition_step_sql(
+                    question, step.description, step.output_var,
+                    grounding_context, values, gaps=step_gaps,
+                )
+                if not sql:
+                    break
+
+                sql = _sanitize_sql(sql, db_path)
+                self._log("decomposition_step", f"{step.output_var}[{attempt}]: {sql}")
+                result = self._try_sql(db_path, sql)
+
+                if not result:
+                    last_err = next(
+                        (s.get("detail", "") for s in reversed(self.steps) if s.get("action") == "sql_error"), ""
+                    )
+                    step_gaps = f"SQL ERROR: {last_err}\nFailed SQL: {sql}"
+                    continue
+
+                if not result.get("rows") or result["rows"][0][0] is None:
+                    hint = ""
+                    if "JOIN" in sql.upper():
+                        hint = " Try using WHERE \"raceId\" IN (SELECT \"_id\" FROM \"races\" WHERE ...) instead of JOIN."
+                    step_gaps = f"Returned NULL or 0 rows.{hint}\nFailed SQL: {sql}"
+                    continue
+
+                try:
+                    step_value = float(result["rows"][0][0])
+                    break
+                except (TypeError, ValueError):
+                    step_gaps = f"Non-numeric result: {result['rows'][0][0]}\nFailed SQL: {sql}"
+                    continue
+
+            if step_value is None:
+                self._log("decomposition_step_fail", f"{step.output_var}: exhausted retries")
+                return None
+
+            values[step.output_var] = step_value
+            descriptions[step.output_var] = step.description
+
+        return None
+
+    def _decomposition_step_sql(
+        self,
+        question: str,
+        step_description: str,
+        output_var: str,
+        grounding_context: str,
+        prior_values: dict[str, float],
+        gaps: str = "",
+    ) -> str:
+        """Generate a simple SQL for one decomposition step."""
+        prior_info = ""
+        if prior_values:
+            prior_info = "\nALREADY RETRIEVED:\n" + "\n".join(
+                f"  {k} = {v}" for k, v in prior_values.items()
+            )
+
+        error_section = ""
+        if gaps:
+            error_section = f"\nPREVIOUS ATTEMPT FAILED:\n{gaps}\nFix the issue."
+
+        # Strip grounding to factual sections only —
+        # remove USER WANTS, COMPUTATION TYPE, VALUE COMPARISON, RATIO PATTERN, etc.
+        # that cause the LLM to solve the whole question instead of one step.
+        keep_headers = ("SCHEMA", "JOIN PATHS", "FILTER VALUES", "ORDER BY")
+        keep_sections: list[str] = []
+        current_section: list[str] = []
+        current_header = ""
+        for line in grounding_context.split("\n"):
+            if any(line.startswith(h) for h in keep_headers):
+                if current_header and current_section:
+                    keep_sections.extend(current_section)
+                current_header = line.split(":")[0]
+                current_section = [line]
+            elif current_header:
+                if line and not line.startswith(" ") and not line.startswith("\t") and not line.startswith('"') and not line.startswith("⚠"):
+                    if current_section:
+                        keep_sections.extend(current_section)
+                    current_header = ""
+                    current_section = []
+                else:
+                    current_section.append(line)
+        if current_header and current_section:
+            keep_sections.extend(current_section)
+        step_grounding = "\n".join(keep_sections).strip()
+
+        prompt = f"""Step: {step_description}
+
+{step_grounding}
+{prior_info}
+{error_section}
+
+Write ONE SQL that returns exactly one row with one numeric value.
+- SELECT one column only. No subqueries in SELECT.
+- Simple: SELECT col FROM table WHERE ... LIMIT 1
+- Quote identifiers with double-quotes.
+- WHERE col IS NOT NULL for the output column.
+- If a JOIN returns 0 rows, use WHERE "col" IN (SELECT ...) instead.
+
+Return ONLY: {{"sql": "SELECT ..."}}"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        if not raw:
+            return ""
+        parsed = self._parse_json(raw)
+        if isinstance(parsed, dict):
+            sql = parsed.get("sql", "")
+            if sql:
+                return sql
+        select_match = re.search(r'(SELECT\s.+?)(?:```|"|\Z)', raw, re.DOTALL | re.IGNORECASE)
+        if select_match:
+            return select_match.group(1).strip().rstrip('"').rstrip("'")
+        return ""
+
+    def _decomposition_compute_sql(
+        self, question: str, db_path: Path, values: dict[str, float],
+        descriptions: dict[str, str] | None = None,
+    ) -> float | None:
+        """Ask LLM for formula, execute in SQLite for full precision."""
+        lines = []
+        for k, v in values.items():
+            label = (descriptions or {}).get(k, k)
+            lines.append(f"  {k} ({label}) = {v}")
+        values_text = "\n".join(lines)
+
+        prompt = f"""QUESTION: {question}
+
+RETRIEVED VALUES:
+{values_text}
+
+Write a SQL SELECT that computes the final answer using the literal numeric values above.
+The answer should be positive when the question asks "how much more/faster/higher".
+
+Return ONLY: {{"sql": "SELECT ..."}}"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        if not raw:
+            return None
+        parsed = self._parse_json(raw)
+        sql = ""
+        if isinstance(parsed, dict):
+            sql = parsed.get("sql", "")
+        if not sql:
+            m = re.search(r'(SELECT\s.+?)(?:```|"|\Z)', raw, re.DOTALL | re.IGNORECASE)
+            if m:
+                sql = m.group(1).strip().rstrip('"').rstrip("'")
+        if not sql:
+            return None
+        result = self._try_sql(db_path, sql)
+        if result and result.get("rows") and result["rows"][0][0] is not None:
+            try:
+                return float(result["rows"][0][0])
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _decomposition_compute(
+        self, question: str, values: dict[str, float], descriptions: dict[str, str] | None = None,
+    ) -> float | None:
+        """Compute final answer from retrieved values using LLM."""
+        # Label values with their step descriptions for semantic clarity
+        lines = []
+        for k, v in values.items():
+            label = (descriptions or {}).get(k, k)
+            lines.append(f"  {label} = {v}")
+        values_text = "\n".join(lines)
+
+        prompt = f"""QUESTION: {question}
+
+RETRIEVED VALUES:
+{values_text}
+
+Compute the final numeric answer. Return FULL precision (no rounding).
+The answer should be a positive number when the question asks "how much more/faster/higher".
+
+Return ONLY: {{"result": <number>}}"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = self._model_call_with_retry(messages)
+        if not raw:
+            return None
+        parsed = self._parse_json(raw)
+        if isinstance(parsed, dict):
+            result = parsed.get("result")
+            if result is not None:
+                try:
+                    return float(result)
+                except (TypeError, ValueError):
+                    pass
+        return None
 
     # ------------------------------------------------------------------
     # LLM Call: Evaluate
@@ -1638,7 +2052,21 @@ RULES:
                 _new_output = []
                 for node in output_nodes:
                     if node.table.lower() != _pref_table.lower() and node.column.lower() in _pref_col_names:
-                        _new_output.append(QueryNode(table=_pref_table, column=node.column, role="output"))
+                        # Try preferred table first, then alternatives, then original
+                        if self._db_check(db_path, _pref_table, node.column):
+                            _new_output.append(QueryNode(table=_pref_table, column=node.column, role="output"))
+                        else:
+                            alt_found = False
+                            for t in kg.tables:
+                                if t.name.lower() in (_pref_table.lower(), node.table.lower()):
+                                    continue
+                                if any(c.name.lower() == node.column.lower() for c in t.columns):
+                                    if self._db_check(db_path, t.name, node.column):
+                                        _new_output.append(QueryNode(table=t.name, column=node.column, role="output"))
+                                        alt_found = True
+                                        break
+                            if not alt_found:
+                                _new_output.append(node)
                     else:
                         _new_output.append(node)
                 output_nodes = _new_output
@@ -1775,10 +2203,12 @@ RULES:
                             if keyword not in pop_words or val.lower() in existing_filter_vals:
                                 continue
                             # Find the column matching field_name that contains this value
+                            # Prefer the table with the most rows for better coverage
                             found = False
                             try:
                                 conn = sqlite3.connect(str(db_path), timeout=5)
                                 field_lower = field_name.lower()
+                                best_match: tuple[str, str, int] | None = None
                                 for t in kg.tables:
                                     for c in t.columns:
                                         if c.name.lower() != field_lower:
@@ -1788,15 +2218,16 @@ RULES:
                                             (val,),
                                         ).fetchone()
                                         if row:
-                                            filter_nodes.append(QueryNode(
-                                                table=t.name, column=c.name, role="filter",
-                                                operator="=", value=val,
-                                            ))
-                                            self._log("kg_inject_filter", f"Added {t.name}.{c.name} = '{val}' (from knowledge: '{val}' for {keyword})")
-                                            found = True
-                                            break
-                                    if found:
-                                        break
+                                            row_count = t.row_count or 0
+                                            if best_match is None or row_count > best_match[2]:
+                                                best_match = (t.name, c.name, row_count)
+                                if best_match:
+                                    filter_nodes.append(QueryNode(
+                                        table=best_match[0], column=best_match[1], role="filter",
+                                        operator="=", value=val,
+                                    ))
+                                    self._log("kg_inject_filter", f"Added {best_match[0]}.{best_match[1]} = '{val}' (from knowledge: '{val}' for {keyword})")
+                                    found = True
                                 conn.close()
                             except Exception:
                                 pass
@@ -1812,7 +2243,12 @@ RULES:
         filter_nodes = self._probe_filter_values(filter_nodes, db_path, kg, question)
 
         # --- Step 3b1: Domain column fixes (deterministic swap) ---
-        filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text)
+        filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text, db_path)
+
+        # --- Step 3b1a: Knowledge-defined value mappings ---
+        # When anchors explicitly define "column = 'value' for keyword" and the filter
+        # concept matches that keyword, override the filter with the canonical form.
+        filter_nodes = self._apply_knowledge_value_mappings(filter_nodes, anchor_text, kg, db_path)
 
         # (Impossible threshold fix moved to rules engine — Step 3d)
 
@@ -1831,7 +2267,7 @@ RULES:
                     picked = repicked2
                     output_nodes = new_output2
                     filter_nodes = self._probe_filter_values(new_filter2, db_path, kg, question)
-                    filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text)
+                    filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text, db_path)
                     self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
                     self._log("kg_filter_nodes", ", ".join(
                         f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
@@ -1839,7 +2275,12 @@ RULES:
 
         # --- Step 3 post: Deterministic column override from exact question-word matches ---
         # Runs AFTER all repick cycles so it has the final say on output columns.
-        output_nodes = self._override_columns_from_question(question, output_nodes, filter_nodes, kg)
+        output_nodes = self._override_columns_from_question(question, output_nodes, filter_nodes, kg, db_path)
+
+        # --- Step 3 post-a2: Resolve FK output columns to their display value ---
+        # If the output column is a foreign key (link_to_X, X_id with FK edge), replace it
+        # with the human-readable label column from the referenced table.
+        output_nodes = self._resolve_fk_output_columns(output_nodes, kg, db_path)
 
         # --- Step 3 post-b: List+lookup → PK when no attribute column named in question ---
         # If shape=list, operation=lookup, and the question doesn't mention any non-PK column
@@ -1924,6 +2365,8 @@ RULES:
         filter_nodes = engine_out.filter_nodes
         for tag, msg in engine_out.log_entries:
             self._log(tag, msg)
+        if engine_out.decomposition:
+            self._decomposition_steps = engine_out.decomposition
 
         # --- Step 4: Graph Traversal (BFS through KG edges) ---
         path = build_query_path(output_nodes, filter_nodes, kg, order_nodes=order_nodes)
@@ -1936,7 +2379,20 @@ RULES:
         ) if path.edges else "(single table)")
 
         # --- Step 5: Format as grounding context for SQL LLM ---
-        grounding = self._format_kg_plan_as_grounding(path, None, picked, "", kg=kg, db_path=db_path)
+        _eoi_match = re.search(r'Entity of interest:\s*(\w+)', user_intent or "")
+        if _eoi_match:
+            picked["_entity_of_interest"] = _eoi_match.group(1)
+
+        # Fix comp_type vs answer shape conflict: "count" + "list" shape means
+        # "produce a grouped list", not "aggregate into one number"
+        _shape_match = re.search(r'Answer shape:\s*(\w+)', user_intent or "")
+        _grain_match = re.search(r'Grain:\s*(.+)', user_intent or "")
+        if _shape_match and _shape_match.group(1).lower() == "list":
+            _ct = picked.get("computation_type", "")
+            if _ct in ("count", "sum", "avg"):
+                picked["computation_type"] = "grouped_list"
+
+        grounding = self._format_kg_plan_as_grounding(path, None, picked, "", kg=kg, db_path=db_path, user_intent=user_intent)
 
         # Inject rules engine directives into grounding
         if engine_out.sql_directives:
@@ -1944,7 +2400,9 @@ RULES:
 
         # --- Step 5a: Surface domain formulas relevant to this question ---
         # Skip if independent ratio already produced the SQL pattern
-        if "INDEPENDENT RATIO" not in grounding:
+        # Skip for percentage/count — those have proper CASE WHEN/COUNT patterns
+        comp_type_lower = (picked.get("computation_type") or "").lower()
+        if "INDEPENDENT RATIO" not in grounding and comp_type_lower not in ("percentage", "count"):
             domain_formula = self._extract_domain_formula(question, anchor_text)
             if domain_formula:
                 sql_hint = self._formula_to_sql_hint(domain_formula, output_nodes, picked)
@@ -2181,6 +2639,16 @@ CONSTRAINTS:
                 ))
             else:
                 matched = self._fuzzy_match_column(table, col, kg)
+                if not matched:
+                    # Column not on specified table — check ALL tables
+                    for t in kg.tables:
+                        if t.name.lower() != table.lower():
+                            for c in t.columns:
+                                if c.name.lower() == col.lower():
+                                    matched = (t.name, c.name)
+                                    break
+                            if matched:
+                                break
                 if matched:
                     filter_nodes.append(QueryNode(
                         table=matched[0], column=matched[1], role="filter",
@@ -2205,6 +2673,7 @@ CONSTRAINTS:
     def _override_columns_from_question(
         self, question: str, output_nodes: list[QueryNode],
         filter_nodes: list[QueryNode], kg: KnowledgeGraph,
+        db_path: Path | None = None,
     ) -> list[QueryNode]:
         """Deterministically replace output columns when the question contains an exact column name
         that exists in the graph but the picker chose a different column with the same structural role.
@@ -2294,22 +2763,37 @@ CONSTRAINTS:
                 # Check if there's a matched column with compatible type.
                 # Skip columns already in another output node.
                 existing_cols = {(n.table, n.column) for n in output_nodes}
+                # Tables already in the query (reachable without extra joins)
+                query_tables = {n.table.lower() for n in output_nodes} | {n.table.lower() for n in filter_nodes}
+                # Tables with direct FK edges to query tables
+                reachable_tables = set(query_tables)
+                if kg.graph and kg.graph.fk_edges:
+                    for edge in kg.graph.fk_edges:
+                        src_tbl = edge.src.split(".")[0].lower() if "." in edge.src else ""
+                        dst_tbl = edge.dst.split(".")[0].lower() if "." in edge.dst else ""
+                        if src_tbl in query_tables:
+                            reachable_tables.add(dst_tbl)
+                        if dst_tbl in query_tables:
+                            reachable_tables.add(src_tbl)
+
                 replacement = None
-                if is_text:
+                type_set = (
+                    ("TEXT", "VARCHAR", "CHAR", "STRING") if is_text
+                    else ("REAL", "FLOAT", "NUMERIC", "INTEGER", "INT") if is_numeric
+                    else ()
+                )
+                if type_set:
+                    # Collect all reachable, type-compatible candidates
+                    all_candidates = []
                     for token, candidates in matched_cols.items():
                         for tbl, col_name, sql_type in candidates:
-                            if sql_type in ("TEXT", "VARCHAR", "CHAR", "STRING") and (tbl, col_name) not in existing_cols:
-                                replacement = (tbl, col_name)
-                                break
-                        if replacement:
-                            break
-                elif is_numeric:
-                    for token, candidates in matched_cols.items():
-                        for tbl, col_name, sql_type in candidates:
-                            if sql_type in ("REAL", "FLOAT", "NUMERIC", "INTEGER", "INT") and (tbl, col_name) not in existing_cols:
-                                replacement = (tbl, col_name)
-                                break
-                        if replacement:
+                            if sql_type in type_set and (tbl, col_name) not in existing_cols:
+                                if tbl.lower() in reachable_tables:
+                                    all_candidates.append((tbl, col_name))
+                    # Try each until one has data
+                    for cand in all_candidates:
+                        if self._db_check(db_path, cand[0], cand[1]):
+                            replacement = cand
                             break
                 if replacement:
                     new_output.append(QueryNode(
@@ -2318,6 +2802,70 @@ CONSTRAINTS:
                     continue
             new_output.append(node)
 
+        return new_output
+
+    def _resolve_fk_output_columns(
+        self, output_nodes: list[QueryNode], kg: KnowledgeGraph, db_path: Path | None,
+    ) -> list[QueryNode]:
+        """Replace FK output columns with the human-readable display column from the referenced table.
+
+        When the picker selects an FK column (link_to_major, category_id, etc.) as output,
+        users want the resolved value (e.g., "Business"), not the opaque ID (e.g., "recXXX").
+        Only resolves columns that are clearly reference/link columns, not shared PKs like "ID".
+        """
+        if not kg or not kg.graph:
+            return output_nodes
+        g = kg.graph
+        new_output: list[QueryNode] = []
+        for node in output_nodes:
+            col_lower = node.column.lower()
+            # Only resolve columns that look like references (link_to_X, X_id, ref_X, fk_X)
+            is_ref_col = (
+                col_lower.startswith("link_to_")
+                or col_lower.startswith("ref_")
+                or col_lower.startswith("fk_")
+                or (col_lower.endswith("_id") and col_lower != "id" and col_lower != "_id")
+                or (col_lower.endswith("_key") and col_lower != "key")
+                or (col_lower.endswith("_code") and col_lower != "code")
+            )
+            if not is_ref_col:
+                new_output.append(node)
+                continue
+            col_id = f"{node.table}.{node.column}"
+            fk_edges_from = g.fk_from.get(col_id, [])
+            if not fk_edges_from:
+                new_output.append(node)
+                continue
+            edge = fk_edges_from[0]
+            dst_col_node = g.columns.get(edge.dst)
+            if not dst_col_node:
+                new_output.append(node)
+                continue
+            ref_table = dst_col_node.table_id
+            ref_col = dst_col_node.name
+            # Look up display column from fk_display_map
+            display_col_id = g.fk_display_map.get(col_id)
+            if display_col_id and "." in display_col_id:
+                disp_table, disp_col = display_col_id.split(".", 1)
+                if self._db_check(db_path, disp_table, disp_col):
+                    self._log("fk_output_resolve", f"{col_id} → {display_col_id}")
+                    new_output.append(QueryNode(table=disp_table, column=disp_col, role="output"))
+                    continue
+            # Fallback: find first non-PK text column in referenced table
+            ref_schema = kg.get_table(ref_table)
+            if ref_schema:
+                for col in ref_schema.columns:
+                    if col.name == ref_col:
+                        continue
+                    if col.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR", ""):
+                        if self._db_check(db_path, ref_table, col.name):
+                            self._log("fk_output_resolve", f"{col_id} → {ref_table}.{col.name}")
+                            new_output.append(QueryNode(table=ref_table, column=col.name, role="output"))
+                            break
+                else:
+                    new_output.append(node)
+            else:
+                new_output.append(node)
         return new_output
 
     def _resolve_question_columns(
@@ -2774,8 +3322,36 @@ CONSTRAINTS:
                             (node.value,),
                         ).fetchone()
                     if row:
+                        # Exact match exists, but check if there are also prefix
+                        # variants (e.g., "Advertisement" exact + "Advertisement for X").
+                        # If so, use LIKE prefix to capture all related rows.
+                        # Guard: value must be 4+ chars and prefix additions must start
+                        # with a word boundary (space/punctuation after the value).
+                        if node.operator == "=" and len(node.value) >= 4:
+                            exact_cnt = conn.execute(
+                                f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" = ?',
+                                (node.value,),
+                            ).fetchone()[0]
+                            # LIKE 'Value %' — require space after value for word-boundary safety
+                            prefix_cnt = conn.execute(
+                                f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" LIKE ? OR "{node.column}" = ?',
+                                (f"{node.value} %", node.value),
+                            ).fetchone()[0]
+                            if prefix_cnt > exact_cnt:
+                                probed.append(QueryNode(
+                                    table=node.table, column=node.column, role=node.role,
+                                    operator="LIKE", value=f"{node.value}%",
+                                ))
+                                self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' → LIKE '{node.value}%' ({prefix_cnt} vs {exact_cnt} exact)")
+                                continue
                         probed.append(node)
                         continue
+                    # Value doesn't match — try FK resolution (name→ID lookup)
+                    if question and kg and not str(node.value).isdigit():
+                        resolved = self._resolve_fk_value(node, conn, kg, question)
+                        if resolved:
+                            probed.append(resolved)
+                            continue
                     # Value doesn't match exactly — sample actual values to find format
                     samples = conn.execute(
                         f'SELECT DISTINCT "{node.column}" FROM "{node.table}" '
@@ -2791,6 +3367,28 @@ CONSTRAINTS:
                             operator=node.operator, value=matched,
                         ))
                         continue
+                    # Try prefix match: value is a prefix of stored values (e.g.,
+                    # "Advertisement" matches "Advertisement for event promotion")
+                    if len(val_lower) >= 3:
+                        prefix_matches = [
+                            v for v in sample_vals
+                            if v.lower().startswith(val_lower)
+                        ]
+                        if not prefix_matches:
+                            # Also check DB beyond sample with LIKE
+                            like_row = conn.execute(
+                                f'SELECT 1 FROM "{node.table}" WHERE "{node.column}" LIKE ? LIMIT 1',
+                                (f"{node.value}%",),
+                            ).fetchone()
+                            if like_row:
+                                prefix_matches = [node.value]
+                        if prefix_matches:
+                            probed.append(QueryNode(
+                                table=node.table, column=node.column, role=node.role,
+                                operator="LIKE", value=f"{node.value}%",
+                            ))
+                            self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' → LIKE '{node.value}%' (prefix match)")
+                            continue
                     # Try date-format reconciliation: if the filter value looks like
                     # a date prefix and samples show a different date format, rewrite
                     rewritten = self._reconcile_date_format(node, sample_vals)
@@ -2835,6 +3433,52 @@ CONSTRAINTS:
                             ))
                             self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' → LIKE '%{digits_pattern}%'")
                             continue
+
+                    # Same-table column search: value not found in assigned column,
+                    # check other TEXT columns in the same table
+                    if kg:
+                        table_schema = kg.get_table(node.table)
+                        if table_schema:
+                            found_col = False
+                            for col in table_schema.columns:
+                                if col.name == node.column:
+                                    continue
+                                if col.sql_type.upper() not in ("TEXT", "VARCHAR", "CHAR", ""):
+                                    continue
+                                try:
+                                    row = conn.execute(
+                                        f'SELECT 1 FROM "{node.table}" WHERE "{col.name}" = ? LIMIT 1',
+                                        (node.value,),
+                                    ).fetchone()
+                                    if row:
+                                        probed.append(QueryNode(
+                                            table=node.table, column=col.name, role=node.role,
+                                            operator=node.operator, value=node.value,
+                                        ))
+                                        self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' not found → moved to {node.table}.{col.name}")
+                                        found_col = True
+                                        break
+                                except Exception:
+                                    continue
+                            if found_col:
+                                continue
+                            # Doc-backed resolution: search raw doc text for the value
+                            # near an ID, then filter by _id directly
+                            if hasattr(self, '_doc_paths') and self._doc_paths:
+                                resolved_id = self._resolve_value_from_doc(
+                                    node.value, node.table
+                                )
+                                if resolved_id:
+                                    probed.append(QueryNode(
+                                        table=node.table, column="_id", role=node.role,
+                                        operator="=", value=resolved_id,
+                                    ))
+                                    self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' resolved from doc → _id='{resolved_id}'")
+                                    continue
+                            probed.append(node)
+                            self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' not found in DB. Samples: {sample_vals[:5]}")
+                            continue
+
                     # Keep original — let close-loop handle it
                     probed.append(node)
                     self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' not found in DB. Samples: {sample_vals[:5]}")
@@ -2927,6 +3571,35 @@ CONSTRAINTS:
             return row is not None
         except Exception:
             return False
+
+    def _db_check(self, db_path: Path | None, table: str, column: str,
+                  operator: str = "IS NOT NULL", value: Any = None) -> bool:
+        """Single utility for all DB existence checks.
+
+        Returns True if at least one row matches, False if no match or error.
+        Handles subquery values (returns True — can't evaluate, assume valid).
+        """
+        if not db_path or not db_path.exists():
+            return True
+        if value is not None:
+            val_str = str(value).strip()
+            if val_str.lstrip("(").lower().startswith("select"):
+                return True
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            if operator == "IS NOT NULL" or value is None:
+                row = conn.execute(
+                    f'SELECT 1 FROM "{table}" WHERE "{column}" IS NOT NULL LIMIT 1'
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f'SELECT 1 FROM "{table}" WHERE "{column}" {operator} ? LIMIT 1',
+                    (value,),
+                ).fetchone()
+            conn.close()
+            return row is not None
+        except Exception:
+            return True
 
     def _detect_per_unit_filters(
         self, question: str, filter_nodes: list[QueryNode], kg: KnowledgeGraph | None,
@@ -3161,6 +3834,43 @@ CONSTRAINTS:
                 continue
         return None
 
+    def _resolve_value_from_doc(self, value: str, table: str) -> str | None:
+        """Search raw doc text for a filter value near an ID pattern.
+
+        When extracted doc data has gaps (e.g., race name not populated for a record),
+        fall back to scanning the original doc text for the value near an ID reference.
+        Returns the ID string if found, None otherwise.
+        """
+        val_lower = value.lower()
+        val_words = set(val_lower.split())
+        table_lower = table.lower()
+
+        for doc_path in self._doc_paths:
+            doc_stem = doc_path.stem.lower()
+            if table_lower not in doc_stem and doc_stem not in table_lower:
+                continue
+            try:
+                doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
+            for para in paragraphs:
+                para_lower = para.lower()
+                if val_lower in para_lower or (
+                    len(val_words) > 1
+                    and sum(1 for w in val_words if w in para_lower) >= len(val_words) - 1
+                ):
+                    id_patterns = [
+                        r'\(\w+\s+ID\s*[:.]?\s*(\d+)\)',
+                        r'(?:\w+\s+)?ID\s*[:.]?\s*(\d+)',
+                        r'(?:identifier|registered\s+under)\s*[:.]?\s*(\d+)',
+                    ]
+                    for pat in id_patterns:
+                        m = re.search(pat, para, re.IGNORECASE)
+                        if m:
+                            return m.group(1)
+        return None
+
     @staticmethod
     def _reconcile_date_format(node: QueryNode, sample_vals: list[str]) -> QueryNode | None:
         """When a filter value doesn't match DB values, try to reconcile date formats.
@@ -3264,6 +3974,7 @@ CONSTRAINTS:
         filter_nodes: list[QueryNode],
         kg: KnowledgeGraph,
         anchor_text: str,
+        db_path: Path | None = None,
     ) -> list[QueryNode]:
         """Deterministically swap filter columns when domain knowledge defines a better match."""
         if not anchor_text or not filter_nodes:
@@ -3294,7 +4005,7 @@ CONSTRAINTS:
             return filter_nodes
 
         # Swap: if a filter uses a synonym column (position↔rank, round↔number),
-        # replace it with the domain-defined column
+        # replace it with the domain-defined column — validate against DB
         synonym_groups = [
             {"position", "rank", "positionorder"},
             {"round", "number"},
@@ -3303,22 +4014,130 @@ CONSTRAINTS:
         for node in filter_nodes:
             swapped = False
             for defined_col, (col_table, definition) in domain_cols.items():
-                # Check if this filter node is in the same synonym group as the domain column
                 for group in synonym_groups:
                     if node.column.lower() in group and defined_col in group:
-                        # Swap to the domain-defined column
-                        fixed.append(QueryNode(
-                            table=col_table, column=defined_col, role=node.role,
-                            operator=node.operator, value=node.value,
-                        ))
-                        self._log("domain_fix",
-                            f'Swapped {node.table}.{node.column} → {col_table}.{defined_col} '
-                            f'(domain: "{definition[:60]}")')
-                        swapped = True
+                        val_str = str(node.value).strip()
+                        is_subquery = val_str.lstrip("(").lower().startswith("select")
+
+                        if not db_path or is_subquery:
+                            # Can't validate — trust domain knowledge
+                            fixed.append(QueryNode(
+                                table=col_table, column=defined_col, role=node.role,
+                                operator=node.operator, value=node.value,
+                            ))
+                            self._log("domain_fix",
+                                f'Swapped {node.table}.{node.column} → {col_table}.{defined_col} '
+                                f'(domain: "{definition[:60]}")')
+                            swapped = True
+                            break
+
+                        # Try domain column with original value, then type-cast alternatives
+                        best_col = None
+                        best_val = node.value
+                        candidates = [(defined_col, node.value)]
+                        try:
+                            int_val = int(float(str(node.value)))
+                            if str(int_val) != str(node.value):
+                                candidates.append((defined_col, int_val))
+                        except (ValueError, TypeError):
+                            pass
+                        for alt_col in group:
+                            if alt_col != defined_col and alt_col != node.column.lower():
+                                ts = kg.get_table(col_table)
+                                if ts and any(c.name.lower() == alt_col for c in ts.columns):
+                                    candidates.append((alt_col, node.value))
+
+                        for cand_col, cand_val in candidates:
+                            if self._db_check(db_path, col_table, cand_col, node.operator, cand_val):
+                                best_col = cand_col
+                                best_val = cand_val
+                                break
+
+                        if best_col:
+                            fixed.append(QueryNode(
+                                table=col_table, column=best_col, role=node.role,
+                                operator=node.operator, value=best_val,
+                            ))
+                            self._log("domain_fix",
+                                f'Swapped {node.table}.{node.column} → {col_table}.{best_col} '
+                                f'(domain: "{definition[:60]}", validated)')
+                            swapped = True
+                        else:
+                            self._log("domain_fix",
+                                f'No valid column in group {group} for value {node.value} — keeping {node.table}.{node.column}')
                         break
                 if swapped:
                     break
             if not swapped:
+                fixed.append(node)
+        return fixed
+
+    def _apply_knowledge_value_mappings(
+        self,
+        filter_nodes: list[QueryNode],
+        anchor_text: str,
+        kg: KnowledgeGraph,
+        db_path: Path | None,
+    ) -> list[QueryNode]:
+        """Override filters using explicit knowledge mappings like 'column = value for keyword'.
+
+        Parses anchor patterns such as:
+          "Use label = '+' for carcinogenic"
+          "'M' for male"
+          "label = '+' for carcinogenic molecules"
+        When a filter's value/column name matches a keyword, replace with the canonical form.
+        """
+        if not anchor_text or not filter_nodes:
+            return filter_nodes
+
+        # Parse patterns: column = 'value' for keyword
+        # e.g. "label = '+' for carcinogenic" or "Use label = '+' for carcinogenic"
+        mappings: list[tuple[str, str, str]] = []  # (column, value, keyword)
+        for m in re.finditer(
+            r"(\w+)\s*=\s*['\"]([^'\"]+)['\"]\s+for\s+(\w+)",
+            anchor_text,
+        ):
+            col, val, keyword = m.group(1), m.group(2), m.group(3).lower()
+            mappings.append((col, val, keyword))
+
+        if not mappings:
+            return filter_nodes
+
+        fixed: list[QueryNode] = []
+        for node in filter_nodes:
+            replaced = False
+            node_val_lower = str(node.value).lower()
+            node_col_lower = node.column.lower()
+
+            for col_name, canon_val, keyword in mappings:
+                # Match if: filter value IS the keyword, OR filter column name contains the keyword
+                if node_val_lower != keyword and keyword not in node_col_lower:
+                    continue
+
+                # Find the table that has this column with this value
+                for t in kg.tables:
+                    real_col = next(
+                        (c.name for c in t.columns if c.name.lower() == col_name.lower()),
+                        None,
+                    )
+                    if not real_col:
+                        continue
+                    if db_path and self._db_check(db_path, t.name, real_col, "=", canon_val):
+                        # Don't replace if already using the correct column+value
+                        if node.table == t.name and node.column == real_col and str(node.value) == canon_val:
+                            break
+                        fixed.append(QueryNode(
+                            table=t.name, column=real_col, role=node.role,
+                            operator="=", value=canon_val,
+                        ))
+                        self._log("knowledge_value_map",
+                            f"{node.table}.{node.column}='{node.value}' → {t.name}.{real_col}='{canon_val}' "
+                            f"(knowledge: '{canon_val}' for {keyword})")
+                        replaced = True
+                        break
+                if replaced:
+                    break
+            if not replaced:
                 fixed.append(node)
         return fixed
 
@@ -3589,13 +4408,20 @@ RULES:
         sql: str,
         kg: KnowledgeGraph | None = None,
         db_path: Path | None = None,
+        user_intent: str = "",
     ) -> str:
         """Format the KG path plan as grounding context for the SQL LLM."""
         parts: list[str] = []
 
         parts.append(f"USER WANTS: {goal.get('what_user_wants', '')}")
         comp_type = plan.computation_type if plan else goal.get("computation_type", "simple_lookup")
-        parts.append(f"COMPUTATION TYPE: {comp_type} (your SQL MUST produce this type of result)")
+        if comp_type == "grouped_list":
+            parts.append(
+                "COMPUTATION TYPE: grouped_list (your SQL MUST return MULTIPLE ROWS — "
+                "use SELECT column, COUNT(*) ... GROUP BY column, or SELECT DISTINCT column)"
+            )
+        else:
+            parts.append(f"COMPUTATION TYPE: {comp_type} (your SQL MUST produce this type of result)")
 
         # Schema for tables in path (so LLM knows exact column names)
         if kg and path.tables_in_path:
@@ -3638,35 +4464,36 @@ RULES:
                 if not fk_connected:
                     # Truly independent populations — no FK relationship
                     is_independent_ratio = True
-                # Group filters by table
-                table_filters: dict[str, list[QueryNode]] = {}
-                for node in path.filter_nodes:
-                    if not node.column.startswith("_expr:"):
-                        table_filters.setdefault(node.table, []).append(node)
-                # Build scalar subquery formula
-                subqueries: list[str] = []
-                for tbl, nodes in table_filters.items():
-                    # Find the table's PK or Id column
-                    pk_col = "Id"
-                    if kg:
-                        table_schema = kg.get_table(tbl)
-                        if table_schema and table_schema.columns:
-                            pk_col = table_schema.columns[0].name
-                    where_parts = []
-                    for n in nodes:
-                        where_parts.append(f'"{n.column}" {n.operator} \'{n.value}\'')
-                    where_clause = " AND ".join(where_parts)
-                    subqueries.append(f'(SELECT COUNT(DISTINCT "{pk_col}") FROM "{tbl}" WHERE {where_clause})')
+                if is_independent_ratio:
+                    # Group filters by table
+                    table_filters: dict[str, list[QueryNode]] = {}
+                    for node in path.filter_nodes:
+                        if not node.column.startswith("_expr:"):
+                            table_filters.setdefault(node.table, []).append(node)
+                    # Build scalar subquery formula
+                    subqueries: list[str] = []
+                    for tbl, nodes in table_filters.items():
+                        # Find the table's PK or Id column
+                        pk_col = "Id"
+                        if kg:
+                            table_schema = kg.get_table(tbl)
+                            if table_schema and table_schema.columns:
+                                pk_col = table_schema.columns[0].name
+                        where_parts = []
+                        for n in nodes:
+                            where_parts.append(f'"{n.column}" {n.operator} \'{n.value}\'')
+                        where_clause = " AND ".join(where_parts)
+                        subqueries.append(f'(SELECT COUNT(DISTINCT "{pk_col}") FROM "{tbl}" WHERE {where_clause})')
 
-                if len(subqueries) >= 2:
-                    if comp_type == "percentage":
-                        formula = f"CAST({subqueries[0]} AS REAL) * 100.0 / {subqueries[1]}"
-                    else:
-                        formula = f"CAST({subqueries[0]} AS REAL) / {subqueries[1]}"
-                    parts.append(
-                        f"INDEPENDENT RATIO (MANDATORY — use this exact SQL pattern):\n"
-                        f"  SELECT {formula}"
-                    )
+                    if len(subqueries) >= 2:
+                        if comp_type == "percentage":
+                            formula = f"CAST({subqueries[0]} AS REAL) * 100.0 / {subqueries[1]}"
+                        else:
+                            formula = f"CAST({subqueries[0]} AS REAL) / {subqueries[1]}"
+                        parts.append(
+                            f"INDEPENDENT RATIO (MANDATORY — use this exact SQL pattern):\n"
+                            f"  SELECT {formula}"
+                        )
 
         # --- Subquery filter makes JOIN redundant detection ---
         # When ALL output columns are from one table and a filter uses IN (SELECT ... FROM other_table),
@@ -3701,6 +4528,15 @@ RULES:
         # Join paths (suppress for independent ratios or subquery-covered joins)
         if path.edges and not is_independent_ratio and not suppress_join:
             jp_lines = [f'  "{e.src_table}"."{e.src_column}" = "{e.dst_table}"."{e.dst_column}"' for e in path.edges]
+            # Warn if FK overlap is low — the join might not work for all rows
+            low_overlap_edges = [e for e in path.edges if e.weight < 0.3]
+            if low_overlap_edges:
+                jp_lines.append(
+                    f"  ⚠️ LOW JOIN RELIABILITY ({low_overlap_edges[0].weight:.0%} overlap). "
+                    f"If the JOIN returns 0 rows, query the larger table alone using "
+                    f"a subquery: WHERE \"{low_overlap_edges[0].src_column}\" IN "
+                    f"(SELECT \"{low_overlap_edges[0].dst_column}\" FROM \"{low_overlap_edges[0].dst_table}\" WHERE ...)"
+                )
             parts.append("JOIN PATHS (use these exact join conditions):\n" + "\n".join(jp_lines))
         elif suppress_join:
             parts.append(
@@ -3720,11 +4556,36 @@ RULES:
         )
         # Multi-table percentage: FK-connected tables, one filter is population (WHERE),
         # the other is subset (CASE WHEN). Fires when independent ratio was suppressed.
+        # Suppress when any output column is a numeric measurement — value comparison, not row-counting.
+        _output_is_numeric_measure = False
+        if path.output_nodes and db_path:
+            try:
+                _conn2 = sqlite3.connect(str(db_path), timeout=5)
+                for _onode in path.output_nodes:
+                    _ocol = _onode.column.lower()
+                    # ID/PK columns are for counting, not value comparison
+                    if _ocol == "id" or _ocol == "_id" or _ocol.endswith("_id"):
+                        continue
+                    _col_info2 = _conn2.execute(f'PRAGMA table_info("{_onode.table}")').fetchall()
+                    for _ci in _col_info2:
+                        if _ci[1].lower() == _ocol:
+                            if _ci[5]:  # pk flag
+                                break
+                            _ct = (_ci[2] or "").upper()
+                            if _ct in ("REAL", "INTEGER", "NUMERIC", "FLOAT", "DOUBLE", "INT"):
+                                _output_is_numeric_measure = True
+                            break
+                    if _output_is_numeric_measure:
+                        break
+                _conn2.close()
+            except Exception:
+                pass
         is_multi_table_pct = (
             comp_type in ("percentage", "ratio") and path.filter_nodes and not is_independent_ratio
             and not is_single_table_ratio
             and len(filter_tables_set) >= 2
             and path.edges
+            and not _output_is_numeric_measure
         )
 
         if path.filter_nodes and not is_independent_ratio:
@@ -3735,10 +4596,29 @@ RULES:
                     ts = kg.get_table(tbl)
                     if ts and ts.columns:
                         pk_col = ts.columns[0].name
+                # Detect TEXT columns needing CAST for range comparisons
+                _st_text_cols: set[str] = set()
+                if db_path:
+                    try:
+                        _conn_st = sqlite3.connect(str(db_path), timeout=5)
+                        for _ci_st in _conn_st.execute(f'PRAGMA table_info("{tbl}")').fetchall():
+                            if (_ci_st[2] or "").upper() == "TEXT":
+                                _st_text_cols.add(_ci_st[1])
+                        _conn_st.close()
+                    except Exception:
+                        pass
                 conds = []
                 for node in path.filter_nodes:
-                    if not node.column.startswith("_expr:"):
-                        conds.append(f'"{node.column}" {node.operator} \'{node.value}\'')
+                    if node.column.startswith("_expr:"):
+                        continue
+                    col_ref = f'"{node.column}"'
+                    is_num = re.match(r'^-?\d+\.?\d*$', str(node.value))
+                    if node.operator in (">=", "<=", ">", "<") and node.column in _st_text_cols and is_num:
+                        conds.append(f'CAST("{node.column}" AS REAL) {node.operator} {node.value}')
+                    elif node.operator.upper() == "LIKE":
+                        conds.append(f'{col_ref} LIKE \'{node.value}\'')
+                    else:
+                        conds.append(f'{col_ref} {node.operator} \'{node.value}\'')
                 cond_sql = " AND ".join(conds)
                 if comp_type == "percentage":
                     parts.append(
@@ -3751,13 +4631,36 @@ RULES:
                         f'  SELECT CAST(COUNT(CASE WHEN {cond_sql} THEN 1 END) AS REAL) / COUNT("{pk_col}") FROM "{tbl}"'
                     )
             elif is_multi_table_pct:
-                # Determine population table (entity of interest / output table) vs subset table
+                # Determine population (WHERE) vs subset (CASE WHEN) using user_intent.
+                # "In X, what % is Y?" → X is population, Y is subset.
                 entity_tbl = path.output_nodes[0].table if path.output_nodes else None
                 pop_filters: list[QueryNode] = []
                 subset_filters: list[QueryNode] = []
+
+                # Extract population description from user_intent
+                _pop_desc = ""
+                if user_intent:
+                    _pop_match = re.search(r'Population \(WHERE\):\s*(.+)', user_intent)
+                    if _pop_match:
+                        _pop_desc = _pop_match.group(1).strip().lower()
+
                 for node in path.filter_nodes:
                     if node.column.startswith("_expr:"):
                         pop_filters.append(node)
+                        continue
+                    # Match column/value to population description flexibly
+                    col_words = node.column.lower().replace("_", " ").split()
+                    val_str = str(node.value).lower().rstrip("0").rstrip(".")
+                    in_pop = False
+                    if _pop_desc:
+                        in_pop = (
+                            any(w in _pop_desc for w in col_words if len(w) > 2)
+                            or val_str in _pop_desc
+                        )
+                    if in_pop:
+                        pop_filters.append(node)
+                    elif _pop_desc:
+                        subset_filters.append(node)
                     elif node.table == entity_tbl:
                         pop_filters.append(node)
                     else:
@@ -3767,7 +4670,9 @@ RULES:
                     subset_filters = pop_filters
                     pop_filters = []
                 # Build the CASE WHEN pattern with JOIN
-                base_table = entity_tbl or path.tables_in_path[0]
+                # Base table = population table (WHERE filters), not necessarily entity table
+                pop_tables = {n.table for n in pop_filters if not n.column.startswith("_expr:")}
+                base_table = next(iter(pop_tables), None) or entity_tbl or path.tables_in_path[0]
                 join_parts_list = []
                 for e in path.edges:
                     if e.dst_table != base_table:
@@ -3779,28 +4684,47 @@ RULES:
                             f'JOIN "{e.src_table}" ON "{e.src_table}"."{e.src_column}" = "{e.dst_table}"."{e.dst_column}"'
                         )
                 join_sql = " ".join(join_parts_list)
+
+                # Determine TEXT columns that hold numeric values (need CAST for range ops)
+                _text_cols: set[str] = set()
+                if db_path:
+                    try:
+                        _conn_tc = sqlite3.connect(str(db_path), timeout=5)
+                        for _tbl_name in {n.table for n in pop_filters + subset_filters}:
+                            for _ci_tc in _conn_tc.execute(f'PRAGMA table_info("{_tbl_name}")').fetchall():
+                                if (_ci_tc[2] or "").upper() == "TEXT":
+                                    _text_cols.add(f"{_tbl_name}.{_ci_tc[1]}")
+                        _conn_tc.close()
+                    except Exception:
+                        pass
+
+                def _filter_expr(n: QueryNode) -> str:
+                    col_ref = f'"{n.table}"."{n.column}"'
+                    # CAST TEXT columns for numeric range comparisons
+                    range_ops = {">=", "<=", ">", "<"}
+                    is_numeric_val = re.match(r'^-?\d+\.?\d*$', str(n.value))
+                    if n.operator in range_ops and f"{n.table}.{n.column}" in _text_cols and is_numeric_val:
+                        col_ref = f'CAST("{n.table}"."{n.column}" AS REAL)'
+                        return f'{col_ref} {n.operator} {n.value}'
+                    if n.operator.upper() == "LIKE":
+                        return f'{col_ref} LIKE \'{n.value}\''
+                    return f'{col_ref} {n.operator} \'{n.value}\''
+
                 # Population WHERE clause
                 pop_parts = []
                 for n in pop_filters:
                     if n.column.startswith("_expr:"):
                         pop_parts.append(f'{n.column[len("_expr:"):]} {n.operator} {n.value}')
-                    elif n.operator.upper() == "LIKE":
-                        pop_parts.append(f'"{n.table}"."{n.column}" LIKE \'{n.value}\'')
                     else:
-                        pop_parts.append(f'"{n.table}"."{n.column}" {n.operator} \'{n.value}\'')
+                        pop_parts.append(_filter_expr(n))
                 # Subset CASE WHEN clause
-                subset_parts = []
-                for n in subset_filters:
-                    if n.operator.upper() == "LIKE":
-                        subset_parts.append(f'"{n.table}"."{n.column}" LIKE \'{n.value}\'')
-                    else:
-                        subset_parts.append(f'"{n.table}"."{n.column}" {n.operator} \'{n.value}\'')
+                subset_parts = [_filter_expr(n) for n in subset_filters]
                 subset_cond = " AND ".join(subset_parts)
                 pop_where = f" WHERE {' AND '.join(pop_parts)}" if pop_parts else ""
-                # Find PK of entity table
+                # Find PK of base table (population table)
                 pk_col = "Id"
-                if kg and entity_tbl:
-                    ts = kg.get_table(entity_tbl)
+                if kg and base_table:
+                    ts = kg.get_table(base_table)
                     if ts and ts.columns:
                         pk_col = ts.columns[0].name
                 if comp_type == "percentage":
@@ -3824,7 +4748,14 @@ RULES:
                     elif node.operator.upper() == "IS NOT NULL":
                         fv_lines.append(f'  "{node.table}"."{node.column}": IS NOT NULL')
                     elif node.operator.upper() == "LIKE":
-                        fv_lines.append(f'  "{node.table}"."{node.column}": USE → WHERE "{node.column}" LIKE \'{node.value}\' COLLATE NOCASE')
+                        like_val = node.value
+                        # Escape literal underscores in ID patterns (e.g., %_4 → %\_4)
+                        # so SQL doesn't treat _ as a single-char wildcard
+                        if "_" in like_val:
+                            like_val = like_val.replace("_", r"\_")
+                            fv_lines.append(f'  "{node.table}"."{node.column}": USE → WHERE "{node.column}" LIKE \'{like_val}\' ESCAPE \'\\\' COLLATE NOCASE')
+                        else:
+                            fv_lines.append(f'  "{node.table}"."{node.column}": USE → WHERE "{node.column}" LIKE \'{like_val}\' COLLATE NOCASE')
                     else:
                         fv_lines.append(f'  "{node.table}"."{node.column}": {node.operator} {node.value}')
                         # Subquery scope propagation: if value is a subquery with WHERE,
@@ -3932,17 +4863,71 @@ RULES:
 
         # --- COUNT DISTINCT hint for count with JOINs ---
         if comp_type == "count" and path.edges and path.output_nodes and not suppress_join:
-            entity_table = path.output_nodes[0].table
-            # Use the primary key (first column) of the entity table, not the output column
-            pk_col = None
-            if kg:
-                table_schema = kg.get_table(entity_table)
-                if table_schema and table_schema.columns:
-                    pk_col = table_schema.columns[0].name
-            if not pk_col:
-                pk_col = path.output_nodes[0].column
+            # Determine what to count: prefer the entity of interest's FK/PK
+            count_table = path.output_nodes[0].table
+            count_col = None
+
+            # If there's an entity-of-interest that differs from the output table,
+            # count through its FK column in the bridge/output table
+            entity_of_interest = goal.get("_entity_of_interest", "")
+            if entity_of_interest and entity_of_interest.lower() != count_table.lower():
+                # Find FK column in the output table pointing to entity of interest
+                if kg:
+                    for edge in (kg.graph.fk_edges if kg.graph else []):
+                        src_tbl = edge.src.split(".")[0] if "." in edge.src else ""
+                        dst_tbl = edge.dst.split(".")[0] if "." in edge.dst else ""
+                        src_col = edge.src.split(".")[1] if "." in edge.src else ""
+                        if src_tbl.lower() == count_table.lower() and dst_tbl.lower() == entity_of_interest.lower():
+                            count_col = src_col
+                            break
+
+            # Structural fallback: on a bridge table with multiple FK edges,
+            # if the output column is an FK whose target table is equality-filtered
+            # to a single entity, counting that column gives trivially 1.
+            # Count the other FK instead.
+            if not count_col and kg and kg.graph and kg.graph.fk_edges:
+                output_col = path.output_nodes[0].column
+                # Collect FK columns in the count_table
+                fk_cols_in_table: list[tuple[str, str]] = []  # (src_col, dst_table)
+                for edge in kg.graph.fk_edges:
+                    src_tbl = edge.src.split(".")[0] if "." in edge.src else ""
+                    src_col = edge.src.split(".")[1] if "." in edge.src else ""
+                    dst_tbl = edge.dst.split(".")[0] if "." in edge.dst else ""
+                    if src_tbl.lower() == count_table.lower():
+                        fk_cols_in_table.append((src_col, dst_tbl))
+
+                if len(fk_cols_in_table) >= 2:
+                    # Check if the output column's FK target is equality-constrained
+                    output_fk_target = None
+                    for col, tgt in fk_cols_in_table:
+                        if col.lower() == output_col.lower():
+                            output_fk_target = tgt
+                            break
+
+                    if output_fk_target:
+                        # Is the target table equality-filtered?
+                        target_eq_filtered = any(
+                            fnode.table.lower() == output_fk_target.lower()
+                            and fnode.operator in ("=", "==")
+                            for fnode in (path.filter_nodes or [])
+                        )
+                        if target_eq_filtered:
+                            # Count the other FK instead
+                            for col, tgt in fk_cols_in_table:
+                                if col.lower() != output_col.lower():
+                                    count_col = col
+                                    break
+
+            if not count_col:
+                if kg:
+                    table_schema = kg.get_table(count_table)
+                    if table_schema and table_schema.columns:
+                        count_col = table_schema.columns[0].name
+                if not count_col:
+                    count_col = path.output_nodes[0].column
+
             parts.append(
-                f'COUNT HINT: Use COUNT(DISTINCT "{entity_table}"."{pk_col}") to avoid '
+                f'COUNT HINT: Use COUNT(DISTINCT "{count_table}"."{count_col}") to avoid '
                 f'counting duplicate rows created by the JOIN.'
             )
 
@@ -3985,6 +4970,10 @@ RULES:
                                 _conn.close()
                             except Exception:
                                 pass
+                        # Skip if sample value doesn't look like a date/timestamp
+                        # (e.g., "+5.478" is a race duration, not a temporal value)
+                        if target_sample and not re.search(r'\d{4}', target_sample):
+                            continue
                         for filter_table, date_filters in filter_tables_with_dates.items():
                             for df in date_filters:
                                 # Extract year/month digits from filter value
@@ -4037,14 +5026,25 @@ RULES:
                         row = conn.execute(
                             f'SELECT MIN(CAST("{f.column}" AS REAL)), '
                             f'MAX(CAST("{f.column}" AS REAL)), '
-                            f'COUNT(*), COUNT(DISTINCT "ID") '
+                            f'COUNT(*) '
                             f'FROM "{f.table}" WHERE "{f.column}" IS NOT NULL'
                         ).fetchone()
                         if row and row[2] > 0:
-                            dist_lines.append(
-                                f'  "{f.table}"."{f.column}": min={row[0]}, max={row[1]}, '
-                                f'{row[2]} records across {row[3]} patients'
-                            )
+                            if row[0] == 0.0 and row[1] == 0.0:
+                                samples = conn.execute(
+                                    f'SELECT DISTINCT "{f.column}" FROM "{f.table}" '
+                                    f'WHERE "{f.column}" IS NOT NULL LIMIT 3'
+                                ).fetchall()
+                                sample_str = ", ".join(repr(s[0]) for s in samples)
+                                dist_lines.append(
+                                    f'  "{f.table}"."{f.column}": TEXT format, '
+                                    f'samples: [{sample_str}], {row[2]} records'
+                                )
+                            else:
+                                dist_lines.append(
+                                    f'  "{f.table}"."{f.column}": min={row[0]}, max={row[1]}, '
+                                    f'{row[2]} records'
+                                )
                     except Exception:
                         pass
                 conn.close()
@@ -4730,8 +5730,8 @@ If the question asks for something with a superlative (lowest, highest, most, le
         """
         if not anchor_text:
             return ""
-        q_words_raw = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
-        q_words_stemmed = {w.rstrip('s') if len(w) > 3 else w for w in q_words_raw}
+        q_words_raw = set(re.findall(r'\b[a-z]{4,}\b', question.lower()))
+        q_words_stemmed = {w.rstrip('s') if len(w) > 4 else w for w in q_words_raw}
         formula_indicators = ("SUM(", "AVG(", "COUNT(", "DIVIDE(", "MULTIPLY(", "/", "\\frac", "frac{", "×", "÷")
 
         best_formula = ""
@@ -4761,14 +5761,14 @@ If the question asks for something with a superlative (lowest, highest, most, le
             if bt_pos > 0 and bt_pos < len(label):
                 label = full_line[:bt_pos]
 
-            label_words_raw = set(re.findall(r'\b[a-z]{3,}\b', label.lower()))
-            label_words_stemmed = {w.rstrip('s') if len(w) > 3 else w for w in label_words_raw}
+            label_words_raw = set(re.findall(r'\b[a-z]{4,}\b', label.lower()))
+            label_words_stemmed = {w.rstrip('s') if len(w) > 4 else w for w in label_words_raw}
             overlap = len(q_words_stemmed & label_words_stemmed)
             if overlap > best_score:
                 best_score = overlap
                 best_formula = full_line
 
-        if best_score >= 2:
+        if best_score >= 4:
             return best_formula
         return ""
 
@@ -7310,37 +8310,58 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
                     pass
 
             if not blockers:
-                # No single filter removal helps — likely a JOIN mismatch.
-                # Test: do the filter values exist in the individual tables (without JOIN)?
-                join_suspect = False
-                tables_all = [r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()]
-                for cond in conditions:
-                    if join_suspect:
-                        break
-                    str_vals = re.findall(r"'([^']*)'", cond)
-                    for val in str_vals:
-                        if not val or join_suspect:
-                            break
-                        for tbl in tables_all:
+                # No single filter removal helps. Two possibilities:
+                # A) JOIN mismatch — filter values exist but JOIN prevents matches
+                # B) Pairwise conflict — two filters individually pass but combined produce 0
+
+                # Test pairwise: remove 2 filters at a time to find conflicting pairs
+                if len(conditions) >= 3:
+                    for i in range(len(conditions)):
+                        for j in range(i + 1, len(conditions)):
+                            remaining = [c for k, c in enumerate(conditions) if k != i and k != j]
+                            test_sql = f"{base_sql} WHERE {' AND '.join(remaining)}" if remaining else base_sql
                             try:
-                                cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()]
-                                for col in cols:
-                                    hit = conn.execute(
-                                        f'SELECT 1 FROM "{tbl}" WHERE "{col}" = ? LIMIT 1', (val,)
-                                    ).fetchone()
-                                    if hit:
-                                        join_suspect = True
-                                        diagnostics.append(
-                                            f"Value '{val}' exists in {tbl}.{col} but JOIN produces 0 rows with it — "
-                                            f"the JOIN condition is WRONG. Try joining on a different column or without transformations."
-                                        )
-                                        break
+                                count = conn.execute(f"SELECT COUNT(*) FROM ({test_sql})").fetchone()[0]
+                                if count > 0:
+                                    diagnostics.append(
+                                        f"CONFLICTING PAIR: '{conditions[i]}' AND '{conditions[j]}' "
+                                        f"together exclude all rows (without both: {count} rows). "
+                                        f"These conditions contradict each other — fix or remove one."
+                                    )
                             except Exception:
                                 pass
-                            if join_suspect:
+
+                # Test JOIN validity: do filter values exist in individual tables?
+                if not diagnostics:
+                    join_suspect = False
+                    tables_all = [r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()]
+                    for cond in conditions:
+                        if join_suspect:
+                            break
+                        str_vals = re.findall(r"'([^']*)'", cond)
+                        for val in str_vals:
+                            if not val or join_suspect:
                                 break
+                            for tbl in tables_all:
+                                try:
+                                    cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()]
+                                    for col in cols:
+                                        hit = conn.execute(
+                                            f'SELECT 1 FROM "{tbl}" WHERE "{col}" = ? LIMIT 1', (val,)
+                                        ).fetchone()
+                                        if hit:
+                                            join_suspect = True
+                                            diagnostics.append(
+                                                f"Value '{val}' exists in {tbl}.{col} but JOIN produces 0 rows with it — "
+                                                f"the JOIN condition is WRONG. Try joining on a different column."
+                                            )
+                                            break
+                                except Exception:
+                                    pass
+                                if join_suspect:
+                                    break
 
                 if not diagnostics:
                     diagnostics.append(
@@ -7446,10 +8467,21 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
         if "FILTER VALUES:" in grounding_context:
             fv_section = grounding_context.split("FILTER VALUES:")[1].split("\n\n")[0]
             for line in fv_section.strip().split("\n"):
-                match = re.match(r"\s*(\S+):\s*(.+)", line)
+                # Match quoted "table"."col": or unquoted table.col:
+                match = re.match(r'\s*"?(\w+)"?\."?(\w+)"?:\s*(.+)', line)
                 if match:
-                    col_key = match.group(1).strip()
-                    vals = [v.strip().strip("'\"") for v in match.group(2).split(",")]
+                    col_key = f"{match.group(1)}.{match.group(2)}"
+                    raw_val = match.group(3)
+                    # Extract values from various formats
+                    # "USE → WHERE ..." format: extract the filter value
+                    like_m = re.search(r"LIKE\s+'([^']+)'", raw_val)
+                    eq_m = re.search(r"=\s*'?([^',\s]+)'?", raw_val) if not like_m else None
+                    if like_m:
+                        vals = [like_m.group(1).replace('%', '')]
+                    elif eq_m:
+                        vals = [eq_m.group(1)]
+                    else:
+                        vals = [v.strip().strip("'\"") for v in raw_val.split(",")]
                     targeted[col_key] = [v for v in vals if v and len(v) >= 2]
 
         if not targeted:
@@ -7519,6 +8551,52 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
         if discoveries:
             return "\n".join(discoveries[:10])
         return ""
+
+    def _patch_grounding_with_discoveries(self, grounding: str, discoveries: str) -> str:
+        """Rewrite FILTER VALUES lines in grounding to use discovered corrections.
+
+        Instead of appending a separate section (which the LLM can ignore),
+        patch the original lines with USE → directives.
+        """
+        if "FILTER VALUES" not in grounding:
+            return grounding + f"\n\nDISCOVERED VALUES (use these exact values in WHERE):\n{discoveries}"
+
+        for line in discoveries.split("\n"):
+            # Parse: "'term' not found exactly in Table.Col, but LIKE matches: ['actual1', ...]"
+            m = re.match(
+                r"\s*'([^']+)' not found exactly in (\w+)\.(\w+), but LIKE matches: \[(.+)\]",
+                line,
+            )
+            if not m:
+                continue
+            term, table, col, matches_str = m.group(1), m.group(2), m.group(3), m.group(4)
+            # Extract the first match value
+            match_vals = re.findall(r"'([^']+)'", matches_str)
+            if not match_vals:
+                continue
+            best_match = match_vals[0]
+
+            # Find the FILTER VALUES line for this column and rewrite it
+            col_pattern = re.compile(
+                rf'(\s*"?{re.escape(table)}"?\."?{re.escape(col)}"?:\s*)(.+)',
+                re.IGNORECASE,
+            )
+            new_lines = []
+            patched = False
+            for gline in grounding.split("\n"):
+                if not patched and col_pattern.search(gline):
+                    # Rewrite with USE → LIKE directive
+                    prefix = col_pattern.search(gline).group(1)
+                    new_lines.append(
+                        f'{prefix}USE → WHERE "{col}" LIKE \'%{best_match}%\' COLLATE NOCASE'
+                    )
+                    patched = True
+                else:
+                    new_lines.append(gline)
+            if patched:
+                grounding = "\n".join(new_lines)
+
+        return grounding
 
     # ------------------------------------------------------------------
     # Component: Threshold Inference
@@ -7634,6 +8712,16 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
         if diagnosis:
             diag_section = f"\nDIAGNOSIS:\n{diagnosis}"
 
+        # Detect if all failed SQLs use JOINs — suggest single-table approach
+        join_hint = ""
+        if failed_sqls and all("JOIN" in s.upper() for s in failed_sqls if s):
+            join_hint = (
+                "\n⚠️ ALL previous attempts used JOIN and returned 0 rows. "
+                "The JOIN key may not match between tables. "
+                "At least one hypothesis MUST query the main/larger table WITHOUT any JOIN — "
+                "use only columns available directly in that table."
+            )
+
         prompt = f"""Previous SQL returned 0 rows.
 
 QUESTION: {question}
@@ -7647,6 +8735,7 @@ SAMPLES:
 {f"DOMAIN: {knowledge_text[:500]}" if knowledge_text else ""}
 {failed_section}
 {diag_section}
+{join_hint}
 
 Generate 3 DIFFERENT SQL queries. Each must try a DIFFERENT column, join, filter value, or format.
 
@@ -7918,6 +9007,7 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                 raw = self._model_call_with_retry(messages)
                 parsed = self._parse_json(raw)
                 if isinstance(parsed, dict) and parsed.get("sql"):
+                    self._log("shape_fix_sql", parsed["sql"])
                     fix_result = self._try_sql(db_path, parsed["sql"])
                     if fix_result and fix_result.get("rows"):
                         fix_str = " ".join(str(v) for v in fix_result["rows"][0])
@@ -7984,6 +9074,7 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                 raw = self._model_call_with_retry(messages)
                 parsed = self._parse_json(raw)
                 if isinstance(parsed, dict) and parsed.get("sql"):
+                    self._log("shape_fix_sql", parsed["sql"])
                     fix_result = self._try_sql(db_path, parsed["sql"])
                     if fix_result and fix_result.get("rows"):
                         new_vals = [str(v) for v in fix_result["rows"][0]]
@@ -8016,6 +9107,7 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             raw = self._model_call_with_retry(messages)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("sql"):
+                self._log("shape_fix_sql", parsed["sql"])
                 fix_result = self._try_sql(db_path, parsed["sql"])
                 if fix_result and fix_result.get("rows") and len(fix_result.get("columns", [])) >= 2:
                     self._log("shape_fixed", f"Now has {len(fix_result['columns'])} columns")
@@ -8081,6 +9173,7 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             raw = self._model_call_with_retry(messages)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("sql"):
+                self._log("shape_fix_sql", parsed["sql"])
                 fix_result = self._try_sql(db_path, parsed["sql"])
                 if fix_result and fix_result.get("rows") and 0 < len(fix_result["rows"]) < len(rows):
                     self._log("shape_fixed_singular", f"Narrowed from {len(rows)} to {len(fix_result['rows'])} rows")
@@ -8250,6 +9343,25 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             conn.close()
             return {"columns": columns, "rows": [list(r) for r in rows]}
         except Exception as e:
+            err_msg = str(e)
+            # Retry with trailing column alias stripped (CAST AS REAL / AS alias ambiguity)
+            if conn and "syntax error" in err_msg.lower():
+                base = sql.rstrip().rstrip(';')
+                fixed = re.sub(r'\s+AS\s+"[^"]*"\s*$', '', base, flags=re.IGNORECASE)
+                if fixed == base:
+                    fixed = re.sub(r'\s+AS\s+[a-z_]\w*\s*$', '', base, flags=re.IGNORECASE)
+                if fixed == base:
+                    # Also try stripping alias before trailing ) * N pattern
+                    fixed = re.sub(r'\)\s*\*\s*\d+\s+AS\s+\w+\s*$', ') * 100', base, flags=re.IGNORECASE)
+                if fixed != base:
+                    try:
+                        cursor = conn.execute(fixed)
+                        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                        rows = cursor.fetchall()
+                        conn.close()
+                        return {"columns": columns, "rows": [list(r) for r in rows]}
+                    except Exception:
+                        pass
             self._log("sql_error", f"SQL failed: {e}")
             if conn:
                 try:
@@ -8382,6 +9494,79 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
         if columns and rows:
             return {"columns": columns, "rows": [[str(v) for v in row] for row in rows]}
         return {}
+
+    def _semantic_validate_result(
+        self,
+        question: str,
+        sql: str,
+        data_result: dict[str, Any],
+        grounding_context: str,
+    ) -> str:
+        """Verify SQL result semantically matches the question. Returns diagnosis or empty string."""
+        cols = data_result.get("columns", [])
+        rows = data_result.get("rows", [])
+        if not rows:
+            return ""
+
+        preview_lines = [" | ".join(str(c) for c in cols)]
+        for row in rows[:5]:
+            preview_lines.append(" | ".join(str(v)[:40] for v in row))
+        if len(rows) > 5:
+            preview_lines.append(f"... ({len(rows)} total rows)")
+        result_preview = "\n".join(preview_lines)
+
+        grounding_compact = grounding_context[:1500]
+
+        prompt = f"""QUESTION: {question}
+
+SQL: {sql}
+
+RESULT ({len(rows)} rows):
+{result_preview}
+
+GROUNDING:
+{grounding_compact}
+
+Verify the SQL SEMANTICALLY answers the question. Check:
+1. COLUMNS: Does SELECT use the column the question actually asks about?
+2. ORDERING: If question asks "highest/lowest/most/first/last", does SQL have ORDER BY + LIMIT or WHERE = MAX/MIN?
+3. AGGREGATION: Is COUNT vs SUM vs AVG correct? Is the denominator right for percentages?
+4. FILTERS: Are WHERE conditions matching what the question specifies?
+5. JOINS: Does the join produce the correct semantic relationship?
+
+Reply EXACTLY:
+PASS
+or
+FAIL: <one sentence: what is semantically wrong and how to fix it>
+
+RULES:
+- Multiple rows are VALID for list questions. Do NOT reject for row count alone.
+- NULL values are acceptable.
+- Do NOT question filter values that appear in GROUNDING.
+- Do NOT question the SELECT column if it matches the GROUNDING's SELECT COLUMNS hint. The grounding chose the column deliberately.
+- For COUNT queries: the column being counted may differ from the SELECT hint — as long as it counts the correct entity (e.g. counting members, not events). Do NOT reject for this.
+- Do NOT reject for complexity, style, or "may not yield correct result". If the SQL RETURNED data, judge the logic only.
+- Only flag CLEAR semantic mismatches where the result is PROVABLY wrong."""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages)
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if not raw:
+                return ""
+            first_line = raw.split("\n")[0].strip()
+            if first_line.upper().startswith("PASS"):
+                return ""
+            if first_line.upper().startswith("FAIL"):
+                diagnosis = first_line[5:].strip() if len(first_line) > 5 else ""
+                if not diagnosis and "\n" in raw:
+                    diagnosis = raw.split("\n", 1)[1].strip()[:200]
+                return diagnosis or "Semantic mismatch detected"
+            if any(kw in raw.lower() for kw in ("correct", "pass", "valid", "matches the question")):
+                return ""
+            return raw[:200]
+        except Exception:
+            return ""
 
     def _model_call_with_retry(self, messages: list[ModelMessage]) -> str:
         """Call model with 60s timeout. Returns empty string on failure (no retry)."""

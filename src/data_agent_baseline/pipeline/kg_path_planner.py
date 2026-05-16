@@ -466,6 +466,15 @@ def find_shortest_path(
             if edge.dst_table in visited:
                 continue
             edge_cost = 1.0 - edge.weight
+            # Tiebreaker: prefer edges following FK naming convention (<table>_id)
+            # Check both directions since edges are bidirectional
+            src_col_lower = edge.src_column.lower()
+            dst_col_lower = edge.dst_column.lower()
+            src_tbl_lower = edge.src_table.lower()
+            dst_tbl_lower = edge.dst_table.lower()
+            if (src_col_lower in (f"{dst_tbl_lower}_id", f"{dst_tbl_lower}id")
+                    or dst_col_lower in (f"{src_tbl_lower}_id", f"{src_tbl_lower}id")):
+                edge_cost -= 0.01
             counter += 1
             heapq.heappush(heap, (cost + edge_cost, counter, edge.dst_table, path + [edge]))
 

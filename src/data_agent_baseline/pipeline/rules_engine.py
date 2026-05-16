@@ -25,11 +25,20 @@ from data_agent_baseline.pipeline.kg_path_planner import QueryNode, QueryPath
 
 
 @dataclass(slots=True)
+class DecompositionStep:
+    """One step of a multi-step SQL execution plan."""
+    description: str  # what this step retrieves
+    sql_template: str  # SQL with {prev_result} placeholders for prior step outputs
+    output_var: str  # variable name for result (e.g., "value_a", "value_b")
+
+
+@dataclass(slots=True)
 class RuleResult:
     """Output of a single rule evaluation."""
     filter_nodes: list[QueryNode] | None = None  # replacement filter nodes (None = no change)
     sql_directives: list[str] = field(default_factory=list)  # lines injected into grounding
     log_entries: list[tuple[str, str]] = field(default_factory=list)  # (tag, message) pairs
+    decomposition: list[DecompositionStep] = field(default_factory=list)  # multi-step plan
 
 
 @dataclass(slots=True)
@@ -115,13 +124,16 @@ class EngineContext:
         return {}
 
     def count_matching(self, table: str, column: str, operator: str, value: Any) -> int:
-        """Count rows matching a condition."""
+        """Count rows matching a condition. Returns -1 if unevaluable."""
         if not self.db_path:
             return -1
         try:
+            val_str = str(value).strip()
+            if val_str.lstrip("(").lower().startswith("select"):
+                return -1
             conn = sqlite3.connect(str(self.db_path), timeout=5)
             if operator.upper() == "IN":
-                vals = re.findall(r"'([^']*)'", str(value))
+                vals = re.findall(r"'([^']*)'", val_str)
                 if not vals:
                     return -1
                 placeholders = ",".join("?" * len(vals))
@@ -743,12 +755,139 @@ def rule_ratio_pattern(ctx: EngineContext) -> RuleResult | None:
     if not population_text or not metric_text:
         return None
 
-    directive = (
-        f"RATIO PATTERN: This is a percentage/ratio question.\n"
-        f"  Population (denominator): {population_text}\n"
-        f"  Subset (numerator): {metric_text}\n"
-        f"  Use: SELECT CAST(COUNT(CASE WHEN [subset_condition] THEN 1 END) AS REAL) * 100 / COUNT(*)"
-    )
+    # Distinguish value ratio (A/B) from percentage (subset/population * 100).
+    # Structural signal: if any output column is numeric (measurement like milliseconds,
+    # amount, score) → comparing values, not counting rows. Skip the COUNT template.
+    is_value_ratio = False
+    if ctx.output_nodes and ctx.db_path:
+        try:
+            _conn = sqlite3.connect(str(ctx.db_path), timeout=5)
+            for _node in ctx.output_nodes:
+                col_lower = _node.column.lower()
+                # ID/PK columns are used for counting, not value comparison
+                if col_lower == "id" or col_lower == "_id" or col_lower.endswith("_id"):
+                    continue
+                col_info = _conn.execute(f'PRAGMA table_info("{_node.table}")').fetchall()
+                for ci in col_info:
+                    if ci[1].lower() == col_lower:
+                        # ci[5] is the pk flag — skip primary keys
+                        if ci[5]:
+                            break
+                        col_type = (ci[2] or "").upper()
+                        if col_type in ("REAL", "INTEGER", "INT", "NUMERIC", "FLOAT", "DOUBLE"):
+                            is_value_ratio = True
+                        break
+                if is_value_ratio:
+                    break
+            _conn.close()
+        except Exception:
+            pass
+        # Also check: multiple equality filter values on same column (group comparison).
+        # Exclude range operators (>=, <=, >, <) which indicate a BETWEEN range, not comparison.
+        if not is_value_ratio and ctx.filter_nodes:
+            range_ops = {">=", "<=", ">", "<", "BETWEEN"}
+            filter_cols: dict[str, int] = {}
+            for fn in ctx.filter_nodes:
+                if fn.operator in range_ops:
+                    continue
+                key = f"{fn.table}.{fn.column}"
+                filter_cols[key] = filter_cols.get(key, 0) + 1
+            if any(v > 1 for v in filter_cols.values()):
+                is_value_ratio = True
+
+    if is_value_ratio:
+        asks_pct = any(w in q for w in ("percentage", "percent", "%"))
+        if asks_pct:
+            directive = (
+                f"VALUE COMPARISON: This compares two numeric values — do NOT use COUNT.\n"
+                f"  Base context: {population_text}\n"
+                f"  Comparison: {metric_text}\n"
+                f"  NULL SAFETY: When finding extremes (first/last), put the IS NOT NULL filter for the output column INSIDE the MIN/MAX subquery, not outside."
+            )
+            # Emit decomposition: get each value in a separate simple query, then compute
+            # Find the numeric output column for decomposition
+            out_col = None
+            out_tbl = None
+            if ctx.output_nodes and ctx.db_path:
+                try:
+                    _conn2 = sqlite3.connect(str(ctx.db_path), timeout=5)
+                    for _nd in ctx.output_nodes:
+                        _ci2 = _conn2.execute(f'PRAGMA table_info("{_nd.table}")').fetchall()
+                        for _r in _ci2:
+                            if _r[1].lower() == _nd.column.lower():
+                                if (_r[2] or "").upper() in ("REAL", "INTEGER", "INT", "NUMERIC", "FLOAT", "DOUBLE"):
+                                    out_col = _nd.column
+                                    out_tbl = _nd.table
+                                break
+                        if out_col:
+                            break
+                    _conn2.close()
+                except Exception:
+                    pass
+            if not out_col and ctx.output_nodes:
+                out_col = ctx.output_nodes[0].column
+                out_tbl = ctx.output_nodes[0].table
+            if out_col and out_tbl:
+                # Detect ordering column from filter_nodes or question context
+                order_col = ""
+                if ctx.filter_nodes:
+                    pos_cols = {"position", "rank", "positionorder", "place", "standing"}
+                    for fn in ctx.filter_nodes:
+                        if fn.column.lower() in pos_cols:
+                            order_col = fn.column
+                            break
+                if not order_col:
+                    # Infer from question keywords
+                    if any(w in ctx.question_lower for w in ("champion", "winner", "first", "last", "finish")):
+                        if ctx.db_path:
+                            try:
+                                _conn3 = sqlite3.connect(str(ctx.db_path), timeout=5)
+                                for _ci3 in _conn3.execute(f'PRAGMA table_info("{out_tbl}")').fetchall():
+                                    if _ci3[1].lower() in ("position", "positionorder"):
+                                        order_col = _ci3[1]
+                                        break
+                                _conn3.close()
+                            except Exception:
+                                pass
+
+                first_hint = f' — use WHERE "{order_col}" = 1' if order_col else ""
+                last_hint = f' — use WHERE "{order_col}" = (SELECT MAX("{order_col}") FROM ... WHERE output IS NOT NULL)' if order_col else ""
+                steps = [
+                    DecompositionStep(
+                        description=f'SELECT "{out_col}" FROM "{out_tbl}" for the FIRST entity (champion/winner){first_hint} within: {population_text}',
+                        sql_template="",
+                        output_var="value_a",
+                    ),
+                    DecompositionStep(
+                        description=f'SELECT "{out_col}" FROM "{out_tbl}" for the LAST entity (last finisher){last_hint} within: {population_text}',
+                        sql_template="",
+                        output_var="value_b",
+                    ),
+                    DecompositionStep(
+                        description=f"Compute: {metric_text}",
+                        sql_template="__compute__",
+                        output_var="result",
+                    ),
+                ]
+                return RuleResult(
+                    sql_directives=[directive],
+                    log_entries=[("rule_ratio", "Detected value comparison — emitting decomposition")],
+                    decomposition=steps,
+                )
+        else:
+            directive = (
+                f"RATIO PATTERN: This is a value ratio (A / B) question — do NOT multiply by 100.\n"
+                f"  Population (denominator): {population_text}\n"
+                f"  Subset (numerator): {metric_text}\n"
+                f"  Use: SELECT CAST(SUM(CASE WHEN [numerator_condition] THEN value END) AS REAL) / SUM(CASE WHEN [denominator_condition] THEN value END)"
+            )
+    else:
+        directive = (
+            f"RATIO PATTERN: This is a percentage/ratio question.\n"
+            f"  Population (denominator): {population_text}\n"
+            f"  Subset (numerator): {metric_text}\n"
+            f"  Use: SELECT CAST(COUNT(CASE WHEN [subset_condition] THEN 1 END) AS REAL) * 100 / COUNT(*)"
+        )
     return RuleResult(
         sql_directives=[directive],
         log_entries=[("rule_ratio", "Detected ratio pattern")]
@@ -1286,6 +1425,7 @@ class EngineOutput:
     filter_nodes: list[QueryNode]
     sql_directives: list[str]
     log_entries: list[tuple[str, str]]
+    decomposition: list[DecompositionStep] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1334,10 +1474,13 @@ def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = No
         parts = []
         params: list[Any] = []
         for f in detail_filters:
+            val_str = str(f.value).strip()
+            if val_str.lstrip("(").lower().startswith("select"):
+                return -1
             if f.operator == "IS NOT NULL":
                 parts.append(f'"{f.column}" IS NOT NULL')
             elif f.operator.upper() == "IN":
-                vals = re.findall(r"'([^']*)'", str(f.value))
+                vals = re.findall(r"'([^']*)'", val_str)
                 if vals:
                     placeholders = ",".join("?" * len(vals))
                     parts.append(f'"{f.column}" IN ({placeholders})')
@@ -1406,13 +1549,8 @@ def _assess_plausibility(ctx: EngineContext) -> PlausibilityReport:
             except Exception:
                 pass
 
-    # Signal 4: Percentage > 100 or negative (for ratio queries)
-    if ctx.comp_type in ("ratio", "percentage"):
-        if result_count < 0:
-            return PlausibilityReport(
-                is_plausible=False, result_count=result_count,
-                anomaly="Ratio computation may produce out-of-range value."
-            )
+    # Signal 4 removed: result_count < 0 only occurs when -1 (unevaluable),
+    # which is not meaningful for ratio anomaly detection.
 
     return PlausibilityReport(is_plausible=True, result_count=result_count)
 
@@ -1842,7 +1980,7 @@ def _generate_hypotheses(
             if _resolve_normal_range(ctx, n.table, n.column, model_call=None):
                 continue  # Has a known/derived range — handled by T4
             fe = next((f for f in evidence.get("filters", []) if f["column"] == n.column), None)
-            if not fe or "data_min" not in fe or "data_avg" not in fe:
+            if not fe or fe.get("data_min") is None or fe.get("data_max") is None or fe.get("data_avg") is None:
                 continue
             # Approximate IQR: use data range / 4 as quartile proxy
             data_min, data_max, data_avg = fe["data_min"], fe["data_max"], fe["data_avg"]
@@ -2611,6 +2749,7 @@ def run_rules_engine(
 
     all_directives: list[str] = []
     all_logs: list[tuple[str, str]] = []
+    all_decomposition: list[DecompositionStep] = []
 
     # Phase 0: Skip subquery filter values — they encode scope internally
     # and should be passed through to the SQL LLM as-is
@@ -2624,6 +2763,7 @@ def run_rules_engine(
             ctx.filter_nodes = result.filter_nodes
         all_directives.extend(result.sql_directives)
         all_logs.extend(result.log_entries)
+        all_decomposition.extend(result.decomposition)
 
     # Phase 2: Adaptive loop (hypothesis-driven)
     if db_path:
@@ -2640,4 +2780,5 @@ def run_rules_engine(
         filter_nodes=ctx.filter_nodes,
         sql_directives=all_directives,
         log_entries=all_logs,
+        decomposition=all_decomposition,
     )
