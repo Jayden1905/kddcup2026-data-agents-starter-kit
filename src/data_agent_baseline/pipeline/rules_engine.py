@@ -55,6 +55,7 @@ class EngineContext:
     knowledge_text: str
     anchor_text: str
     model_call: Callable | None = None
+    domain_locked_columns: set[str] = None  # "table.column" entries that adaptive loop must not change
 
     # Computed lazily
     _rows_per_entity: dict[str, float] | None = None
@@ -87,7 +88,13 @@ class EngineContext:
         return self._rows_per_entity[key]
 
     def col_null_ratio(self, table: str, column: str) -> float:
-        """Fraction of rows where column IS NULL."""
+        """Fraction of rows where column IS NULL. Uses Layer 3 pre-computed stats first."""
+        # Layer 3: use pre-computed stats if available
+        ts = self.kg.get_table(table)
+        if ts and hasattr(ts, 'col_stats') and column in ts.col_stats:
+            cached = ts.col_stats[column].get("null_ratio")
+            if cached is not None:
+                return cached
         if not self.db_path:
             return 0.0
         try:
@@ -1458,7 +1465,7 @@ class PlausibilityReport:
 
 
 def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = None) -> int:
-    """Execute the filter chain and count distinct entities."""
+    """Execute the filter chain and count distinct entities, including join-table filters."""
     if not ctx.db_path:
         return -1
     entity_table = ctx.entity_table
@@ -1473,31 +1480,86 @@ def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = No
     ts = ctx.kg.get_table(entity_table)
     pk_col = ts.columns[0].name if ts and ts.columns else "ID"
 
+    # Separate filters on joined tables
+    join_filters: dict[str, list[QueryNode]] = {}
+    for n in use_filters:
+        if n.table != entity_table:
+            join_filters.setdefault(n.table, []).append(n)
+
     try:
         conn = sqlite3.connect(str(ctx.db_path), timeout=5)
         parts = []
         params: list[Any] = []
+        joins: list[str] = []
+
+        # Build JOIN clauses for filters on other tables
+        for other_table, other_nodes in join_filters.items():
+            fk_edges = ctx.kg.graph.get_fk_between(entity_table, other_table) if ctx.kg.graph else []
+            if not fk_edges:
+                continue
+            edge = fk_edges[0]
+            if edge.src.split(".")[0] == entity_table:
+                src_col = edge.src.split(".")[1]
+                dst_col = edge.dst.split(".")[1]
+            else:
+                src_col = edge.dst.split(".")[1]
+                dst_col = edge.src.split(".")[1]
+            joins.append(
+                f'JOIN "{other_table}" ON "{entity_table}"."{src_col}" = "{other_table}"."{dst_col}"'
+            )
+            for f in other_nodes:
+                if f.column.startswith("_expr:"):
+                    expr_sql = f.column[len("_expr:"):]
+                    parts.append(f'{expr_sql} {f.operator} ?')
+                    params.append(f.value)
+                    continue
+                val_str = str(f.value).strip()
+                if val_str.lstrip("(").lower().startswith("select"):
+                    continue
+                if f.operator == "IS NOT NULL":
+                    parts.append(f'"{other_table}"."{f.column}" IS NOT NULL')
+                elif f.operator.upper() == "IN":
+                    vals = re.findall(r"'([^']*)'", val_str)
+                    if vals:
+                        placeholders = ",".join("?" * len(vals))
+                        parts.append(f'"{other_table}"."{f.column}" IN ({placeholders})')
+                        params.extend(vals)
+                elif f.operator in ("=", "LIKE"):
+                    parts.append(f'"{other_table}"."{f.column}" {f.operator} ?')
+                    params.append(f.value)
+                else:
+                    parts.append(f'"{other_table}"."{f.column}" {f.operator} ?')
+                    params.append(f.value)
+
+        # Entity table filters
         for f in detail_filters:
+            if f.column.startswith("_expr:"):
+                expr_sql = f.column[len("_expr:"):]
+                parts.append(f'{expr_sql} {f.operator} ?')
+                params.append(f.value)
+                continue
             val_str = str(f.value).strip()
             if val_str.lstrip("(").lower().startswith("select"):
                 return -1
             if f.operator == "IS NOT NULL":
-                parts.append(f'"{f.column}" IS NOT NULL')
+                parts.append(f'"{entity_table}"."{f.column}" IS NOT NULL')
             elif f.operator.upper() == "IN":
                 vals = re.findall(r"'([^']*)'", val_str)
                 if vals:
                     placeholders = ",".join("?" * len(vals))
-                    parts.append(f'"{f.column}" IN ({placeholders})')
+                    parts.append(f'"{entity_table}"."{f.column}" IN ({placeholders})')
                     params.extend(vals)
             elif f.operator in ("=", "LIKE"):
-                parts.append(f'"{f.column}" {f.operator} ?')
+                parts.append(f'"{entity_table}"."{f.column}" {f.operator} ?')
                 params.append(f.value)
             else:
-                parts.append(f'"{f.column}" {f.operator} ?')
+                parts.append(f'"{entity_table}"."{f.column}" {f.operator} ?')
                 params.append(f.value)
+
         where = " AND ".join(parts)
+        join_sql = " ".join(joins)
         row = conn.execute(
-            f'SELECT COUNT(DISTINCT "{pk_col}") FROM "{entity_table}" WHERE {where}',
+            f'SELECT COUNT(DISTINCT "{entity_table}"."{pk_col}") FROM "{entity_table}" {join_sql} WHERE {where}',
             tuple(params),
         ).fetchone()
         conn.close()
@@ -2625,6 +2687,54 @@ def _apply_domain_column_fixes(ctx: EngineContext) -> list[QueryNode]:
     return fixed
 
 
+def _enforce_domain_locks(
+    ctx: EngineContext,
+    new_filters: list[QueryNode],
+    all_logs: list[tuple[str, str]],
+) -> list[QueryNode]:
+    """Preserve domain-locked filters: if a hypothesis swaps a locked column to a synonym, swap it back."""
+    if not ctx.domain_locked_columns:
+        return new_filters
+
+    locked_keys = ctx.domain_locked_columns
+    # Find the original domain-locked filter nodes from ctx (before hypothesis applied)
+    original_locked = {
+        f"{n.table}.{n.column}": n for n in ctx.filter_nodes
+        if f"{n.table}.{n.column}" in locked_keys
+    }
+    if not original_locked:
+        return new_filters
+
+    synonym_groups = [
+        {"position", "rank", "positionorder"},
+        {"round", "number"},
+    ]
+
+    result = []
+    for node in new_filters:
+        node_key = f"{node.table}.{node.column}"
+        if node_key in locked_keys:
+            result.append(node)
+            continue
+        # Check if this node's column is a synonym of a locked column on the same table
+        replaced = False
+        for locked_key, locked_node in original_locked.items():
+            if locked_node.table != node.table:
+                continue
+            for group in synonym_groups:
+                if node.column.lower() in group and locked_node.column.lower() in group:
+                    result.append(locked_node)
+                    all_logs.append(("domain_lock",
+                        f"Preserved {locked_key} (hypothesis tried {node.table}.{node.column})"))
+                    replaced = True
+                    break
+            if replaced:
+                break
+        if not replaced:
+            result.append(node)
+    return result
+
+
 def _adaptive_loop(
     ctx: EngineContext,
     model_call: Callable | None,
@@ -2682,7 +2792,8 @@ def _adaptive_loop(
         if len(non_current_viable) == 1 and non_current_viable[0].score > 5:
             chosen = non_current_viable[0]
             all_logs.append(("adaptive_auto", f"Single clear winner: {chosen.label} → {chosen.reasoning}"))
-            ctx.filter_nodes = chosen.filter_nodes
+            enforced = _enforce_domain_locks(ctx, chosen.filter_nodes, all_logs)
+            ctx.filter_nodes = enforced
             ctx.filter_nodes = _apply_domain_column_fixes(ctx)
             if chosen.sql_directives:
                 all_directives.extend(chosen.sql_directives)
@@ -2692,7 +2803,8 @@ def _adaptive_loop(
         if not model_call:
             if non_current_viable:
                 best = max(non_current_viable, key=lambda h: h.score)
-                ctx.filter_nodes = best.filter_nodes
+                enforced = _enforce_domain_locks(ctx, best.filter_nodes, all_logs)
+                ctx.filter_nodes = enforced
                 ctx.filter_nodes = _apply_domain_column_fixes(ctx)
                 if best.sql_directives:
                     all_directives.extend(best.sql_directives)
@@ -2701,7 +2813,8 @@ def _adaptive_loop(
 
         chosen = _llm_select_hypothesis(ctx, viable, evidence, report.anomaly, model_call, iteration + 1)
         if chosen and chosen.label != "current":
-            ctx.filter_nodes = chosen.filter_nodes
+            enforced = _enforce_domain_locks(ctx, chosen.filter_nodes, all_logs)
+            ctx.filter_nodes = enforced
             ctx.filter_nodes = _apply_domain_column_fixes(ctx)
             if chosen.sql_directives:
                 all_directives.extend(chosen.sql_directives)
@@ -2729,6 +2842,7 @@ def run_rules_engine(
     knowledge_text: str = "",
     anchor_text: str = "",
     model_call: Callable | None = None,
+    domain_locked_columns: set[str] | None = None,
 ) -> EngineOutput:
     """Run deterministic rules, then hypothesis-driven adaptive loop.
 
@@ -2749,6 +2863,7 @@ def run_rules_engine(
         knowledge_text=knowledge_text,
         anchor_text=anchor_text,
         model_call=model_call,
+        domain_locked_columns=domain_locked_columns or set(),
     )
 
     all_directives: list[str] = []

@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 60  # seconds per API call
+REQUEST_TIMEOUT = 80  # seconds per API call
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 

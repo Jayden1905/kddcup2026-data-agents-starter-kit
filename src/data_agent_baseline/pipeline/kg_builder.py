@@ -53,6 +53,12 @@ class TableSchema:
     row_count: int = 0
     sample_values: dict[str, list[Any]] = field(default_factory=dict)
     col_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Structural role annotation (set by profile_schema)
+    role: str = ""  # "fact" | "dimension" | "bridge" | "snapshot"
+    grain_columns: list[str] = field(default_factory=list)  # columns defining row uniqueness
+    measure_columns: list[str] = field(default_factory=list)  # numeric columns suitable for SUM/AVG
+    temporal_columns: list[str] = field(default_factory=list)  # date/time/period columns
+    measure_agg_level: dict[str, str] = field(default_factory=dict)  # col → "raw" | "pre_aggregated"
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +239,12 @@ class KnowledgeGraph:
     _tables: list[TableSchema] = field(default_factory=list)
     _inferred_fks: list[tuple[str, ForeignKey]] = field(default_factory=list)
     graph: PropertyGraph = field(default_factory=PropertyGraph)
+    # Dimensional model: fact_table, dimensions [{table, join_col, label_col}]
+    dim_model: dict[str, Any] = field(default_factory=dict)
+    # Semantic concept map: abstract_concept → "table.column"
+    concept_map: dict[str, str] = field(default_factory=dict)
+    # Ontology: "table.column" → {semantic_type, value_vocab, unit, derived_from, hierarchy}
+    ontology: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def tables(self) -> list[TableSchema]:
@@ -770,12 +782,17 @@ def _introspect_table(conn: sqlite3.Connection, table_name: str) -> TableSchema 
     for col in columns:
         stats: dict[str, Any] = {}
         try:
-            distinct_count = conn.execute(
-                f'SELECT COUNT(DISTINCT "{col.name}") FROM "{table_name}" '
-                f'WHERE "{col.name}" IS NOT NULL'
-            ).fetchone()[0]
+            row_info = conn.execute(
+                f'SELECT COUNT(*), COUNT("{col.name}"), COUNT(DISTINCT "{col.name}") '
+                f'FROM "{table_name}"'
+            ).fetchone()
+            total, non_null, distinct_count = row_info[0], row_info[1], row_info[2]
             stats["distinct"] = distinct_count
-            if col.sql_type.upper() in ("INTEGER", "INT", "REAL", "FLOAT", "NUMERIC", "DOUBLE"):
+            stats["null_ratio"] = round(1.0 - non_null / total, 3) if total else 0.0
+            stats["cardinality_ratio"] = round(distinct_count / total, 4) if total else 0.0
+
+            is_numeric = col.sql_type.upper() in ("INTEGER", "INT", "REAL", "FLOAT", "NUMERIC", "DOUBLE", "NUM")
+            if is_numeric:
                 row = conn.execute(
                     f'SELECT MIN("{col.name}"), MAX("{col.name}"), AVG("{col.name}") '
                     f'FROM "{table_name}" WHERE "{col.name}" IS NOT NULL'
@@ -784,6 +801,35 @@ def _introspect_table(conn: sqlite3.Connection, table_name: str) -> TableSchema 
                     stats["min"] = row[0]
                     stats["max"] = row[1]
                     stats["avg"] = round(row[2], 2) if row[2] is not None else None
+                    # Percentiles (p25, p75) via offset on sorted values
+                    if non_null >= 4:
+                        p25_off = max(0, non_null // 4 - 1)
+                        p75_off = max(0, (non_null * 3) // 4 - 1)
+                        p25_row = conn.execute(
+                            f'SELECT CAST("{col.name}" AS REAL) FROM "{table_name}" '
+                            f'WHERE "{col.name}" IS NOT NULL ORDER BY CAST("{col.name}" AS REAL) '
+                            f'LIMIT 1 OFFSET {p25_off}'
+                        ).fetchone()
+                        p75_row = conn.execute(
+                            f'SELECT CAST("{col.name}" AS REAL) FROM "{table_name}" '
+                            f'WHERE "{col.name}" IS NOT NULL ORDER BY CAST("{col.name}" AS REAL) '
+                            f'LIMIT 1 OFFSET {p75_off}'
+                        ).fetchone()
+                        if p25_row:
+                            stats["p25"] = round(p25_row[0], 2)
+                        if p75_row:
+                            stats["p75"] = round(p75_row[0], 2)
+            else:
+                # Text columns: top-1 value and frequency
+                if distinct_count and distinct_count <= 200 and non_null:
+                    top_row = conn.execute(
+                        f'SELECT "{col.name}", COUNT(*) as cnt FROM "{table_name}" '
+                        f'WHERE "{col.name}" IS NOT NULL GROUP BY "{col.name}" '
+                        f'ORDER BY cnt DESC LIMIT 1'
+                    ).fetchone()
+                    if top_row:
+                        stats["top1_value"] = top_row[0]
+                        stats["top1_freq"] = round(top_row[1] / non_null, 3)
         except Exception:
             pass
         if stats:
@@ -1178,8 +1224,262 @@ def enrich_kg_with_descriptions(
 
 
 # ---------------------------------------------------------------------------
-# LLM-powered FK/Join Discovery
+# Ontology builder: sequential small LLM calls
 # ---------------------------------------------------------------------------
+
+
+def _is_obvious_column(col: Column, table: "TableSchema") -> str | None:
+    """Return a deterministic semantic_type if the column is trivially classifiable, else None."""
+    cl = col.name.lower()
+    ct = col.sql_type.upper()
+
+    if col.is_pk or cl == "id" or cl == "_id" or cl.endswith("_id") or cl.endswith("id"):
+        return "identifier"
+    if cl.startswith("link_to") or cl.startswith("fk_"):
+        return "identifier"
+    if any(kw in cl for kw in ("date", "time", "timestamp", "created_at", "updated_at")):
+        return "timestamp"
+    # Year columns (e.g., "year", "birth_year")
+    if cl == "year" or cl.endswith("_year"):
+        return "timestamp"
+
+    stats = table.col_stats.get(col.name, {})
+    cr = stats.get("cardinality_ratio", 0)
+    if ct in ("TEXT", "VARCHAR", "CHAR") and cr and cr > 0.5 and table.row_count > 20:
+        return "free_text"
+
+    return None
+
+
+def _parse_json_response(raw: str) -> dict | None:
+    """Extract JSON object from LLM response."""
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+    if fence:
+        raw = fence.group(1)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _step_classify(
+    ambiguous_cols: list[tuple["TableSchema", Column]],
+    model: "ModelAdapter",
+    log_fn: Any = None,
+) -> dict[str, str]:
+    """Step 1: Classify ambiguous columns by semantic_type. Fast — tiny output."""
+    if log_fn:
+        log_fn("kg_onto", f"classifying {len(ambiguous_cols)} columns...")
+    col_lines = []
+    for t, c in ambiguous_cols:
+        samples = t.sample_values.get(c.name, [])
+        sample_str = f" e.g. {samples[:4]}" if samples else ""
+        col_lines.append(f"  {t.name}.{c.name} ({c.sql_type}){sample_str}")
+
+    prompt = f"""Classify each column's semantic type.
+
+COLUMNS:
+{chr(10).join(col_lines)}
+
+Return JSON: {{"table.column": "type"}}
+Types: flag, category, currency, rate, count, score, duration, percentage, identifier, timestamp, free_text
+"""
+    from data_agent_baseline.agents.model import ModelMessage
+    messages = [ModelMessage(role="user", content=prompt)]
+    raw = model.complete(messages, thinking=False)
+    if not raw:
+        return {}
+    result = _parse_json_response(raw)
+    if isinstance(result, dict):
+        valid = {k: v for k, v in result.items() if isinstance(v, str)}
+        if log_fn:
+            log_fn("kg_onto_classify", f"done — {len(valid)} types assigned")
+        return valid
+    return {}
+
+
+_VOCAB_BATCH_SIZE = 7
+
+
+def _step_decode_vocab(
+    category_cols: list[tuple["TableSchema", Column]],
+    model: "ModelAdapter",
+    log_fn: Any = None,
+) -> dict[str, dict[str, str]]:
+    """Step 2: Decode value vocabularies for flag/category columns only.
+
+    Batches into chunks to avoid LLM timeout on large column sets.
+    """
+    if not category_cols:
+        return {}
+    if log_fn:
+        log_fn("kg_onto", f"decoding vocab for {len(category_cols)} flag/category columns...")
+
+    from data_agent_baseline.agents.model import ModelMessage
+
+    all_valid: dict[str, dict[str, str]] = {}
+
+    for batch_start in range(0, len(category_cols), _VOCAB_BATCH_SIZE):
+        batch = category_cols[batch_start:batch_start + _VOCAB_BATCH_SIZE]
+
+        col_lines = []
+        for t, c in batch:
+            samples = t.sample_values.get(c.name, [])
+            sample_str = f" values: {samples[:8]}" if samples else ""
+            col_lines.append(f"  {t.name}.{c.name}{sample_str}")
+
+        prompt = f"""For each column, explain what the column REPRESENTS and decode its stored values.
+
+COLUMNS:
+{chr(10).join(col_lines)}
+
+Return JSON: {{"table.column": {{"_purpose": "what this column represents (1-5 words)", "stored_value": "human meaning", ...}}}}
+Rules:
+- _purpose: describes what the column categorizes (e.g., "transaction direction", "payment method", "account status")
+- Each stored_value gets a short human-readable meaning
+- Skip columns where values are already readable English words
+"""
+        messages = [ModelMessage(role="user", content=prompt)]
+        raw = model.complete(messages, thinking=False)
+        if not raw:
+            continue
+        result = _parse_json_response(raw)
+        if isinstance(result, dict):
+            for k, v in result.items():
+                if isinstance(v, dict):
+                    all_valid[k] = {sk: sv for sk, sv in v.items() if isinstance(sv, str)}
+
+    if log_fn:
+        log_fn("kg_onto_vocab", f"done — {len(all_valid)} columns decoded")
+    return all_valid
+
+
+def _step_concepts(
+    kg: KnowledgeGraph,
+    types_map: dict[str, str],
+    model: "ModelAdapter",
+    log_fn: Any = None,
+) -> dict[str, str]:
+    """Step 3: Map abstract user terms to columns, informed by type classification."""
+    if log_fn:
+        log_fn("kg_onto", "mapping concept words...")
+    col_lines = []
+    for t in kg.tables:
+        for c in t.columns:
+            col_ref = f"{t.name}.{c.name}"
+            stype = types_map.get(col_ref, "")
+            type_hint = f" [{stype}]" if stype else ""
+            col_lines.append(f"  {col_ref}{type_hint}")
+
+    prompt = f"""Map abstract user concepts to the best column. A "concept" is a word a user might say that doesn't literally match a column name.
+
+COLUMNS:
+{chr(10).join(col_lines)}
+
+Return JSON: {{"concept_word": "table.column"}}
+Rules:
+- Only non-obvious mappings (skip "name"→name, "date"→date)
+- Max 10 entries
+"""
+    from data_agent_baseline.agents.model import ModelMessage
+    messages = [ModelMessage(role="user", content=prompt)]
+    raw = model.complete(messages, thinking=False)
+    if not raw:
+        return {}
+    result = _parse_json_response(raw)
+    if isinstance(result, dict):
+        all_cols = {f"{t.name}.{c.name}" for t in kg.tables for c in t.columns}
+        valid = {}
+        for concept, col_ref in result.items():
+            if isinstance(concept, str) and isinstance(col_ref, str) and col_ref in all_cols:
+                valid[concept.lower()] = col_ref
+        if log_fn:
+            log_fn("kg_onto_concepts", f"{len(valid)} concepts mapped")
+        return valid
+    return {}
+
+
+def build_ontology(
+    kg: KnowledgeGraph,
+    model: "ModelAdapter",
+    db_path: Path | None = None,
+    log_fn: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Build semantic ontology via sequential small LLM calls.
+
+    Steps:
+      1. Deterministic pre-classification (instant)
+      2. LLM classify remaining columns by type (~2-5s)
+      3. LLM decode vocab for flag/category columns only (~2-5s)
+      4. LLM map concept words (~2-5s)
+
+    Sets kg.concept_map as a side effect.
+    Returns dict of "table.column" → {semantic_type, value_vocab, unit, ...}.
+    """
+    if not kg or not kg.tables:
+        return {}
+
+    # Step 0: Deterministic pre-classification
+    ontology: dict[str, dict[str, Any]] = {}
+    ambiguous_cols: list[tuple["TableSchema", Column]] = []
+
+    for t in kg.tables:
+        for c in t.columns:
+            obvious_type = _is_obvious_column(c, t)
+            if obvious_type:
+                ontology[f"{t.name}.{c.name}"] = {"semantic_type": obvious_type}
+            else:
+                ambiguous_cols.append((t, c))
+
+    if not ambiguous_cols:
+        if log_fn:
+            log_fn("kg_ontology", f"{len(ontology)} columns (all deterministic), 0 concepts")
+        return ontology
+
+    # Step 1: Classify ambiguous columns
+    types_map = _step_classify(ambiguous_cols, model, log_fn)
+    for col_ref, stype in types_map.items():
+        ontology.setdefault(col_ref, {})["semantic_type"] = stype
+
+    # Step 2: Decode vocab for flag/category columns only
+    category_cols = [
+        (t, c) for t, c in ambiguous_cols
+        if types_map.get(f"{t.name}.{c.name}") in ("flag", "category")
+    ]
+    if category_cols:
+        vocab_map = _step_decode_vocab(category_cols, model, log_fn)
+        for col_ref, vocab in vocab_map.items():
+            entry = ontology.setdefault(col_ref, {})
+            # Extract _purpose if present, store separately
+            purpose = vocab.pop("_purpose", None)
+            if purpose:
+                entry["purpose"] = purpose
+            entry["value_vocab"] = vocab
+
+    # Step 3: Concept map
+    # Merge deterministic types into types_map for context
+    full_types = {k: v.get("semantic_type", "") for k, v in ontology.items()}
+    kg.concept_map = _step_concepts(kg, full_types, model, log_fn)
+
+    if log_fn:
+        det_count = sum(1 for t in kg.tables for c in t.columns if _is_obvious_column(c, t))
+        log_fn("kg_ontology", f"{len(ontology)} columns ({det_count} deterministic + {len(ontology)-det_count} LLM), {len(kg.concept_map)} concepts")
+    return ontology
+
+
+def build_concept_map(
+    kg: KnowledgeGraph,
+    model: "ModelAdapter",
+    knowledge_text: str = "",
+    log_fn: Any = None,
+) -> dict[str, str]:
+    """Deprecated — concept_map is now built inside build_ontology. Returns existing map."""
+    return kg.concept_map
+
 
 _RELATIONSHIP_DISCOVERY_PROMPT = """\
 You are a database schema expert. Analyze this schema and identify ALL table relationships.
@@ -1226,6 +1526,8 @@ def discover_joins_with_llm(
     log_fn: Callable[..., None] | None = None,
 ) -> KnowledgeGraph:
     """Use LLM to discover all table relationships: PKs, FKs, cardinality, bridge tables, display columns."""
+    if log_fn:
+        log_fn("kg_joins", f"discovering relationships across {len(kg.tables)} tables...")
     schema_lines: list[str] = []
     for table in kg.tables:
         schema_lines.append(f"TABLE: {table.name} ({table.row_count} rows)")
@@ -1331,8 +1633,29 @@ def discover_joins_with_llm(
 
     graph.fk_display_map.update(fk_display_map)
 
+    # --- Deterministic label column fallback ---
+    # If LLM didn't provide label columns, auto-detect obvious ones
+    _NAME_PATTERNS = re.compile(
+        r"(name|title|label|description|display_name|full_name|event_name|"
+        r"product_name|category_name|city|country|region)$", re.IGNORECASE
+    )
+    for table in kg.tables:
+        label_key = f"_label_.{table.name}"
+        if label_key in graph.fk_display_map:
+            continue
+        for col in table.columns:
+            if col.is_pk:
+                continue
+            if col.sql_type.upper() not in ("TEXT", "VARCHAR", "NVARCHAR", "CHAR"):
+                continue
+            if _NAME_PATTERNS.search(col.name):
+                graph.fk_display_map[label_key] = f"{table.name}.{col.name}"
+                break
+
+    total_fks = len(graph.fk_edges)
+    label_count = sum(1 for k in graph.fk_display_map if k.startswith("_label_."))
     if log_fn:
-        log_fn("kg_llm_fk", f"{added} FKs added, {len(fk_display_map)} display columns mapped")
+        log_fn("kg_llm_fk", f"{added} new FKs ({total_fks} total), {label_count} label columns, {len(fk_display_map)} display mappings")
 
     return kg
 
@@ -1357,3 +1680,142 @@ def _fuzzy_find_col(ref: str, graph: PropertyGraph) -> str | None:
         if col_id.lower() == ref_lower:
             return col_id
     return None
+
+
+# ---------------------------------------------------------------------------
+# Schema Profiler — structural role annotation
+# ---------------------------------------------------------------------------
+
+def profile_schema(kg: KnowledgeGraph) -> None:
+    """Annotate tables with structural roles derived from topology and statistics.
+
+    Roles:
+      - dimension: low cardinality, referenced by FKs, no outgoing FKs (or few)
+      - fact: has measures + multiple FK references to dimensions
+      - bridge: connects two entities (2+ FK columns, few/no measures)
+      - snapshot: entity × time grain (has entity FK + temporal column + measures)
+
+    This runs once after KG build. Downstream logic reads table.role,
+    table.grain_columns, table.measure_columns instead of re-deriving heuristics.
+    """
+    if not kg or not kg.tables:
+        return
+
+    # Pre-compute FK topology per table
+    fk_out: dict[str, list[str]] = {}  # table → [target_tables]
+    fk_in: dict[str, int] = {}  # table → count of tables referencing it
+    for src_table, fk in kg.all_foreign_keys():
+        fk_out.setdefault(src_table, []).append(fk.ref_table)
+        fk_in[fk.ref_table] = fk_in.get(fk.ref_table, 0) + 1
+
+    for table in kg.tables:
+        n = table.name
+        cols = table.columns
+        num_fk_out = len(fk_out.get(n, []))
+        num_fk_in = fk_in.get(n, 0)
+
+        # Classify columns
+        id_cols: list[str] = []
+        measures: list[str] = []
+        temporal: list[str] = []
+        for c in cols:
+            cl = c.name.lower()
+            t = c.sql_type.upper()
+            is_numeric = t in ("INT", "INTEGER", "REAL", "FLOAT", "NUMERIC", "NUM", "DOUBLE")
+            is_id = cl.endswith("id") or cl.startswith("link") or c.is_pk
+            is_temporal = any(kw in cl for kw in ("date", "year", "month", "time", "period"))
+
+            if is_temporal:
+                temporal.append(c.name)
+            elif is_id:
+                id_cols.append(c.name)
+            elif is_numeric:
+                measures.append(c.name)
+
+        table.measure_columns = measures
+        table.temporal_columns = temporal
+
+        # Determine role
+        if num_fk_out >= 2 and not measures:
+            # 2+ outgoing FKs, no measures → bridge/junction table
+            table.role = "bridge"
+            table.grain_columns = id_cols[:2] if len(id_cols) >= 2 else id_cols
+        elif num_fk_out >= 1 and temporal and measures:
+            # FK + temporal + measures → snapshot (entity × time)
+            table.role = "snapshot"
+            table.grain_columns = [id_cols[0]] if id_cols else []
+            if temporal:
+                table.grain_columns.append(temporal[0])
+        elif num_fk_out >= 2 and measures:
+            # Multiple FKs + measures → fact/transaction table
+            table.role = "fact"
+            table.grain_columns = id_cols
+        elif num_fk_out <= 1 and num_fk_in >= 1 and table.row_count < 500:
+            # Referenced by others, small, few outgoing → dimension
+            table.role = "dimension"
+            table.grain_columns = [cols[0].name] if cols else []
+        elif num_fk_out >= 1 and measures:
+            # Has FK + measures but only 1 FK → still fact-like
+            table.role = "fact"
+            table.grain_columns = id_cols
+        else:
+            # Default: if it has measures treat as fact, otherwise dimension
+            if measures:
+                table.role = "fact"
+            else:
+                table.role = "dimension"
+            table.grain_columns = id_cols or ([cols[0].name] if cols else [])
+
+        # Layer 1: Normalization — classify measures as raw vs pre-aggregated
+        for m in measures:
+            if table.role == "snapshot":
+                table.measure_agg_level[m] = "pre_aggregated"
+            else:
+                table.measure_agg_level[m] = "raw"
+
+    # Layer 2: Dimensional model map
+    _build_dimensional_map(kg)
+
+
+def _build_dimensional_map(kg: KnowledgeGraph) -> None:
+    """Build a star/snowflake model identifying the central fact and its dimensions."""
+    # Find the fact table (highest row count among fact/snapshot tables)
+    fact_table = None
+    for t in sorted(kg.tables, key=lambda x: -x.row_count):
+        if t.role in ("fact", "snapshot", "bridge"):
+            fact_table = t
+            break
+    if not fact_table:
+        return
+
+    # Build dimensions: tables referenced by fact table's FKs
+    dimensions: list[dict[str, str]] = []
+    all_fks = kg.all_foreign_keys()
+    for src_table, fk in all_fks:
+        if src_table != fact_table.name:
+            continue
+        dim_schema = kg.get_table(fk.ref_table)
+        if not dim_schema:
+            continue
+        # Find best label column: first TEXT non-PK non-ID column, or PK
+        label_col = fk.ref_column
+        for c in dim_schema.columns:
+            cl = c.name.lower()
+            if c.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR") and not cl.endswith("id"):
+                label_col = c.name
+                break
+        dimensions.append({
+            "table": fk.ref_table,
+            "join_col": fk.column,
+            "ref_col": fk.ref_column,
+            "label_col": label_col,
+            "role": dim_schema.role,
+        })
+
+    kg.dim_model = {
+        "fact_table": fact_table.name,
+        "fact_role": fact_table.role,
+        "fact_measures": fact_table.measure_columns,
+        "fact_grain": fact_table.grain_columns,
+        "dimensions": dimensions,
+    }
