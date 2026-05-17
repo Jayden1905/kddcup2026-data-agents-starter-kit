@@ -8022,9 +8022,10 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
                 try:
                     cols = [c[1].lower() for c in conn.execute(f'PRAGMA table_info("{actual_table}")').fetchall()]
                     if cols and req_col.lower() not in cols:
+                        avail_cols = [c[1] for c in conn.execute(f'PRAGMA table_info("{actual_table}")').fetchall()]
                         schema_failures.append(
                             f"Column '{req_col}' does NOT exist in table '{req_table}'. "
-                            f"Available columns: {[c[1] for c in conn.execute(f'PRAGMA table_info(\"{actual_table}\")').fetchall()]}"
+                            f"Available columns: {avail_cols}"
                         )
                 except Exception:
                     pass
@@ -8045,9 +8046,10 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
                     try:
                         cols = [col[1].lower() for col in conn.execute(f'PRAGMA table_info("{actual_table}")').fetchall()]
                         if cols and c.lower() not in cols:
+                            avail_cols = [col[1] for col in conn.execute(f'PRAGMA table_info("{actual_table}")').fetchall()]
                             schema_failures.append(
                                 f"Join column '{c}' does NOT exist in table '{t}'. "
-                                f"Available columns: {[col[1] for col in conn.execute(f'PRAGMA table_info(\"{actual_table}\")').fetchall()]}"
+                                f"Available columns: {avail_cols}"
                             )
                     except Exception:
                         pass
