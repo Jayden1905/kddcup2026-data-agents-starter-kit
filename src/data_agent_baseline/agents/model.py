@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 60  # seconds per API call
+REQUEST_TIMEOUT = 180  # seconds per API call (thinking models need more time)
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
@@ -76,7 +76,7 @@ class OpenAIModelAdapter:
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
         if "qwen" in self.model.lower():
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
 
         try:
             response = client.chat.completions.create(**kwargs, timeout=REQUEST_TIMEOUT)
