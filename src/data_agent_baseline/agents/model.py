@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -74,6 +75,7 @@ class OpenAIModelAdapter:
                 {"role": message.role, "content": message.content}
                 for message in messages
             ],
+            "max_tokens": 4096,
         }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
@@ -86,7 +88,15 @@ class OpenAIModelAdapter:
                 }
 
         try:
-            response = client.chat.completions.create(**kwargs, timeout=REQUEST_TIMEOUT)
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(client.chat.completions.create, **kwargs)
+            try:
+                response = future.result(timeout=REQUEST_TIMEOUT)
+            except FuturesTimeout:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(f"Model API error: wall-clock timeout after {REQUEST_TIMEOUT}s")
+            finally:
+                pool.shutdown(wait=False)
         except (APITimeoutError, APIError) as exc:
             raise RuntimeError(f"Model API error: {exc}") from exc
 

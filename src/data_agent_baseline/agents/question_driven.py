@@ -102,35 +102,16 @@ def _build_sql_prompt(
     gaps: str = "",
     grounding_context: str = "",
 ) -> str:
-    parts = [f"QUESTION: {question}\n\nWrite a SQL query to answer this question."]
+    parts = [f"QUESTION: {question}\n\nWrite a SQLite query to answer this question."]
 
     if grounding_context:
         parts.append(f"\n{grounding_context}")
 
     if gaps:
-        parts.append(f"\nPREVIOUS ATTEMPT FAILED:\n{gaps}")
+        parts.append(f"\nPREVIOUS ATTEMPT FAILED:\n{gaps}\nFix the error.")
 
-    rules = (
-        "RULES:\n"
-        "- Use ONLY columns from SCHEMA above. Quote all identifiers with double-quotes.\n"
-        "- Prefer the columns listed in SELECT COLUMNS above.\n"
-        "- For list/lookup queries ('what are', 'list', 'identify'), always use SELECT DISTINCT.\n"
-        "- For superlatives (lowest/highest/best), use WHERE col = (SELECT MIN/MAX(col)...) to include ALL ties — no LIMIT.\n"
-        "- JOIN through JOIN PATHS shown above — do not invent join conditions.\n"
-        "- Use exact FILTER VALUES as-is. Only use LIKE when FILTER VALUES says 'USE → WHERE ... LIKE ...'.\n"
-        "- FILTER VALUES are literal DB values — use them EXACTLY. Do NOT paraphrase (e.g., '#' not 'triple', '-' not 'single').\n"
-        "- CAST(x AS REAL) for division.\n"
-        "- For non-aggregate queries, add WHERE col IS NOT NULL. For AVG/SUM/COUNT/MIN/MAX, do NOT add IS NOT NULL on aggregated columns. Escape apostrophes with ''.\n"
-        "- Never transform, concatenate, or split column values.\n"
-        "- For 'how many [entities]' with JOINs, use COUNT(DISTINCT entity.primary_key) to avoid counting duplicates from the join.\n"
-        "- If a CROSS-ROW HINT is provided, you MUST use the subquery pattern shown there (WHERE id IN (SELECT ...)) — do NOT put those conditions directly in the outer WHERE."
-    )
-
-    if gaps:
-        rules += "\n- Fix what the error says."
-
-    parts.append(f"\n{rules}")
-    parts.append('\nReturn ONLY: {"thought": "...", "sql": "SELECT ..."}')
+    parts.append('\nEscape apostrophes with \'\'. Use double-quotes for identifiers. CAST(x AS REAL) for division.')
+    parts.append('\nReturn ONLY: {"sql": "SELECT ..."}')
 
     return "\n".join(parts)
 
@@ -1404,9 +1385,12 @@ class QuestionDrivenAgent:
             gaps=gaps,
             grounding_context=grounding_context,
         )
+        self._log("sql_prompt_size", f"chars={len(prompt)}, grounding={len(grounding_context)}, kg={len(kg_context)}, gaps={len(gaps)}")
 
         messages = [ModelMessage(role="user", content=prompt)]
+        t0 = time.monotonic()
         raw = self._model_call_with_retry(messages, thinking=False)
+        self._log("sql_llm_time", f"{time.monotonic() - t0:.1f}s, response_len={len(raw) if raw else 0}")
         if not raw:
             self._log("sql_call_empty", "LLM returned empty response")
             return ""
@@ -2102,11 +2086,13 @@ RULES:
 
         # Deterministic answer_shape correction based on question keywords
         _q_lower = question.lower()
-        if user_intent:
-            if re.search(r'\b(?:how many|how much|what is the (?:total|average|number|percentage|ratio|count))\b', _q_lower):
+        _has_plural_hint = bool(re.search(r'\b(?:each|every|per|all the|for each)\b', _q_lower))
+        if user_intent and not _has_plural_hint:
+            if re.search(r'\b(?:how many|what is the (?:total|average|number|percentage|ratio|count))\b', _q_lower):
                 if "Answer shape: list" in user_intent or "Answer shape: grouped_table" in user_intent:
                     user_intent = re.sub(r'Answer shape: \w+', 'Answer shape: single_value', user_intent)
-            elif re.search(r'\b(?:list all|list the|what are the|which are the|name all|give me all)\b', _q_lower):
+        if user_intent:
+            if re.search(r'\b(?:list all|list the|what are the|which are the|name all|give me all)\b', _q_lower):
                 if "Answer shape: single_value" in user_intent:
                     user_intent = re.sub(r'Answer shape: \w+', 'Answer shape: list', user_intent)
 
@@ -2156,7 +2142,9 @@ RULES:
             _det_comp_type = "ratio"
 
         # --- Step 2: LLM picks nodes from graph (1 call) ---
+        _t_pick = time.monotonic()
         picked = self._pick_graph_nodes(question, kg, anchor_text, user_intent)
+        self._log("pick_nodes_time", f"{time.monotonic() - _t_pick:.1f}s")
         if not picked:
             self._log("kg_path", "Node picking failed, falling back")
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
@@ -9280,7 +9268,7 @@ RULES:
 
         # Execute in order, return first that produces rows
         for i, hyp in enumerate(valid_hyps):
-            sql = hyp["sql"]
+            sql = _fix_unescaped_apostrophes(hyp["sql"])
             # Reject SQL that references non-existent columns (SQLite treats them as string literals)
             if valid_columns:
                 quoted_refs = re.findall(r'"([^"]+)"', sql)
