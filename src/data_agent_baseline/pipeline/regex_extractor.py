@@ -786,7 +786,7 @@ def _build_normalization_map(
                 continue
             field_lower = field.lower()
             matched = False
-            if field_lower in ("sex", "gender") and meaning in ("male", "female"):
+            if ("sex" in field_lower or "gender" in field_lower) and meaning in ("male", "female"):
                 matched = True
             elif meaning in field_lower or field_lower in meaning:
                 matched = True
@@ -936,6 +936,90 @@ def _extract_numeric_from_context(
                     break
 
 
+def _normalize_to_canonical(
+    records: dict[str, dict[str, Any]],
+    fields: list[str],
+    paragraphs: list[str],
+    id_pattern: re.Pattern,
+    db_path: Path,
+    entity_name: str,
+) -> None:
+    """Normalize verbose extracted values to canonical short forms.
+
+    When a TEXT field has a mix of short canonical values (e.g. "Advertisement") and
+    verbose values (e.g. "Event-specific promotional activities..."), check if a
+    canonical value appears in the record's paragraph text. If so, replace the verbose
+    value with the canonical one.
+    """
+    if not db_path or not db_path.exists():
+        return
+
+    # Build paragraph index
+    para_index: dict[str, str] = {}
+    for para in paragraphs:
+        m = id_pattern.search(para)
+        if m:
+            rid = m.group(1) if m.lastindex else m.group(0)
+            if rid in records:
+                if rid not in para_index:
+                    para_index[rid] = para
+                else:
+                    para_index[rid] += "\n" + para
+
+    for field in fields:
+        if field.startswith("link_to_") or field == "_id":
+            continue
+
+        # Collect all distinct values for this field across records
+        value_lengths: dict[str, int] = {}
+        for rec in records.values():
+            v = rec.get(field)
+            if v is not None:
+                vs = str(v).strip()
+                if vs:
+                    value_lengths[vs] = len(vs)
+
+        if len(value_lengths) < 2:
+            continue
+
+        # Identify canonical values: short values that appear multiple times
+        value_counts: dict[str, int] = {}
+        for rec in records.values():
+            v = rec.get(field)
+            if v is not None:
+                vs = str(v).strip()
+                value_counts[vs] = value_counts.get(vs, 0) + 1
+
+        # Canonical = appears 2+ times AND length <= 30 chars
+        canonical_vals = [v for v, cnt in value_counts.items() if cnt >= 2 and len(v) <= 30]
+        if not canonical_vals:
+            continue
+
+        # For each record with a non-canonical value, check if a canonical value
+        # appears in the paragraph text
+        max_canonical_len = max(len(cv) for cv in canonical_vals)
+        for rid, rec in records.items():
+            v = rec.get(field)
+            if v is None:
+                continue
+            vs = str(v).strip()
+            if vs in canonical_vals:
+                continue  # already canonical
+            if len(vs) <= max_canonical_len:
+                continue  # not longer than canonical values
+
+            para_text = para_index.get(rid, "")
+            if not para_text:
+                continue
+
+            # Check which canonical values appear in this paragraph (case-insensitive)
+            para_lower = para_text.lower()
+            for cv in canonical_vals:
+                if cv.lower() in para_lower:
+                    rec[field] = cv
+                    break
+
+
 def _normalize_values(
     records: dict[str, dict[str, Any]],
     fields: list[str],
@@ -965,7 +1049,7 @@ def _normalize_values(
 # Main Extraction Engine
 # ---------------------------------------------------------------------------
 
-_MAX_LLM_CALLS = 10
+_MAX_LLM_CALLS = 12
 
 
 def regex_extract(
@@ -1259,6 +1343,12 @@ def regex_extract(
     # For numeric columns, extract numbers from contextual patterns.
     _match_known_values(records, non_id_fields, paragraphs, id_pattern, db_path, entity_name)
     _extract_numeric_from_context(records, non_id_fields, paragraphs, id_pattern)
+
+    # === PHASE 5a2: CANONICAL CATEGORY NORMALIZATION (0 calls) ===
+    # When a TEXT field has short canonical values AND verbose extracted values,
+    # normalize verbose values to the canonical form if the canonical value appears
+    # in the same paragraph as the record.
+    _normalize_to_canonical(records, non_id_fields, paragraphs, id_pattern, db_path, entity_name)
 
     # === PHASE 5b: VALUE NORMALIZATION ===
     _normalize_values(records, fields, knowledge_text, db_path, entity_name)
@@ -1872,6 +1962,17 @@ def _build_extractors(
             ))
             continue
 
+        # For link_to_* fields, check if the referenced table has a sex/gender column
+        # and use the sex extractor instead of FK ID lookup
+        if field_lower.startswith("link_to_") and ("sex" in field_lower or "gender" in field_lower):
+            patterns = [
+                re.compile(r"\b(male|female)\b", re.IGNORECASE),
+                re.compile(r"\b(man|woman)\b", re.IGNORECASE),
+                re.compile(r"\bsex[:\s]+['\"]?(\w+)", re.IGNORECASE),
+            ]
+            extractors.append(FieldExtractor(field, "categorical", patterns))
+            continue
+
         # Determine field type from name heuristics
         if field_lower in ("sex", "gender"):
             # Sex/gender: extract "male"/"female" from prose
@@ -2079,6 +2180,21 @@ def _merge_into_table(
                         vals,
                     )
                     updated += 1
+
+        # Propagate link_to_* values to the original column when it's NULL
+        for field in new_fields:
+            if field.startswith("link_to_"):
+                # Find the corresponding original column (e.g., link_to_patient_sex → SEX)
+                for orig_col_lower, orig_col in existing_cols.items():
+                    if orig_col_lower == field.lower() or orig_col_lower == id_col_lower:
+                        continue
+                    # Match: the link field name contains the original column name
+                    if orig_col_lower in field.lower().replace("link_to_", ""):
+                        conn.execute(
+                            f'UPDATE "{table_name}" SET "{orig_col}" = "{field}" '
+                            f'WHERE "{orig_col}" IS NULL AND "{field}" IS NOT NULL'
+                        )
+                        break
 
         conn.commit()
         if log_fn:

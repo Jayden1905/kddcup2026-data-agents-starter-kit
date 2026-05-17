@@ -79,9 +79,9 @@ SQL_RULES_LABELED: list[tuple[str, str]] = [
     ("temporal", "TEMPORAL: 'last time'/'most recent' = ORDER BY DESC LIMIT 1. 'first time' = ORDER BY ASC LIMIT 1."),
     ("monthly_yearly", "MONTHLY from YEARLY: If DOMAIN KNOWLEDGE defines a formula with /12, ALWAYS include /12 in the SQL. Formula is authoritative over data granularity."),
     ("time_parse", "TIME STRING: '1:36.483' → CAST(SUBSTR)*60 + CAST(SUBSTR) for seconds conversion. ALWAYS filter WHERE col IS NOT NULL AND col != '' before converting. If domain knowledge provides an exact SQL example for this question, use ORDER BY col ASC LIMIT 1 instead of conversion."),
-    ("no_null", "NEVER RETURN NULL: Wrap with COALESCE or add WHERE IS NOT NULL. NULL answer = wrong."),
+    ("no_null", "NEVER RETURN NULL: For non-aggregate queries add WHERE col IS NOT NULL. For aggregate functions (AVG, SUM, COUNT, MIN, MAX) do NOT add IS NOT NULL — they already skip NULLs and adding it restricts other columns incorrectly."),
     ("having", "HAVING vs WHERE: 'where the average exceeds N' = GROUP BY + HAVING, not per-row WHERE."),
-    ("positional", "PER-GROUP POSITIONAL: 'Nth of each group' = ROW_NUMBER() OVER (PARTITION BY ...)."),
+    ("positional", "PER-GROUP POSITIONAL: 'Nth of each group' = ROW_NUMBER() OVER (PARTITION BY ... ORDER BY CAST(SUBSTR(id_col, INSTR(id_col,'_')+1) AS INTEGER)) when the ordering column has format PREFIX_N (text sort gives wrong order: _10 before _2). Use numeric extraction for the ORDER BY inside ROW_NUMBER."),
     ("intersection", "INTERSECTION: 'X with Y containing Z' = two subqueries intersected, NOT one WHERE."),
     ("colocated", "CO-LOCATED MEASURES: Filter column in detail table → use measure from SAME detail table, not parent summary."),
     ("same_name_col", "SAME-NAME COLUMNS: When multiple tables share a column name, read the question language to pick the right table. 'the patient's X' → Patient.X, not DetailTable.X."),
@@ -120,7 +120,7 @@ def _build_sql_prompt(
         "- Use exact FILTER VALUES as-is. Only use LIKE when FILTER VALUES says 'USE → WHERE ... LIKE ...'.\n"
         "- FILTER VALUES are literal DB values — use them EXACTLY. Do NOT paraphrase (e.g., '#' not 'triple', '-' not 'single').\n"
         "- CAST(x AS REAL) for division.\n"
-        "- WHERE col IS NOT NULL to avoid nulls. Escape apostrophes with ''.\n"
+        "- For non-aggregate queries, add WHERE col IS NOT NULL. For AVG/SUM/COUNT/MIN/MAX, do NOT add IS NOT NULL on aggregated columns. Escape apostrophes with ''.\n"
         "- Never transform, concatenate, or split column values.\n"
         "- For 'how many [entities]' with JOINs, use COUNT(DISTINCT entity.primary_key) to avoid counting duplicates from the join.\n"
         "- If a CROSS-ROW HINT is provided, you MUST use the subquery pattern shown there (WHERE id IN (SELECT ...)) — do NOT put those conditions directly in the outer WHERE."
@@ -768,6 +768,61 @@ def _sanitize_sql(sql: str, db_path: Path) -> str:
     return sql
 
 
+def _enforce_grounding_filters(sql: str, grounding_context: str, db_path: Path) -> str:
+    """Replace incorrect filter columns with those specified in FILTER VALUES."""
+    if "FILTER VALUES" not in grounding_context:
+        return sql
+    # Parse grounding filters: "table"."column": operator value
+    grounding_filters: list[tuple[str, str, str, str]] = []
+    for m in re.finditer(
+        r'"(\w+)"\."(\w+)":\s*(=|>=|<=|>|<|LIKE|IS NOT NULL)\s*(.*)',
+        grounding_context,
+    ):
+        grounding_filters.append((m.group(1), m.group(2), m.group(3), m.group(4).strip()))
+    if not grounding_filters:
+        return sql
+
+    # Check each grounding filter: if the SQL filters the same table but on a
+    # different column with a non-matching value, replace it
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        tables_cols: dict[str, list[str]] = {}
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            tname = row[0]
+            tables_cols[tname] = [
+                r[1] for r in conn.execute(f'PRAGMA table_info("{tname}")').fetchall()
+            ]
+        conn.close()
+    except Exception:
+        return sql
+
+    for tbl, col, op, val in grounding_filters:
+        if tbl not in tables_cols or col not in tables_cols[tbl]:
+            continue
+        # Only handle simple equality filters (safest replacement)
+        if op != "=":
+            continue
+        # Only replace if the grounding column is NOT already used in the SQL
+        if f'"{col}"' in sql or f'.{col}' in sql:
+            continue
+        # Check if SQL references a different column from the same table with a string value
+        # that looks like it's trying to filter for the same concept
+        other_cols = [c for c in tables_cols[tbl] if c != col and c.lower() != "_id" and c.lower() != "id"]
+        for other_col in other_cols:
+            # Look for patterns like "table"."other_col" = 'something' or other_col = 'something'
+            patterns = [
+                rf'"{re.escape(tbl)}"\."{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
+                rf'"{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
+            ]
+            for pat in patterns:
+                match = re.search(pat, sql)
+                if match:
+                    old_cond = match.group(0)
+                    new_cond = f'"{tbl}"."{col}" = \'{val}\''
+                    sql = sql.replace(old_cond, new_cond)
+                    break
+    return sql
+
 
 def _apply_null_guard(sql: str) -> str:
     """Add IS NOT NULL + != '' for columns used in ORDER BY LIMIT 1 or subquery MIN/MAX."""
@@ -1226,6 +1281,7 @@ class QuestionDrivenAgent:
 
                 sql = _sanitize_sql(sql, db_path)
                 sql = _apply_null_guard(sql)
+                sql = _enforce_grounding_filters(sql, grounding_context, db_path)
                 self._log("sql_generated" if attempt == 0 else f"sql_retry_{attempt}", sql)
                 data_result = self._try_sql(db_path, sql)
 
@@ -1233,7 +1289,10 @@ class QuestionDrivenAgent:
                     # Semantic validation: skip for value comparisons (grounding is sufficient),
                     # on final attempt, or when time is tight
                     elapsed = time.monotonic() - self._start_time
-                    skip_semantic = "VALUE COMPARISON" in grounding_context
+                    skip_semantic = (
+                        "VALUE COMPARISON" in grounding_context
+                        or "CROSS-ROW HINT" in grounding_context
+                    )
                     if not skip_semantic and attempt < max_sql_attempts - 1 and elapsed < 90:
                         semantic_issue = self._semantic_validate_result(
                             question, sql, data_result, grounding_context,
@@ -1255,7 +1314,14 @@ class QuestionDrivenAgent:
                 if last_error:
                     gaps = f"- SQL ERROR: {last_error}\n- Failed SQL: {sql}"
                 elif data_result is not None:
-                    # Executed OK but 0 rows
+                    # Executed OK but 0 rows — try deterministic blocker removal
+                    fixed_sql = self._try_remove_blocker_filter(db_path, sql)
+                    if fixed_sql and fixed_sql != sql:
+                        data_result = self._try_sql(db_path, fixed_sql)
+                        if data_result and data_result.get("rows"):
+                            sql = fixed_sql
+                            self._log(f"sql_retry_{attempt}", f"(blocker removed) {fixed_sql}")
+                            break
                     diagnosis = self._diagnose_empty_result(db_path, sql) if sql else ""
                     gaps = f"- ZERO ROWS returned.\n- Failed SQL: {sql}"
                     if diagnosis:
@@ -1503,7 +1569,7 @@ Write ONE SQL that returns exactly one row with one numeric value.
 - SELECT one column only. No subqueries in SELECT.
 - Simple: SELECT col FROM table WHERE ... LIMIT 1
 - Quote identifiers with double-quotes.
-- WHERE col IS NOT NULL for the output column.
+- For non-aggregate: WHERE col IS NOT NULL. For AVG/SUM/COUNT: do NOT add IS NOT NULL on aggregated columns.
 - If a JOIN returns 0 rows, use WHERE "col" IN (SELECT ...) instead.
 
 Return ONLY: {{"sql": "SELECT ..."}}"""
@@ -1758,6 +1824,33 @@ RULES:
                     "columns": [columns[keep_idx]],
                     "rows": [[str(row[keep_idx])] for row in rows],
                 }
+
+        # Detect grouped_list with aggregate column: when SQL returns [col, COUNT/SUM/...]
+        # and the question asks to "tally/list/identify" rather than "how many of each",
+        # keep only the descriptive column (drop the aggregate).
+        if len(columns) == 2:
+            agg_pattern = re.compile(
+                r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', re.IGNORECASE,
+            )
+            agg_idx = next(
+                (i for i, c in enumerate(columns) if agg_pattern.match(c)), None,
+            )
+            if agg_idx is not None:
+                q_lower = question.lower()
+                # Only drop if the question does NOT explicitly ask for counts/breakdown
+                asks_for_count = bool(re.search(
+                    r'\bhow many (?:of each|per|for each|times each)\b'
+                    r'|\bcount (?:of|for) each\b'
+                    r'|\bbreakdown\b|\bfrequency\b|\bdistribution\b',
+                    q_lower,
+                ))
+                if not asks_for_count:
+                    keep_idx = 1 - agg_idx
+                    self._log("answer_schema", f"Kept columns [{keep_idx}] → ['{columns[keep_idx]}'] ({len(rows)} rows)")
+                    return {
+                        "columns": [columns[keep_idx]],
+                        "rows": [[str(row[keep_idx])] for row in rows],
+                    }
 
         prompt = f"""The user asked a question. The SQL returned these columns. Which columns should appear in the final answer?
 
@@ -2082,6 +2175,29 @@ RULES:
         )
         if sanity_issues:
             self._log("kg_sanity", sanity_issues)
+
+            # Handle computation_type mismatch deterministically — no LLM repick needed
+            comp_type_fix = re.search(
+                r'Change computation_type to "(\w+)"', sanity_issues,
+            )
+            if comp_type_fix:
+                picked["computation_type"] = comp_type_fix.group(1)
+                # Remove this issue so remaining issues (if any) still trigger repick
+                sanity_issues = re.sub(
+                    r'Intent says operation is "[^"]+" but computation_type is "[^"]+"\. '
+                    r'Change computation_type to "\w+"\.\n?',
+                    "", sanity_issues,
+                ).strip()
+                if not sanity_issues:
+                    # Only issue was computation_type — no repick needed
+                    sanity_issues = ""
+
+            if not sanity_issues:
+                pass  # skip repick entirely
+            else:
+                pass  # fall through to repick below
+
+        if sanity_issues:
             # Re-prompt with sanity feedback
             repicked = self._pick_graph_nodes(
                 question, kg, anchor_text,
@@ -2263,12 +2379,11 @@ RULES:
             if repicked2 and repicked2.get("select_columns"):
                 self._log("kg_repicked", json.dumps(repicked2, default=str))
                 new_output2, new_filter2, _ = self._validate_picked_nodes(repicked2, kg, db_path)
-                if new_output2:
-                    picked = repicked2
-                    output_nodes = new_output2
+                if new_filter2:
+                    # Only take filters from weak_filter repick — preserve existing output
+                    picked["filter_conditions"] = repicked2.get("filter_conditions", [])
                     filter_nodes = self._probe_filter_values(new_filter2, db_path, kg, question)
                     filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text, db_path)
-                    self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
                     self._log("kg_filter_nodes", ", ".join(
                         f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
                     ))
@@ -2293,15 +2408,21 @@ RULES:
                     _shape = _line.split("Answer shape:")[1].strip().lower()
                 elif "Operation:" in _line:
                     _operation = _line.split("Operation:")[1].strip().lower()
-            if _shape == "list" and _operation == "lookup":
+            # Only override for "list all" enumeration, NOT "which/what" questions
+            # (those ask for the display column, not the PK)
+            _q_lower_pk = question.lower().strip()
+            _is_enumeration = (
+                _q_lower_pk.startswith("list ")
+                or _q_lower_pk.startswith("give ")
+                or _q_lower_pk.startswith("show ")
+                or _q_lower_pk.startswith("find ")
+                or "list all" in _q_lower_pk
+                or "list the" in _q_lower_pk
+            )
+            if _shape == "list" and _operation == "lookup" and _is_enumeration:
                 entity_table = output_nodes[0].table
-                current_out_col = output_nodes[0].column.lower()
-                already_display = (
-                    current_out_col != "id"
-                    and not current_out_col.endswith("_id")
-                )
                 table_schema = kg.get_table(entity_table)
-                if table_schema and not already_display:
+                if table_schema:
                     q_tokens_pk = set(re.findall(r'[a-z]{3,}', question.lower()))
                     pk_names = {c.name.lower() for c in table_schema.columns if c.is_pk}
                     if not pk_names and table_schema.primary_keys:
@@ -2397,6 +2518,66 @@ RULES:
         # Inject rules engine directives into grounding
         if engine_out.sql_directives:
             grounding += "\n" + "\n".join(engine_out.sql_directives)
+
+        # --- Step 5b: Positional (Nth) with PREFIX_N ID pattern → numeric ordering ---
+        ordinal_match = re.search(
+            r'\b(\d+)(?:st|nd|rd|th)\b', question.lower(),
+        )
+        if ordinal_match and db_path and db_path.exists():
+            entity_table = output_nodes[0].table if output_nodes else ""
+            if entity_table:
+                try:
+                    _pos_conn = sqlite3.connect(str(db_path), timeout=5)
+                    # Find the primary ordering column (first TEXT column ending in _id or named id)
+                    cols_info = _pos_conn.execute(f'PRAGMA table_info("{entity_table}")').fetchall()
+                    id_col = None
+                    for ci in cols_info:
+                        cn = ci[1].lower()
+                        if cn.endswith("_id") or cn == "id":
+                            id_col = ci[1]
+                            break
+                    if id_col:
+                        sample_vals = [
+                            r[0] for r in _pos_conn.execute(
+                                f'SELECT DISTINCT "{id_col}" FROM "{entity_table}" LIMIT 10'
+                            ).fetchall() if r[0]
+                        ]
+                        # Detect PREFIX_N pattern (e.g. TR001_1, TR001_10)
+                        prefix_n_count = sum(
+                            1 for v in sample_vals
+                            if re.match(r'^.+[_\-]\d+$', str(v))
+                        )
+                        if prefix_n_count >= len(sample_vals) * 0.8 and sample_vals:
+                            sep = "_" if "_" in str(sample_vals[0]) else "-"
+                            nth = ordinal_match.group(1)
+                            # Check if there's a group-by column (partition)
+                            partition_col = ""
+                            for ci in cols_info:
+                                cn = ci[1].lower()
+                                if cn.endswith("_id") and cn != id_col.lower():
+                                    partition_col = ci[1]
+                                    break
+                            if partition_col:
+                                grounding += (
+                                    f'\nNUMERIC ORDERING (MANDATORY — use this exact subquery pattern):\n'
+                                    f'  The "{id_col}" column encodes position as PREFIX{sep}N (e.g. {sample_vals[0]}).\n'
+                                    f'  To get the {nth}th item per group, use:\n'
+                                    f'  WHERE "{id_col}" IN (SELECT "{id_col}" FROM '
+                                    f'(SELECT "{id_col}", "{partition_col}", '
+                                    f'ROW_NUMBER() OVER (PARTITION BY "{partition_col}" '
+                                    f'ORDER BY CAST(SUBSTR("{id_col}", INSTR("{id_col}",\'{sep}\')+1) AS INTEGER)) AS rn '
+                                    f'FROM "{entity_table}") WHERE rn = {nth})'
+                                )
+                            else:
+                                grounding += (
+                                    f'\nNUMERIC ORDERING (MANDATORY): The "{id_col}" column has format '
+                                    f'PREFIX{sep}NUMBER (e.g. {sample_vals[0]}). Text sorting gives wrong '
+                                    f'positional order (_10 before _2). In ROW_NUMBER() or ORDER BY, use: '
+                                    f'ORDER BY CAST(SUBSTR("{id_col}", INSTR("{id_col}",\'{sep}\')+1) AS INTEGER)'
+                                )
+                    _pos_conn.close()
+                except Exception:
+                    pass
 
         # --- Step 5a: Surface domain formulas relevant to this question ---
         # Skip if independent ratio already produced the SQL pattern
@@ -2704,12 +2885,25 @@ CONSTRAINTS:
                         break
             exact_cols.setdefault(cn, []).append((col_node.table_id, col_node.name, sql_type))
 
+        # Detect tokens near a numeric value — likely filter context, not output
+        # e.g. "number less than 20", "age over 30", "round 5"
+        _q_words = q_lower.split()
+        _filter_context_tokens: set[str] = set()
+        for i, w in enumerate(_q_words):
+            if w in exact_cols:
+                # Check if any word within 3 positions contains digits
+                window = _q_words[max(0, i - 2):i + 4]
+                if any(re.search(r'\d', tok) for tok in window):
+                    _filter_context_tokens.add(w)
+
         # Find question tokens that exactly match column names (exclude filter columns)
         matched_cols: dict[str, list[tuple[str, str, str]]] = {}
         for token in q_tokens:
             if len(token) < 3:
                 continue
             if token in filter_col_names:
+                continue
+            if token in _filter_context_tokens:
                 continue
             if token in exact_cols:
                 matched_cols[token] = exact_cols[token]
@@ -2757,6 +2951,14 @@ CONSTRAINTS:
                     node_parts = [p for p in node.column.lower().split("_") if p]
                 if len(node_parts) >= 2:
                     node_mentioned = all(p.lower() in q_tokens for p in node_parts)
+                # Partial match: if any substantive part of the column name appears in the
+                # question (including plural forms), consider it mentioned
+                if not node_mentioned and node_parts:
+                    for p in node_parts:
+                        pl = p.lower()
+                        if len(pl) >= 4 and (pl in q_tokens or pl + "s" in q_tokens or pl.rstrip("s") in q_tokens):
+                            node_mentioned = True
+                            break
 
             if not node_mentioned:
                 # This output column is NOT directly referenced in the question.
@@ -3338,12 +3540,20 @@ CONSTRAINTS:
                                 (f"{node.value} %", node.value),
                             ).fetchone()[0]
                             if prefix_cnt > exact_cnt:
-                                probed.append(QueryNode(
-                                    table=node.table, column=node.column, role=node.role,
-                                    operator="LIKE", value=f"{node.value}%",
-                                ))
-                                self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' → LIKE '{node.value}%' ({prefix_cnt} vs {exact_cnt} exact)")
-                                continue
+                                # Don't expand if multiple distinct values share this prefix
+                                # (e.g. "VYBER" and "VYBER KARTOU" are separate categories)
+                                distinct_prefixed = conn.execute(
+                                    f'SELECT COUNT(DISTINCT "{node.column}") FROM "{node.table}" '
+                                    f'WHERE "{node.column}" LIKE ? OR "{node.column}" = ?',
+                                    (f"{node.value} %", node.value),
+                                ).fetchone()[0]
+                                if distinct_prefixed <= 1:
+                                    probed.append(QueryNode(
+                                        table=node.table, column=node.column, role=node.role,
+                                        operator="LIKE", value=f"{node.value}%",
+                                    ))
+                                    self._log("value_probe", f"{node.table}.{node.column}: '{node.value}' → LIKE '{node.value}%' ({prefix_cnt} vs {exact_cnt} exact)")
+                                    continue
                         probed.append(node)
                         continue
                     # Value doesn't match — try FK resolution (name→ID lookup)
@@ -3351,6 +3561,54 @@ CONSTRAINTS:
                         resolved = self._resolve_fk_value(node, conn, kg, question)
                         if resolved:
                             probed.append(resolved)
+                            continue
+                    # Year→FK resolution: numeric value looks like a year but the column
+                    # holds small FK IDs. Convert to subquery via the referenced table.
+                    if (question and kg and str(node.value).isdigit()
+                            and 1900 <= int(node.value) <= 2100
+                            and node.column.lower().endswith("id")):
+                        # Find FK target table with a 'year' column
+                        col_id = f"{node.table}.{node.column}"
+                        fk_edges = kg.graph.fk_from.get(col_id, []) if kg.graph else []
+                        for edge in fk_edges:
+                            dst_parts = edge.dst.split(".")
+                            if len(dst_parts) == 2:
+                                ref_table = dst_parts[0]
+                                # Check if ref_table has a 'year' column
+                                ref_schema = kg.get_table(ref_table)
+                                if ref_schema and any(c.name.lower() == "year" for c in ref_schema.columns):
+                                    # Build subquery filter using year + any name mention in question
+                                    name_filter = ""
+                                    if ref_schema and any(c.name.lower() == "name" for c in ref_schema.columns):
+                                        # Extract potential race/event name from question
+                                        q_lower = question.lower()
+                                        name_samples = conn.execute(
+                                            f'SELECT DISTINCT "name" FROM "{ref_table}" LIMIT 50'
+                                        ).fetchall()
+                                        for (ns,) in name_samples:
+                                            if ns and ns.lower() in q_lower:
+                                                name_filter = f' AND "name" = \'{ns}\''
+                                                break
+                                            # partial match: "Chinese Grand Prix" in question
+                                            if ns and all(w.lower() in q_lower for w in ns.split() if len(w) > 2):
+                                                name_filter = f' AND "name" = \'{ns}\''
+                                                break
+                                    subquery = (
+                                        f'(SELECT "{dst_parts[1]}" FROM "{ref_table}" '
+                                        f'WHERE "year" = {node.value}{name_filter})'
+                                    )
+                                    probed.append(QueryNode(
+                                        table=node.table, column=node.column, role=node.role,
+                                        operator="IN", value=subquery,
+                                    ))
+                                    self._log("value_probe",
+                                              f"{node.table}.{node.column}: '{node.value}' is year → "
+                                              f"subquery via {ref_table} (year={node.value}{name_filter})")
+                                    break
+                        else:
+                            # No FK edge found — keep as-is, fall through to other checks
+                            pass
+                        if probed and probed[-1].table == node.table and probed[-1].column == node.column and probed[-1].operator == "IN":
                             continue
                     # Value doesn't match exactly — sample actual values to find format
                     samples = conn.execute(
@@ -3845,26 +4103,36 @@ CONSTRAINTS:
         val_words = set(val_lower.split())
         table_lower = table.lower()
 
-        for doc_path in self._doc_paths:
-            doc_stem = doc_path.stem.lower()
-            if table_lower not in doc_stem and doc_stem not in table_lower:
-                continue
-            try:
-                doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
-            for para in paragraphs:
-                para_lower = para.lower()
-                if val_lower in para_lower or (
-                    len(val_words) > 1
-                    and sum(1 for w in val_words if w in para_lower) >= len(val_words) - 1
-                ):
-                    id_patterns = [
-                        r'\(\w+\s+ID\s*[:.]?\s*(\d+)\)',
-                        r'(?:\w+\s+)?ID\s*[:.]?\s*(\d+)',
-                        r'(?:identifier|registered\s+under)\s*[:.]?\s*(\d+)',
-                    ]
+        id_patterns = [
+            r'\(\w+\s+ID\s*[:.]?\s*(\d+)\)',
+            r'(?:\w+\s+)?ID\s*[:.]?\s*(\d+)',
+            r'(?:identifier|registered\s+under)\s*[:.]?\s*(\d+)',
+        ]
+        # Two passes: exact match first, then fuzzy — prevents "Grand Prix" in
+        # every paragraph from resolving to the wrong race
+        for require_exact in (True, False):
+            for doc_path in self._doc_paths:
+                doc_stem = doc_path.stem.lower()
+                if table_lower not in doc_stem and doc_stem not in table_lower:
+                    continue
+                try:
+                    doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
+                for para in paragraphs:
+                    para_lower = para.lower()
+                    if require_exact:
+                        if val_lower not in para_lower:
+                            continue
+                    else:
+                        if val_lower in para_lower:
+                            continue  # already tried in exact pass
+                        if not (
+                            len(val_words) > 1
+                            and sum(1 for w in val_words if w in para_lower) >= len(val_words) - 1
+                        ):
+                            continue
                     for pat in id_patterns:
                         m = re.search(pat, para, re.IGNORECASE)
                         if m:
@@ -4147,6 +4415,31 @@ CONSTRAINTS:
         """Check if filters are discriminating. A filter that keeps >90% of rows is likely wrong."""
         if not db_path or not filter_nodes:
             return ""
+        # If there are highly selective equality filters on OTHER tables (e.g. name='Alex'),
+        # a broad range filter on a different table is fine — the JOIN handles selectivity.
+        has_selective_eq = False
+        try:
+            _sel_conn = sqlite3.connect(str(db_path))
+            filter_tables = {n.table for n in filter_nodes}
+            for node in filter_nodes:
+                if node.operator != "=" or node.column.startswith("_expr:"):
+                    continue
+                _sel_total = _sel_conn.execute(
+                    f'SELECT COUNT(*) FROM "{node.table}"'
+                ).fetchone()[0]
+                if _sel_total == 0:
+                    continue
+                _sel_match = _sel_conn.execute(
+                    f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" = ?',
+                    (node.value,),
+                ).fetchone()[0]
+                if _sel_match / _sel_total < 0.05:
+                    has_selective_eq = True
+                    break
+            _sel_conn.close()
+        except Exception:
+            pass
+
         # Identify columns that have paired range filters (>= and <=) — skip individual checks
         range_paired_cols: set[str] = set()
         col_ops: dict[str, set[str]] = {}
@@ -4173,6 +4466,10 @@ CONSTRAINTS:
                 # Skip individual bounds of paired range filters (the pair is selective together)
                 col_key = f"{node.table}.{node.column}"
                 if col_key in range_paired_cols and node.operator in (">=", ">", "<=", "<"):
+                    continue
+                # Skip range filters when another filter is already highly selective
+                # (the JOIN with the selective filter handles the actual row reduction)
+                if has_selective_eq and node.operator in (">=", ">", "<=", "<"):
                     continue
                 try:
                     total = conn.execute(
@@ -4564,7 +4861,7 @@ RULES:
                 for _onode in path.output_nodes:
                     _ocol = _onode.column.lower()
                     # ID/PK columns are for counting, not value comparison
-                    if _ocol == "id" or _ocol == "_id" or _ocol.endswith("_id"):
+                    if _ocol == "id" or _ocol == "_id" or _ocol.endswith("_id") or _ocol.endswith("id"):
                         continue
                     _col_info2 = _conn2.execute(f'PRAGMA table_info("{_onode.table}")').fetchall()
                     for _ci in _col_info2:
@@ -4774,7 +5071,8 @@ RULES:
         # --- Self-join / OR-logic / AND-logic detection ---
         # When multiple filters target the same column with "=" and different values,
         # check question language: "X or Y" → OR (IN), "X and Y" / "both" → self-join
-        if path.filter_nodes:
+        # Skip for ratio/percentage — those use CASE WHEN pattern, not self-join
+        if path.filter_nodes and comp_type not in ("ratio", "percentage"):
             col_values: dict[str, list[str]] = {}
             for node in path.filter_nodes:
                 if node.operator == "=" and not node.column.startswith("_expr:"):
@@ -5724,15 +6022,13 @@ If the question asks for something with a superlative (lowest, highest, most, le
     def _extract_domain_formula(self, question: str, anchor_text: str) -> str:
         """Extract domain formula definitions relevant to the question from anchor text.
 
-        Matches any bullet-point line containing a formula indicator and scores
-        by word overlap with the question. Format-agnostic: works with colon-separated,
-        equals-separated, LaTeX, function syntax, or plain arithmetic.
+        Matches bullet-point blocks by word overlap with the question.
+        Returns the raw text for the LLM to interpret (handles LaTeX, plain text, etc).
         """
         if not anchor_text:
             return ""
         q_words_raw = set(re.findall(r'\b[a-z]{4,}\b', question.lower()))
         q_words_stemmed = {w.rstrip('s') if len(w) > 4 else w for w in q_words_raw}
-        formula_indicators = ("SUM(", "AVG(", "COUNT(", "DIVIDE(", "MULTIPLY(", "/", "\\frac", "frac{", "×", "÷")
 
         best_formula = ""
         best_score = 0
@@ -5743,23 +6039,18 @@ If the question asks for something with a superlative (lowest, highest, most, le
             anchor_text, re.MULTILINE | re.DOTALL,
         ):
             full_line = m.group(1).strip()
-            # Must contain a formula indicator (arithmetic/aggregation)
-            if not any(ind in full_line for ind in formula_indicators):
-                # Also check for "= ... / N" or "= ... * N" patterns
-                if not re.search(r'=.*[/*×÷]\s*\d', full_line):
-                    continue
+            # Must contain something that looks like a formula/calculation
+            has_formula = any(ind in full_line for ind in (
+                "SUM(", "AVG(", "COUNT(", "DIVIDE(", "MULTIPLY(",
+                "/", "×", "÷", "frac", "=",
+            ))
+            if not has_formula:
+                continue
 
-            # Label = all text before the formula indicator (captures full context)
-            label = full_line
-            for ind in formula_indicators:
-                ind_pos = full_line.find(ind)
-                if ind_pos > 0:
-                    label = full_line[:ind_pos]
-                    break
-            # Also try text before backtick-wrapped formula
-            bt_pos = full_line.find("`")
-            if bt_pos > 0 and bt_pos < len(label):
-                label = full_line[:bt_pos]
+            # Score by word overlap between the label portion and the question
+            # Label = text before first formula-like character
+            colon_pos = full_line.find(":")
+            label = full_line[:colon_pos] if colon_pos > 0 else full_line[:60]
 
             label_words_raw = set(re.findall(r'\b[a-z]{4,}\b', label.lower()))
             label_words_stemmed = {w.rstrip('s') if len(w) > 4 else w for w in label_words_raw}
@@ -5768,7 +6059,7 @@ If the question asks for something with a superlative (lowest, highest, most, le
                 best_score = overlap
                 best_formula = full_line
 
-        if best_score >= 4:
+        if best_score >= 2:
             return best_formula
         return ""
 
@@ -8230,6 +8521,58 @@ Reply PASS if the result looks reasonable, or FAIL: <one sentence why it's suspi
         if issues:
             return "EMPTY RESULT — these filters likely caused it:\n" + "\n".join(f"  - {i}" for i in issues[:3])
         return "Query returned 0 rows. The combined WHERE conditions are too restrictive — try removing or relaxing one filter at a time."
+
+    def _try_remove_blocker_filter(self, db_path: Path, sql: str) -> str | None:
+        """Remove a single redundant WHERE filter that blocks results.
+
+        Only removes a filter when: (1) the full SQL returns 0 rows,
+        (2) removing exactly one filter produces exactly 1 row,
+        meaning the remaining filters already uniquely identify the entity.
+        """
+        if not sql or not db_path or not db_path.exists():
+            return None
+        sql_upper = sql.upper()
+        if "WHERE" not in sql_upper:
+            return None
+
+        where_idx = sql.upper().find("WHERE")
+        base_sql = sql[:where_idx].strip()
+
+        # Find the end of WHERE clause
+        where_rest = sql[where_idx + 5:]
+        where_clause = where_rest
+        suffix = ""
+        for keyword in ("ORDER BY", "GROUP BY", "LIMIT", "HAVING"):
+            kw_idx = where_clause.upper().find(keyword)
+            if kw_idx > 0:
+                suffix = where_clause[kw_idx:]
+                where_clause = where_clause[:kw_idx]
+                break
+
+        conditions = [c.strip() for c in re.split(r'\bAND\b', where_clause, flags=re.IGNORECASE) if c.strip()]
+        if len(conditions) < 2:
+            return None
+
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            best_removal: tuple[int, str] | None = None
+            for i, cond in enumerate(conditions):
+                remaining = [c for j, c in enumerate(conditions) if j != i]
+                test_where = " AND ".join(remaining)
+                test_sql = f"{base_sql} WHERE {test_where} {suffix}".strip()
+                try:
+                    count = conn.execute(f"SELECT COUNT(*) FROM ({test_sql})").fetchone()[0]
+                    if count == 1:
+                        best_removal = (count, test_sql)
+                        break
+                except Exception:
+                    continue
+            conn.close()
+            if best_removal:
+                return best_removal[1]
+        except Exception:
+            pass
+        return None
 
     def _diagnose_empty_result(self, db_path: Path, sql: str) -> str:
         """When SQL returns 0 rows, isolate which filter causes the empty result.

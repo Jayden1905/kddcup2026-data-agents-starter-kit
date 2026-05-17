@@ -765,7 +765,11 @@ def rule_ratio_pattern(ctx: EngineContext) -> RuleResult | None:
             for _node in ctx.output_nodes:
                 col_lower = _node.column.lower()
                 # ID/PK columns are used for counting, not value comparison
-                if col_lower == "id" or col_lower == "_id" or col_lower.endswith("_id"):
+                is_id_col = (
+                    col_lower == "id" or col_lower == "_id"
+                    or col_lower.endswith("_id") or col_lower.endswith("id")
+                )
+                if is_id_col:
                     continue
                 col_info = _conn.execute(f'PRAGMA table_info("{_node.table}")').fetchall()
                 for ci in col_info:
