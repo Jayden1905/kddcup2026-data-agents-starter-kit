@@ -32,7 +32,7 @@ def run():
             "model": model_name,
             "api_base": model_api_url,
             "api_key": model_api_key,
-            "temperature": 0.0,
+            "temperature": 0.3,
         },
         "run": {
             "output_dir": "/tmp/run_output",

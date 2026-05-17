@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from openai import APIError, APITimeoutError, AzureOpenAI, OpenAI
 
-REQUEST_TIMEOUT = 180  # seconds per API call (thinking models need more time)
+REQUEST_TIMEOUT = 60  # seconds per API call
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
@@ -77,7 +77,7 @@ class OpenAIModelAdapter:
         }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
-        if "qwen" in self.model.lower() and not thinking:
+        if "qwen" in self.model.lower():
             if "deepinfra" in self.api_base:
                 kwargs["extra_body"] = {"reasoning": {"enabled": False}}
             else:
