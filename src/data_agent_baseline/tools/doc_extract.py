@@ -232,7 +232,7 @@ def extract_records_from_document(
             ModelMessage(role="user", content=prompt),
         ]
         try:
-            raw = model.complete(messages)
+            raw = model.complete(messages, thinking=False)
             return _parse_extraction_response(raw)
         except Exception:
             return []

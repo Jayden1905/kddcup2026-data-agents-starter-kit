@@ -493,7 +493,7 @@ def _run_planner(
     messages = [ModelMessage(role="user", content=prompt)]
 
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
     except Exception as e:
         if log_fn:
             log_fn("planner_error", str(e)[:200])
@@ -594,7 +594,7 @@ def _run_workers(
         )
         messages = [ModelMessage(role="user", content=prompt)]
         try:
-            raw_response = model.complete(messages)
+            raw_response = model.complete(messages, thinking=False)
             records = _parse_json_response(raw_response)
             if log_fn and not records:
                 log_fn("worker_empty", f"chunk {i+1}: no records parsed. Response preview: {raw_response[:150]}")
@@ -756,7 +756,7 @@ def _run_repair(
         )
         messages = [ModelMessage(role="user", content=prompt)]
         try:
-            raw = model.complete(messages)
+            raw = model.complete(messages, thinking=False)
             return _parse_json_response(raw)
         except Exception:
             return []

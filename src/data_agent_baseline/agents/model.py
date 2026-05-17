@@ -54,6 +54,7 @@ class OpenAIModelAdapter:
     def _get_client(self) -> OpenAI:
         if self._client is None:
             from httpx import Timeout
+
             self._client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
@@ -61,7 +62,7 @@ class OpenAIModelAdapter:
             )
         return self._client
 
-    def complete(self, messages: list[ModelMessage]) -> str:
+    def complete(self, messages: list[ModelMessage], *, thinking: bool = True) -> str:
         if not self.api_key:
             raise RuntimeError("Missing model API key in config.agent.api_key.")
 
@@ -70,14 +71,19 @@ class OpenAIModelAdapter:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": message.role, "content": message.content} for message in messages
+                {"role": message.role, "content": message.content}
+                for message in messages
             ],
         }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
-        if "qwen" in self.model.lower():
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
-            kwargs["temperature"] = 0.6
+        if "qwen" in self.model.lower() and not thinking:
+            if "deepinfra" in self.api_base:
+                kwargs["extra_body"] = {"reasoning": {"enabled": False}}
+            else:
+                kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": False}
+                }
 
         try:
             response = client.chat.completions.create(**kwargs, timeout=REQUEST_TIMEOUT)
@@ -124,6 +130,7 @@ class AzureOpenAIModelAdapter:
             raise RuntimeError("Missing Azure OpenAI API key in config.agent.api_key.")
 
         from httpx import Timeout
+
         client = AzureOpenAI(
             api_key=self.api_key,
             api_version=self.api_version,
@@ -135,7 +142,8 @@ class AzureOpenAIModelAdapter:
             response = client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": message.role, "content": message.content} for message in messages
+                    {"role": message.role, "content": message.content}
+                    for message in messages
                 ],
                 temperature=self.temperature,
                 timeout=REQUEST_TIMEOUT,

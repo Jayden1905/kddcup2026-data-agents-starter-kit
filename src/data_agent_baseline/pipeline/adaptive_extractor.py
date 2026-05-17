@@ -401,7 +401,7 @@ def adaptive_extract(
 
     messages = [ModelMessage(role="user", content=prompt)]
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
     except Exception as e:
         if log_fn:
             log_fn("adaptive_error", f"Pattern discovery LLM failed: {e}")
@@ -466,7 +466,7 @@ def adaptive_extract(
 
         messages = [ModelMessage(role="user", content=refine_prompt)]
         try:
-            raw = model.complete(messages)
+            raw = model.complete(messages, thinking=False)
         except Exception:
             break
 

@@ -1426,7 +1426,7 @@ Respond with ONLY a JSON array:
     messages = [ModelMessage(role="user", content=prompt)]
     calls = 0
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
         calls += 1
     except Exception:
         return {}, 1
@@ -1467,7 +1467,7 @@ Respond with ONLY a JSON array:
 
         messages2 = [ModelMessage(role="user", content=prompt2)]
         try:
-            raw2 = model.complete(messages2)
+            raw2 = model.complete(messages2, thinking=False)
             calls += 1
             data2 = _parse_llm_json(raw2)
             if isinstance(data2, list):
@@ -1620,7 +1620,7 @@ Respond with ONLY a JSON array:
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
-            raw = model.complete(messages)
+            raw = model.complete(messages, thinking=False)
             calls_made += 1
         except Exception:
             calls_made += 1
@@ -1734,7 +1734,7 @@ Rules:
 
     messages = [ModelMessage(role="user", content=prompt)]
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
     except Exception as e:
         if log_fn:
             log_fn("regex_planner_error", f"LLM call failed: {e}")

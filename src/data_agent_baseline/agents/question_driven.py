@@ -1406,7 +1406,7 @@ class QuestionDrivenAgent:
         )
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         if not raw:
             self._log("sql_call_empty", "LLM returned empty response")
             return ""
@@ -1586,7 +1586,7 @@ Write ONE SQL that returns exactly one row with one numeric value.
 Return ONLY: {{"sql": "SELECT ..."}}"""
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         if not raw:
             return ""
         parsed = self._parse_json(raw)
@@ -1621,7 +1621,7 @@ The answer should be positive when the question asks "how much more/faster/highe
 Return ONLY: {{"sql": "SELECT ..."}}"""
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         if not raw:
             return None
         parsed = self._parse_json(raw)
@@ -1707,7 +1707,7 @@ Return ONLY: {{"result": <number>}}"""
         )
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         parsed = self._parse_json(raw)
 
         if isinstance(parsed, dict):
@@ -1748,7 +1748,7 @@ RULES:
 - Only flag REAL problems: clearly wrong columns, wrong aggregation type, or completely empty result where data should exist."""
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         raw = raw.strip()
 
         raw_upper = raw.upper()
@@ -1881,7 +1881,7 @@ RULES:
 - REMOVE internal IDs and filter-echo columns (constant values from WHERE clause).
 - NEVER merge columns. Just pick indices to keep."""
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         parsed = self._parse_json(raw)
 
         if not isinstance(parsed, dict) or "keep_columns" not in parsed:
@@ -2039,7 +2039,7 @@ RULES:
             knowledge_text=knowledge_text[:4000],
         )
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         parsed = self._parse_json(raw)
 
         llm_parts: list[str] = []
@@ -2749,7 +2749,7 @@ CONSTRAINTS:
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
-            raw = self._model_call_with_retry(messages)
+            raw = self._model_call_with_retry(messages, thinking=True)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("select_columns"):
                 return parsed
@@ -5571,12 +5571,12 @@ RULES:
             feedback=validated_section if validated_section else "",
         )
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         grounding = self._parse_json(raw)
 
         if not isinstance(grounding, dict) or not grounding:
             self._log("semantic_grounding", "(failed to parse, retrying)")
-            raw = self._model_call_with_retry(messages)
+            raw = self._model_call_with_retry(messages, thinking=False)
             grounding = self._parse_json(raw)
 
         if not isinstance(grounding, dict) or not grounding:
@@ -5944,7 +5944,7 @@ RULES:
             "Return the cleaned grounding context as plain text (no JSON, no code fences)."
         )
         try:
-            raw = self._model_call_with_retry([ModelMessage(role="user", content=prompt)])
+            raw = self._model_call_with_retry([ModelMessage(role="user", content=prompt)], thinking=False)
             cleaned = raw.strip()
             if cleaned and len(cleaned) > 50:
                 return cleaned
@@ -9214,7 +9214,7 @@ RULES:
 - ONLY use columns that appear in the SCHEMA above. NEVER invent or guess column names."""
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         parsed = self._parse_json(raw)
 
         if not isinstance(parsed, dict):
@@ -9327,7 +9327,7 @@ RULES:
 - Keep it simple — under 30 lines"""
 
         messages = [ModelMessage(role="user", content=prompt)]
-        raw = self._model_call_with_retry(messages)
+        raw = self._model_call_with_retry(messages, thinking=False)
         parsed = self._parse_json(raw)
 
         if not isinstance(parsed, dict) or not parsed.get("python"):
@@ -9468,7 +9468,7 @@ DATABASE SCHEMA:
 Write a SIMPLER SQL that avoids the computation error. Use NULLIF for division, COALESCE for NULLs.
 Return ONLY: {{"sql": "SELECT ..."}}"""
                 messages = [ModelMessage(role="user", content=fix_prompt)]
-                raw = self._model_call_with_retry(messages)
+                raw = self._model_call_with_retry(messages, thinking=False)
                 parsed = self._parse_json(raw)
                 if isinstance(parsed, dict) and parsed.get("sql"):
                     self._log("shape_fix_sql", parsed["sql"])
@@ -9535,7 +9535,7 @@ DATABASE SCHEMA:
 
 Return ONLY: {{"sql": "SELECT ..."}}"""
                 messages = [ModelMessage(role="user", content=fix_prompt)]
-                raw = self._model_call_with_retry(messages)
+                raw = self._model_call_with_retry(messages, thinking=False)
                 parsed = self._parse_json(raw)
                 if isinstance(parsed, dict) and parsed.get("sql"):
                     self._log("shape_fix_sql", parsed["sql"])
@@ -9568,7 +9568,7 @@ DATABASE SCHEMA:
 Write a corrected SQL that returns TWO columns (one for each value).
 Return ONLY: {{"sql": "SELECT ..."}}"""
             messages = [ModelMessage(role="user", content=fix_prompt)]
-            raw = self._model_call_with_retry(messages)
+            raw = self._model_call_with_retry(messages, thinking=False)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("sql"):
                 self._log("shape_fix_sql", parsed["sql"])
@@ -9600,7 +9600,7 @@ DATABASE SCHEMA:
 
 Return ONLY: {{"sql": "SELECT COUNT(...) ..."}}"""
             messages = [ModelMessage(role="user", content=fix_prompt)]
-            raw = self._model_call_with_retry(messages)
+            raw = self._model_call_with_retry(messages, thinking=False)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("sql"):
                 fix_result = self._try_sql(db_path, parsed["sql"])
@@ -9634,7 +9634,7 @@ DATABASE SCHEMA:
 
 Return ONLY: {{"sql": "SELECT ..."}}"""
             messages = [ModelMessage(role="user", content=fix_prompt)]
-            raw = self._model_call_with_retry(messages)
+            raw = self._model_call_with_retry(messages, thinking=False)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("sql"):
                 self._log("shape_fix_sql", parsed["sql"])
@@ -10032,10 +10032,10 @@ RULES:
         except Exception:
             return ""
 
-    def _model_call_with_retry(self, messages: list[ModelMessage]) -> str:
-        """Call model with 60s timeout. Returns empty string on failure (no retry)."""
+    def _model_call_with_retry(self, messages: list[ModelMessage], *, thinking: bool = True) -> str:
+        """Call model with timeout. Returns empty string on failure (no retry)."""
         try:
-            result = self.model.complete(messages)
+            result = self.model.complete(messages, thinking=thinking)
             return result if result else ""
         except RuntimeError as e:
             self._log("llm_error", f"LLM call failed: {e}")

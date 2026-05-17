@@ -221,7 +221,7 @@ def build_knowledge_graph(
 
     for attempt in range(1 + max_retries):
         try:
-            raw = model.complete(messages)
+            raw = model.complete(messages, thinking=False)
             parsed = json.loads(_strip_json_fence(raw))
             if not isinstance(parsed, dict):
                 return {}

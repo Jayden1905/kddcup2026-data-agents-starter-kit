@@ -182,7 +182,7 @@ def _discover_entities_in_chunk(
         ModelMessage(role="user", content=prompt),
     ]
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
         data = _parse_json_response(raw)
         return data.get("entity_types", [])
     except Exception:
@@ -472,7 +472,7 @@ def _extract_one_chunk(
         ModelMessage(role="user", content=prompt),
     ]
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
         data = _parse_json_response(raw)
         records = data.get("records", [])
         edges = data.get("edges", [])
@@ -734,7 +734,7 @@ def _extract_batch(
     ]
     for attempt in range(3):
         try:
-            raw = model.complete(messages)
+            raw = model.complete(messages, thinking=False)
             data = _parse_json_response(raw)
             records = data.get("records", [])
             return [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
@@ -935,7 +935,7 @@ def _repair_null_values(
     ]
 
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
         data = _parse_json_response(raw)
         repairs = data.get("records", [])
         if not isinstance(repairs, list):

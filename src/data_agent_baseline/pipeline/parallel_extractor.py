@@ -113,7 +113,7 @@ class ExtractionAgent:
         prompt = self._build_prompt(unit.text, entity_type)
         messages = [ModelMessage(role="user", content=prompt)]
         try:
-            raw = self.model.complete(messages)
+            raw = self.model.complete(messages, thinking=False)
         except RuntimeError:
             return
 

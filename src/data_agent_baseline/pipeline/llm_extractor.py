@@ -227,7 +227,7 @@ def hybrid_extract_docs(
             messages = [ModelMessage(role="user", content=prompt)]
 
             try:
-                response = model.complete(messages)
+                response = model.complete(messages, thinking=False)
             except Exception as e:
                 if log_fn:
                     log_fn("llm_error", f"Chunk {i}: {str(e)[:100]}")

@@ -163,7 +163,7 @@ def parse_grounding(text: str, *, model: ModelAdapter) -> GroundingContext:
         ModelMessage(role="user", content=_PARSE_GROUNDING_PROMPT.format(text=text)),
     ]
     try:
-        raw = model.complete(messages)
+        raw = model.complete(messages, thinking=False)
         data = json.loads(_strip_json_fence(raw))
         if isinstance(data, dict):
             return _build_context_from_json(data, text)

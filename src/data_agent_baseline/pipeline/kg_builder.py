@@ -1108,7 +1108,7 @@ def enrich_kg_with_descriptions(
         knowledge_text=knowledge_text[:3000] if knowledge_text else "(none)",
     )
     messages = [ModelMessage(role="user", content=prompt)]
-    raw = model.complete(messages)
+    raw = model.complete(messages, thinking=False)
 
     descriptions: dict[str, str] = {}
     try:
@@ -1244,7 +1244,7 @@ def discover_joins_with_llm(
 
     prompt = _RELATIONSHIP_DISCOVERY_PROMPT.format(schema=schema_text)
     messages = [ModelMessage(role="user", content=prompt)]
-    raw = model.complete(messages)
+    raw = model.complete(messages, thinking=False)
 
     result: dict = {}
     try:
