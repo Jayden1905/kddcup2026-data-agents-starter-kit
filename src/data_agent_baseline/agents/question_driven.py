@@ -2099,6 +2099,17 @@ RULES:
         # --- Step 1: Domain anchors + user intent ---
         anchor_text = self._extract_domain_anchors(question, knowledge_text, db_path=db_path)
         user_intent = self._detect_user_intent_only(question, kg_context=kg_context, anchor_text=anchor_text)
+
+        # Deterministic answer_shape correction based on question keywords
+        _q_lower = question.lower()
+        if user_intent:
+            if re.search(r'\b(?:how many|how much|what is the (?:total|average|number|percentage|ratio|count))\b', _q_lower):
+                if "Answer shape: list" in user_intent or "Answer shape: grouped_table" in user_intent:
+                    user_intent = re.sub(r'Answer shape: \w+', 'Answer shape: single_value', user_intent)
+            elif re.search(r'\b(?:list all|list the|what are the|which are the|name all|give me all)\b', _q_lower):
+                if "Answer shape: single_value" in user_intent:
+                    user_intent = re.sub(r'Answer shape: \w+', 'Answer shape: list', user_intent)
+
         if user_intent:
             self._log("user_intent", user_intent)
 
@@ -2130,11 +2141,28 @@ RULES:
                     f"Include filter_conditions for EACH table so the ratio can be computed independently per table."
                 )
 
+        # --- Step 1d: Deterministic computation_type from question keywords ---
+        _q_lower = question.lower()
+        _det_comp_type = ""
+        if re.search(r'\b(?:how many|number of|count of|total number)\b', _q_lower):
+            _det_comp_type = "count"
+        elif re.search(r'\b(?:average|mean|avg)\b', _q_lower):
+            _det_comp_type = "avg"
+        elif re.search(r'\b(?:total|sum of|sum the)\b', _q_lower) and "how many" not in _q_lower:
+            _det_comp_type = "sum"
+        elif re.search(r'\b(?:percentage|percent|%)\b', _q_lower):
+            _det_comp_type = "percentage"
+        elif re.search(r'\b(?:ratio of|ratio between)\b', _q_lower):
+            _det_comp_type = "ratio"
+
         # --- Step 2: LLM picks nodes from graph (1 call) ---
         picked = self._pick_graph_nodes(question, kg, anchor_text, user_intent)
         if not picked:
             self._log("kg_path", "Node picking failed, falling back")
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+
+        if _det_comp_type:
+            picked["computation_type"] = _det_comp_type
 
         self._log("kg_picked", json.dumps(picked, default=str))
 
@@ -2749,7 +2777,7 @@ CONSTRAINTS:
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
-            raw = self._model_call_with_retry(messages, thinking=True)
+            raw = self._model_call_with_retry(messages, thinking=False)
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict) and parsed.get("select_columns"):
                 return parsed
@@ -3125,6 +3153,14 @@ CONSTRAINTS:
             if token in col_by_name:
                 cols = col_by_name[token]
                 hints.append(f'"{token}" in question matches column: {", ".join(cols)}')
+
+        # --- Strategy 1b: Multi-word column name matching ---
+        # Column names like "home_team_goal" or "Phone" should match "home team goal" or "phone"
+        for col_lower, col_refs in col_by_name.items():
+            col_words = set(col_lower.replace("_", " ").split())
+            if len(col_words) >= 2 and col_words.issubset(q_tokens):
+                if not any(col_lower in h for h in hints):
+                    hints.append(f'question words match multi-word column "{col_lower}": {", ".join(col_refs)}')
 
         # --- Strategy 2: Table mention → structural columns ---
         for table in kg.tables:
