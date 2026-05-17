@@ -1423,9 +1423,21 @@ class QuestionDrivenAgent:
                 self._log("sql_parse_failed", f"No sql key in: {list(parsed.keys())} | raw={raw}")
             return sql
         # Try extracting SQL directly from raw text
-        select_match = re.search(r'(SELECT\s.+?)(?:```|"|\Z)', raw, re.DOTALL | re.IGNORECASE)
+        # First try: extract from "sql": "..." pattern (handles properly escaped JSON)
+        sql_val_match = re.search(r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+        if sql_val_match:
+            sql_candidate = sql_val_match.group(1).replace('\\"', '"').replace("\\n", "\n")
+            if sql_candidate.strip().upper().startswith("SELECT") and len(sql_candidate.strip()) > 20:
+                return sql_candidate.strip()
+        # Second try: find SELECT...up to end or code fence (handles unescaped quotes)
+        select_match = re.search(r'(SELECT\s.+?)(?:```|\Z)', raw, re.DOTALL | re.IGNORECASE)
         if select_match:
-            return select_match.group(1).strip().rstrip('"').rstrip("'")
+            sql_candidate = select_match.group(1).strip()
+            # Clean trailing JSON artifacts
+            sql_candidate = re.sub(r'"\s*\}?\s*$', '', sql_candidate).strip()
+            sql_candidate = sql_candidate.replace('\\"', '"').replace("\\n", "\n")
+            if sql_candidate.upper().startswith("SELECT"):
+                return sql_candidate
         self._log("sql_parse_failed", f"raw={raw}")
         return ""
 
