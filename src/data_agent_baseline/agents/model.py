@@ -77,6 +77,7 @@ class OpenAIModelAdapter:
             kwargs["temperature"] = self.temperature
         if "qwen" in self.model.lower():
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+            kwargs["temperature"] = 0.6
 
         try:
             response = client.chat.completions.create(**kwargs, timeout=REQUEST_TIMEOUT)
