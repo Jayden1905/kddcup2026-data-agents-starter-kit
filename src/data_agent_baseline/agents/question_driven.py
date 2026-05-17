@@ -1419,9 +1419,8 @@ class QuestionDrivenAgent:
                     if isinstance(v, str) and v.strip().upper().startswith("SELECT"):
                         sql = v
                         break
-            if not sql:
-                self._log("sql_parse_failed", f"No sql key in: {list(parsed.keys())} | raw={raw}")
-            return sql
+            if sql:
+                return sql
         # Try extracting SQL directly from raw text
         # First try: extract from "sql": "..." pattern (handles properly escaped JSON)
         sql_val_match = re.search(r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
