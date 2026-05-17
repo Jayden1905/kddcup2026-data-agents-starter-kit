@@ -1263,6 +1263,12 @@ class QuestionDrivenAgent:
                 sql = _sanitize_sql(sql, db_path)
                 sql = _apply_null_guard(sql)
                 sql = _enforce_grounding_filters(sql, grounding_context, db_path)
+
+                # Break if model repeats a previous SQL (no variation = no point retrying)
+                if sql in failed_sqls:
+                    self._log("sql_repeat", "Model repeated same SQL, stopping retries")
+                    break
+
                 self._log("sql_generated" if attempt == 0 else f"sql_retry_{attempt}", sql)
                 data_result = self._try_sql(db_path, sql)
 
@@ -2877,6 +2883,78 @@ CONSTRAINTS:
                     ))
                 else:
                     errors.append(f"Filter column not in graph: {col_ref}")
+
+        # Deduplicate: same value used on multiple columns in the same table is nonsensical.
+        # Probe DB to find which column actually contains the value, or use LLM to resolve.
+        value_to_nodes: dict[tuple[str, str], list[QueryNode]] = {}
+        for node in filter_nodes:
+            if node.column.startswith("_expr:"):
+                continue
+            key = (node.table.lower(), str(node.value).lower())
+            value_to_nodes.setdefault(key, []).append(node)
+
+        dupes_to_remove: set[int] = set()
+        for (tbl_lower, val_lower), nodes in value_to_nodes.items():
+            if len(nodes) < 2:
+                continue
+            # Probe DB: which column(s) actually contain this value?
+            valid_cols: list[QueryNode] = []
+            if db_path and db_path.exists():
+                try:
+                    conn = sqlite3.connect(str(db_path), timeout=5)
+                    for node in nodes:
+                        try:
+                            cnt = conn.execute(
+                                f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" = ? COLLATE NOCASE',
+                                (node.value,)
+                            ).fetchone()[0]
+                            if cnt > 0:
+                                valid_cols.append(node)
+                        except Exception:
+                            pass
+                    conn.close()
+                except Exception:
+                    pass
+
+            if len(valid_cols) == 1:
+                # Only one column has this value — keep that one, remove others
+                keeper = valid_cols[0]
+                for i, node in enumerate(filter_nodes):
+                    if node in nodes and node is not keeper:
+                        dupes_to_remove.add(i)
+            elif len(valid_cols) == 0:
+                # None have it — keep just the first (LLM's primary pick)
+                for i, node in enumerate(filter_nodes):
+                    if node in nodes[1:]:
+                        dupes_to_remove.add(i)
+            else:
+                # Multiple columns have the value — check which is more specific
+                # The column with FEWER matching rows is more likely the correct filter
+                # (e.g., operation='VYBER' is more specific than type='VYBER')
+                best_node = valid_cols[0]
+                best_count = float("inf")
+                try:
+                    conn2 = sqlite3.connect(str(db_path), timeout=5)
+                    for node in valid_cols:
+                        try:
+                            cnt = conn2.execute(
+                                f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" = ? COLLATE NOCASE',
+                                (node.value,)
+                            ).fetchone()[0]
+                            if cnt < best_count:
+                                best_count = cnt
+                                best_node = node
+                        except Exception:
+                            pass
+                    conn2.close()
+                except Exception:
+                    pass
+                for i, node in enumerate(filter_nodes):
+                    if node in nodes and node is not best_node:
+                        dupes_to_remove.add(i)
+
+        if dupes_to_remove:
+            filter_nodes = [n for i, n in enumerate(filter_nodes) if i not in dupes_to_remove]
 
         return output_nodes, filter_nodes, errors
 
