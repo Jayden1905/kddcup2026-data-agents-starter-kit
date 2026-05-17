@@ -1353,8 +1353,12 @@ def regex_extract(
     # === PHASE 5b: VALUE NORMALIZATION ===
     _normalize_values(records, fields, knowledge_text, db_path, entity_name)
 
-    # === PHASE 6: WRITE TO SQLITE (merge-into-existing or create new) ===
+    # === PHASE 5c: DATE NORMALIZATION ===
+    # Convert natural-language dates to YYYY-MM-DD for consistent comparisons
     record_list = list(records.values())
+    _normalize_dates_in_records(record_list, [f for f in fields if f != "_id"])
+
+    # === PHASE 6: WRITE TO SQLITE (merge-into-existing or create new) ===
 
     written = _merge_or_create(db_path, doc_path.stem, record_list, protected_tables, log_fn)
     if log_fn:
@@ -2206,6 +2210,65 @@ def _merge_into_table(
         return 0
     finally:
         conn.close()
+
+
+_MONTH_MAP = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12",
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+    "jun": "06", "jul": "07", "aug": "08", "sep": "09",
+    "oct": "10", "nov": "11", "dec": "12",
+}
+
+_NL_DATE_RE = re.compile(
+    r'^(?:(?:the\s+)?'
+    r'(?:(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?)?'  # optional day before month
+    r'([A-Za-z]+)'  # month name
+    r'(?:\s+(\d{1,2})(?:st|nd|rd|th)?)?'  # optional day after month
+    r',?\s*(\d{4})'  # year
+    r')$',
+    re.IGNORECASE,
+)
+
+
+def _normalize_date(val: str) -> str:
+    """Convert natural language date to YYYY-MM-DD. Returns original if not parseable."""
+    m = _NL_DATE_RE.match(val.strip())
+    if not m:
+        return val
+    day_before, month_str, day_after, year = m.groups()
+    month_key = month_str.lower().rstrip(".")
+    month = _MONTH_MAP.get(month_key)
+    if not month:
+        return val
+    day = day_before or day_after or "01"
+    return f"{year}-{month}-{int(day):02d}"
+
+
+def _normalize_dates_in_records(records: list[dict[str, Any]], columns: list[str]) -> None:
+    """Detect date columns and normalize values to YYYY-MM-DD in place."""
+    date_cols: set[str] = set()
+    for col in columns:
+        if col == "_id":
+            continue
+        nl_count = 0
+        sample_count = 0
+        for r in records[:30]:
+            v = r.get(col)
+            if not isinstance(v, str) or not v:
+                continue
+            sample_count += 1
+            if _NL_DATE_RE.match(v.strip()):
+                nl_count += 1
+        if sample_count >= 3 and nl_count >= sample_count * 0.5:
+            date_cols.add(col)
+
+    for col in date_cols:
+        for r in records:
+            v = r.get(col)
+            if isinstance(v, str) and v:
+                r[col] = _normalize_date(v)
 
 
 def _write_new_table(

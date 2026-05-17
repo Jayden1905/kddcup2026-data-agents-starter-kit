@@ -2209,6 +2209,13 @@ RULES:
                 pass  # fall through to repick below
 
         if sanity_issues:
+            # Detect if sanity issues are output-only (no filter corrections needed)
+            _sanity_is_output_only = (
+                ("output" in sanity_issues.lower() or "select the" in sanity_issues.lower())
+                and "filter" not in sanity_issues.lower()
+                and "Add a" not in sanity_issues
+            )
+
             # Re-prompt with sanity feedback
             repicked = self._pick_graph_nodes(
                 question, kg, anchor_text,
@@ -2220,7 +2227,10 @@ RULES:
                 if new_output:
                     picked = repicked
                     output_nodes = new_output
-                    filter_nodes = new_filter
+                    if _sanity_is_output_only and filter_nodes:
+                        pass
+                    else:
+                        filter_nodes = new_filter
                     # Strip spurious filters the repick may have re-introduced
                     filter_nodes = self._strip_spurious_filters(question, filter_nodes, user_intent, db_path)
                     self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
@@ -2406,7 +2416,10 @@ RULES:
         # --- Step 3 post-a2: Resolve FK output columns to their display value ---
         # If the output column is a foreign key (link_to_X, X_id with FK edge), replace it
         # with the human-readable label column from the referenced table.
-        output_nodes = self._resolve_fk_output_columns(output_nodes, kg, db_path)
+        # Skip for aggregate operations — the FK column is being counted/summed, not displayed.
+        _comp_type_for_resolve = picked.get("computation_type", "simple_lookup")
+        if _comp_type_for_resolve not in ("avg", "count", "count_distinct", "sum", "ratio", "percentage"):
+            output_nodes = self._resolve_fk_output_columns(output_nodes, kg, db_path)
 
         # --- Step 3 post-b: List+lookup → PK when no attribute column named in question ---
         # If shape=list, operation=lookup, and the question doesn't mention any non-PK column
@@ -3514,9 +3527,18 @@ CONSTRAINTS:
                     probed.append(node)
                     continue
 
-                # --- FK value resolution: numeric ID on _id column may be wrong ---
-                if (question and kg and str(node.value).isdigit()
-                        and node.column.lower().endswith("_id")):
+                # --- FK value resolution: ID on FK column may be wrong ---
+                _col_lower = node.column.lower()
+                _val_str = str(node.value)
+                _is_fk_col = (
+                    _col_lower.endswith("_id") or _col_lower.startswith("link_to")
+                    or _col_lower.endswith("id")
+                )
+                _is_opaque_id = (
+                    _val_str.isdigit()
+                    or re.match(r'^rec[A-Za-z0-9]{10,}$', _val_str)
+                )
+                if question and kg and _is_fk_col and _is_opaque_id:
                     resolved = self._resolve_fk_value(node, conn, kg, question)
                     if resolved:
                         probed.append(resolved)
@@ -3950,14 +3972,11 @@ CONSTRAINTS:
         col_id = f"{node.table}.{node.column}"
         display_col_id = g.fk_display_map.get(col_id)
         if not display_col_id:
-            # Try to find FK target from table schema
-            table_schema = kg.get_table(node.table)
-            if not table_schema:
-                return None
+            # Try to find FK target from all FKs (declared + inferred)
             ref_table = None
             ref_col = None
-            for fk in table_schema.foreign_keys:
-                if fk.column == node.column:
+            for src_tbl, fk in kg.all_foreign_keys():
+                if src_tbl == node.table and fk.column == node.column:
                     ref_table = fk.ref_table
                     ref_col = fk.ref_column
                     break
@@ -3983,12 +4002,10 @@ CONSTRAINTS:
 
         # Get FK target (the PK column in the referenced table)
         fk_target_col = None
-        table_schema = kg.get_table(node.table)
-        if table_schema:
-            for fk in table_schema.foreign_keys:
-                if fk.column == node.column:
-                    fk_target_col = fk.ref_column
-                    break
+        for src_tbl, fk in kg.all_foreign_keys():
+            if src_tbl == node.table and fk.column == node.column:
+                fk_target_col = fk.ref_column
+                break
         if not fk_target_col:
             fk_target_col = "id"
 
@@ -3996,11 +4013,28 @@ CONSTRAINTS:
         q_words = set(re.findall(r'\b[a-z]{3,}\b', question.lower()))
 
         # Query display values and find the one matching a question word
+        # Also try multi-column name matching (first_name + last_name)
         try:
-            rows = conn.execute(
-                f'SELECT "{fk_target_col}", "{disp_col}" FROM "{disp_table}" '
-                f'WHERE "{disp_col}" IS NOT NULL'
-            ).fetchall()
+            ref_schema = kg.get_table(disp_table)
+            text_cols = [
+                c.name for c in (ref_schema.columns if ref_schema else [])
+                if c.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR", "")
+                and c.name != fk_target_col
+            ]
+            # Build concatenated name query if multiple name-like columns exist
+            name_cols = [c for c in text_cols if any(
+                k in c.lower() for k in ("name", "first", "last", "surname", "forename")
+            )]
+            if len(name_cols) >= 2:
+                concat_expr = " || ' ' || ".join(f'"{c}"' for c in name_cols)
+                rows = conn.execute(
+                    f'SELECT "{fk_target_col}", {concat_expr} FROM "{disp_table}"'
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f'SELECT "{fk_target_col}", "{disp_col}" FROM "{disp_table}" '
+                    f'WHERE "{disp_col}" IS NOT NULL'
+                ).fetchall()
         except Exception:
             return None
 
@@ -4009,13 +4043,39 @@ CONSTRAINTS:
         q_lower = question.lower()
         candidates = []
         for row_id, display_val in rows:
-            dv_lower = str(display_val).lower()
+            dv_lower = str(display_val).lower().strip()
             if dv_lower in q_words:
                 candidates.append((len(dv_lower), str(row_id), str(display_val)))
             elif len(dv_lower) >= 3 and re.search(r'\b' + re.escape(dv_lower) + r'\b', q_lower):
                 candidates.append((len(dv_lower), str(row_id), str(display_val)))
         if candidates:
             candidates.sort(key=lambda x: -x[0])
+            # Disambiguate ties: when multiple IDs share the same display value,
+            # check other columns (e.g. year) against question context
+            top_len = candidates[0][0]
+            tied = [c for c in candidates if c[0] == top_len]
+            if len(tied) > 1:
+                q_numbers = re.findall(r'\b((?:19|20)\d{2})\b', question)
+                if q_numbers and ref_schema:
+                    year_cols = [c.name for c in ref_schema.columns
+                                 if any(k in c.name.lower() for k in ("year", "date"))]
+                    if year_cols:
+                        year_col = year_cols[0]
+                        tied_ids = [c[1] for c in tied]
+                        placeholders = ",".join("?" * len(tied_ids))
+                        try:
+                            disambig_rows = conn.execute(
+                                f'SELECT "{fk_target_col}", "{year_col}" FROM "{disp_table}" '
+                                f'WHERE "{fk_target_col}" IN ({placeholders})',
+                                tuple(tied_ids),
+                            ).fetchall()
+                            for row_id, year_val in disambig_rows:
+                                year_str = str(year_val).strip()
+                                if any(y in year_str for y in q_numbers):
+                                    candidates = [(top_len, str(row_id), tied[0][2])]
+                                    break
+                        except Exception:
+                            pass
             best_id = candidates[0][1]
             best_match = candidates[0][2]
 
@@ -5066,9 +5126,32 @@ RULES:
                             fv_lines.append(f'  "{node.table}"."{node.column}": USE → WHERE "{node.column}" LIKE \'{like_val}\' COLLATE NOCASE')
                     else:
                         fv_lines.append(f'  "{node.table}"."{node.column}": {node.operator} {node.value}')
+                        # When comparing a year value against a TEXT date column,
+                        # hint the LLM to use proper date/year extraction
+                        val_str = str(node.value)
+                        if (node.operator in ("<", ">", "<=", ">=")
+                                and re.match(r'^(19|20)\d{2}$', val_str)
+                                and db_path and db_path.exists()):
+                            try:
+                                _dc = sqlite3.connect(str(db_path), timeout=5)
+                                _sample = _dc.execute(
+                                    f'SELECT "{node.column}" FROM "{node.table}" '
+                                    f'WHERE "{node.column}" IS NOT NULL LIMIT 5'
+                                ).fetchall()
+                                _dc.close()
+                                _has_dates = any(
+                                    re.match(r'^\d{4}-\d{2}-\d{2}', str(s[0]))
+                                    for s in _sample if s[0]
+                                )
+                                if _has_dates:
+                                    fv_lines.append(
+                                        f'  ⚠️ DATE COLUMN: "{node.column}" stores dates as YYYY-MM-DD text. '
+                                        f'Compare using: "{node.column}" {node.operator} \'{val_str}-01-01\''
+                                    )
+                            except Exception:
+                                pass
                         # Subquery scope propagation: if value is a subquery with WHERE,
                         # those conditions must ALSO apply in the outer query
-                        val_str = str(node.value)
                         if val_str.lstrip().upper().startswith("(SELECT") or val_str.lstrip().upper().startswith("SELECT"):
                             where_match = re.search(r'\bWHERE\s+(.+?)(?:\)$|\bGROUP\b|\bORDER\b|\bLIMIT\b)', val_str, re.IGNORECASE)
                             if where_match:
@@ -5332,6 +5415,33 @@ RULES:
                         continue
                     seen_cols.add(key)
                     try:
+                        # Skip date columns — CAST to REAL gives garbage for date text
+                        _sample_vals = conn.execute(
+                            f'SELECT "{f.column}" FROM "{f.table}" '
+                            f'WHERE "{f.column}" IS NOT NULL LIMIT 5'
+                        ).fetchall()
+                        _is_date_col = any(
+                            re.match(r'^\d{4}-\d{2}-\d{2}', str(s[0]))
+                            for s in _sample_vals if s[0]
+                        )
+                        if _is_date_col:
+                            _min_date = conn.execute(
+                                f'SELECT MIN("{f.column}") FROM "{f.table}" '
+                                f'WHERE "{f.column}" IS NOT NULL'
+                            ).fetchone()
+                            _max_date = conn.execute(
+                                f'SELECT MAX("{f.column}") FROM "{f.table}" '
+                                f'WHERE "{f.column}" IS NOT NULL'
+                            ).fetchone()
+                            cnt = conn.execute(
+                                f'SELECT COUNT(*) FROM "{f.table}" '
+                                f'WHERE "{f.column}" IS NOT NULL'
+                            ).fetchone()[0]
+                            dist_lines.append(
+                                f'  "{f.table}"."{f.column}": DATE column (YYYY-MM-DD), '
+                                f'range=[{_min_date[0]}..{_max_date[0]}], {cnt} records'
+                            )
+                            continue
                         row = conn.execute(
                             f'SELECT MIN(CAST("{f.column}" AS REAL)), '
                             f'MAX(CAST("{f.column}" AS REAL)), '
