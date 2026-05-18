@@ -274,6 +274,10 @@ class GroundingFormatMixin:
             parts.append(
                 "RESULT TYPE: grouped_list — answer is a list/breakdown across categories (multiple rows)"
             )
+        elif comp_type == "count_distinct":
+            parts.append(
+                "RESULT TYPE: count_distinct — use SELECT DISTINCT to return unique values only"
+            )
         else:
             parts.append(f"RESULT TYPE: {comp_type}")
 

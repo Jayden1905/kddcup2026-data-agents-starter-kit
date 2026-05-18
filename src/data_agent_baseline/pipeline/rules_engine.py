@@ -765,7 +765,14 @@ def rule_ratio_pattern(ctx: EngineContext) -> RuleResult | None:
     # Distinguish value ratio (A/B) from percentage (subset/population * 100).
     # Structural signal: if any output column is numeric (measurement like milliseconds,
     # amount, score) → comparing values, not counting rows. Skip the COUNT template.
+    # Exception: if the numeric column also appears in filter_nodes as a range condition,
+    # it defines the population, not a value being compared.
     is_value_ratio = False
+    _range_filter_cols: set[str] = set()
+    if ctx.filter_nodes:
+        for fn in ctx.filter_nodes:
+            if fn.operator in (">=", "<=", ">", "<", "BETWEEN"):
+                _range_filter_cols.add(f"{fn.table}.{fn.column}".lower())
     if ctx.output_nodes and ctx.db_path:
         try:
             _conn = sqlite3.connect(str(ctx.db_path), timeout=5)
@@ -777,6 +784,9 @@ def rule_ratio_pattern(ctx: EngineContext) -> RuleResult | None:
                     or col_lower.endswith("_id") or col_lower.endswith("id")
                 )
                 if is_id_col:
+                    continue
+                # Columns used as range filters define the population, not a compared value
+                if f"{_node.table}.{col_lower}".lower() in _range_filter_cols:
                     continue
                 col_info = _conn.execute(f'PRAGMA table_info("{_node.table}")').fetchall()
                 for ci in col_info:
@@ -1516,6 +1526,8 @@ def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = No
                 val_str = str(f.value).strip()
                 if val_str.lstrip("(").lower().startswith("select"):
                     continue
+                if re.match(r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', f.column, re.IGNORECASE):
+                    continue
                 if f.operator == "IS NOT NULL":
                     parts.append(f'"{other_table}"."{f.column}" IS NOT NULL')
                 elif f.operator.upper() == "IN":
@@ -1537,6 +1549,8 @@ def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = No
                 expr_sql = f.column[len("_expr:"):]
                 parts.append(f'{expr_sql} {f.operator} ?')
                 params.append(f.value)
+                continue
+            if re.match(r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', f.column, re.IGNORECASE):
                 continue
             val_str = str(f.value).strip()
             if val_str.lstrip("(").lower().startswith("select"):
@@ -1570,6 +1584,12 @@ def _probe_result_count(ctx: EngineContext, filters: list[QueryNode] | None = No
 
 def _assess_plausibility(ctx: EngineContext) -> PlausibilityReport:
     """Multi-signal plausibility check — goes beyond just zero-result detection."""
+    # For ratio/percentage: 0 combined results is a valid answer (0%).
+    # The SQL uses a subquery denominator pattern — the adaptive loop should never
+    # "fix" filters that produce a legitimate 0% result.
+    if ctx.comp_type in ("ratio", "percentage"):
+        return PlausibilityReport(is_plausible=True, result_count=-1)
+
     result_count = _probe_result_count(ctx)
 
     # Signal 1: Zero results

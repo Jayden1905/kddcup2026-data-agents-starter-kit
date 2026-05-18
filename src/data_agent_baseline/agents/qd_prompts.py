@@ -462,8 +462,23 @@ def _format_grounding_for_sql(grounding: dict[str, Any]) -> str:
         parts.append(f"REFERENCE FORMULA (logic only — use FILTER VALUES for actual values):\n  {display_formula.strip()}")
 
     # Join paths (factual FK relationships)
+    # For ratio computations with filters on different tables, counts are independent —
+    # a JOIN would collapse them. Suppress join paths and hint scalar subqueries.
     join_paths = grounding.get("join_paths", [])
-    if join_paths:
+    comp_type = grounding.get("computation_type", "")
+    known_values = grounding.get("known_values", {})
+    _filter_tables = {k.split(".")[0] for k in known_values if "." in k}
+    _is_independent_ratio = (
+        comp_type == "ratio" and len(_filter_tables) >= 2 and formula
+        and ("count" in formula.lower() or "sum" in formula.lower())
+    )
+    if _is_independent_ratio:
+        parts.append(
+            "INDEPENDENT COUNTS: The numerator and denominator filter DIFFERENT tables. "
+            "Do NOT JOIN them. Use two scalar subqueries: "
+            "SELECT (SELECT COUNT(...) FROM tableA WHERE ...) / (SELECT COUNT(...) FROM tableB WHERE ...)"
+        )
+    elif join_paths:
         parts.append("JOIN PATHS:\n" + "\n".join(f"  {jp}" for jp in join_paths))
 
     # Filter values

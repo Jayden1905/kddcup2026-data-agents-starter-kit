@@ -26,7 +26,9 @@ class FilterProcessingMixin:
         try:
             conn = sqlite3.connect(str(db_path))
             for node in filter_nodes:
-                if node.column.startswith("_expr:"):
+                if node.column.startswith("_expr:") or re.match(
+                    r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', node.column, re.IGNORECASE
+                ):
                     probed.append(node)
                     continue
                 if node.operator not in ("=", "LIKE"):
@@ -746,7 +748,7 @@ class FilterProcessingMixin:
                             return m.group(1)
         return None
 
-    def _reconcile_date_format(node: QueryNode, sample_vals: list[str]) -> QueryNode | None:
+    def _reconcile_date_format(self, node: QueryNode, sample_vals: list[str]) -> QueryNode | None:
         """When a filter value doesn't match DB values, try to reconcile date formats.
 
         Extracts year/month/day components from the filter value, detects the
@@ -1017,6 +1019,12 @@ class FilterProcessingMixin:
                 continue
             node_col_words = set(re.findall(r'[a-z]+', node.column.lower()))
             current_score = _stem_match_score(node_col_words, q_words_set)
+            # Don't override if value validates in current column — unless
+            # an alternative has a much stronger question-word match (score >= 2)
+            _value_validates = db_path and self._db_check(
+                db_path, node.table, node.column, node.operator, node.value
+            )
+            _require_strong_alt = _value_validates
 
             best_alt = None
             best_alt_score = current_score
@@ -1044,6 +1052,10 @@ class FilterProcessingMixin:
                 best_alt_score = alt_score
 
             if best_alt and best_alt_score > current_score:
+                # When value already validates in current column, require strong alt match
+                if _require_strong_alt and best_alt_score < 2:
+                    fixed3.append(node)
+                    continue
                 val = str(node.value)
                 if node.operator == "LIKE" and "%" not in val:
                     val = f"%{val}%"
@@ -1143,7 +1155,9 @@ class FilterProcessingMixin:
             _sel_conn = sqlite3.connect(str(db_path))
             filter_tables = {n.table for n in filter_nodes}
             for node in filter_nodes:
-                if node.operator != "=" or node.column.startswith("_expr:"):
+                if node.operator != "=" or node.column.startswith("_expr:") or re.match(
+                    r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', node.column, re.IGNORECASE
+                ):
                     continue
                 _sel_total = _sel_conn.execute(
                     f'SELECT COUNT(*) FROM "{node.table}"'
@@ -1176,7 +1190,9 @@ class FilterProcessingMixin:
         try:
             conn = sqlite3.connect(str(db_path))
             for node in filter_nodes:
-                if node.column.startswith("_expr:"):
+                if node.column.startswith("_expr:") or re.match(
+                    r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', node.column, re.IGNORECASE
+                ):
                     continue
                 if node.operator in ("LIKE",):
                     continue

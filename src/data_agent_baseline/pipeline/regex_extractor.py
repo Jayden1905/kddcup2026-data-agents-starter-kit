@@ -454,6 +454,26 @@ class FieldExtractor:
         return raw
 
 
+class VocabularyExtractor(FieldExtractor):
+    """Categorical extractor that uses plain substring matching against known values.
+
+    No regex — just checks if any known value appears literally in the text.
+    Longer values are checked first to prefer specific matches (e.g., "Speaker Gifts"
+    over "Speaker"). Returns None if no known value is found (gap-fill handles it).
+    """
+
+    def __init__(self, field_name: str, known_values: list[str]):
+        super().__init__(field_name, "categorical", [])
+        self.known_values = sorted(known_values, key=len, reverse=True)
+
+    def extract(self, text: str) -> Any | None:
+        text_lower = text.lower()
+        for val in self.known_values:
+            if val.lower() in text_lower:
+                return val
+        return None
+
+
 # Correction pattern: detects "initially X, corrected/confirmed to Y"
 _CORRECTION_RE = re.compile(
     r"(?:initially|originally|first)\s+(?:logged|recorded|reported|"
@@ -1223,7 +1243,6 @@ def regex_extract(
     # === PHASE 3: CALIBRATE (2 calls) ===
     # Pick diverse sample paragraphs, extract via LLM, use results to
     # learn document-specific extraction patterns
-    extractors = _build_extractors(fields, entity_name, db_path, knowledge_text)
     non_id_fields = [f for f in fields if f != "_id"]
 
     if non_id_fields and llm_calls_used < _MAX_LLM_CALLS:
@@ -1235,6 +1254,24 @@ def regex_extract(
             log_fn("regex_calibrate", f"Calibrated from {len(calibration_records)} LLM-extracted records")
     else:
         calibration_records = {}
+
+    # Build extractors AFTER calibration: for categorical fields where
+    # calibration discovered string values, use VocabularyExtractor (plain
+    # substring match) instead of fragile regex patterns.
+    _calibrated_vocab: dict[str, list[str]] = {}
+    if calibration_records:
+        for rec in calibration_records.values():
+            for f in non_id_fields:
+                v = rec.get(f)
+                if v is not None and isinstance(v, str) and len(v) >= 2:
+                    _calibrated_vocab.setdefault(f, []).append(v)
+        for f in list(_calibrated_vocab):
+            _calibrated_vocab[f] = list(set(_calibrated_vocab[f]))
+
+    extractors = _build_extractors(
+        fields, entity_name, db_path, knowledge_text,
+        calibrated_vocab=_calibrated_vocab,
+    )
 
     if log_fn:
         log_fn("regex_extractors", f"Built {len(extractors)} field extractors")
@@ -1558,9 +1595,10 @@ def _gap_fill(
             if rid in gap_paras:
                 gap_paras[rid].append(para)
 
-    # Batch gap paragraphs — 8 entities per call (conservative for small models)
-    batch_size = 8
-    gap_items = [(rid, "\n".join(ps[:2])[:600]) for rid, ps in gap_paras.items() if ps]
+    # Batch gap paragraphs — use larger batches to maximize coverage within budget.
+    # 20 records × ~600 chars = ~12K chars per call, well within model capacity.
+    batch_size = 20
+    gap_items = [(rid, "\n".join(ps)[:800]) for rid, ps in gap_paras.items() if ps]
 
     # Prioritize records referenced by FK columns in structured tables
     referenced_ids: set[str] = set()
@@ -1811,12 +1849,18 @@ def _get_sample_ids_from_db(db_path: Path, entity_name: str) -> list[str]:
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
         entity_lower = entity_name.lower()
+        # Also match singular form (e.g., "races" → "race" matches "raceId")
+        entity_stems = {entity_lower}
+        if entity_lower.endswith("s"):
+            entity_stems.add(entity_lower[:-1])
+        if entity_lower.endswith("es"):
+            entity_stems.add(entity_lower[:-2])
         for (tname,) in tables:
             cols = conn.execute(f'PRAGMA table_info("{tname}")').fetchall()
             for col in cols:
                 col_name = col[1].lower()
                 # Look for FK columns referencing this entity
-                if entity_lower in col_name and ("id" in col_name or "key" in col_name or "link" in col_name):
+                if any(stem in col_name for stem in entity_stems) and ("id" in col_name or "key" in col_name or "link" in col_name):
                     # Sample from different parts of the range to avoid
                     # prefix bias (e.g., LIMIT 20 on sorted IDs gives TR000-TR019)
                     total = conn.execute(
@@ -1843,7 +1887,7 @@ def _get_sample_ids_from_db(db_path: Path, entity_name: str) -> list[str]:
                     conn.close()
                     return [str(r[0]) for r in rows if r[0]]
             # Also check: table name contains entity and has an ID column
-            if entity_lower in tname.lower():
+            if any(stem in tname.lower() for stem in entity_stems):
                 id_col = next((c[1] for c in cols if c[1].lower() == "id"), None)
                 if id_col:
                     total = conn.execute(
@@ -1931,6 +1975,7 @@ def _build_extractors(
     entity_name: str,
     db_path: Path,
     knowledge_text: str,
+    calibrated_vocab: dict[str, list[str]] | None = None,
 ) -> list[FieldExtractor]:
     """Build field extractors based on field names and knowledge."""
     extractors: list[FieldExtractor] = []
@@ -2032,11 +2077,17 @@ def _build_extractors(
             patterns = _build_text_patterns(field)
             extractors.append(FieldExtractor(field, "text", patterns))
         elif "category" in field_lower or "type" in field_lower or "label" in field_lower:
-            patterns = _build_categorical_patterns(field)
-            extractors.append(FieldExtractor(field, "categorical", patterns))
+            vocab = (calibrated_vocab or {}).get(field)
+            if vocab:
+                extractors.append(VocabularyExtractor(field, vocab))
+            else:
+                patterns = _build_categorical_patterns(field)
+                extractors.append(FieldExtractor(field, "categorical", patterns))
         elif ftype == "text":
             patterns = _build_text_patterns(field)
             extractors.append(FieldExtractor(field, "text", patterns))
+        elif (calibrated_vocab or {}).get(field):
+            extractors.append(VocabularyExtractor(field, calibrated_vocab[field]))
         else:
             # Default: try numeric then text
             patterns = _build_numeric_patterns(field)

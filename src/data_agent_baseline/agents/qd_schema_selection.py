@@ -37,6 +37,7 @@ HOW TO DECIDE:
    - "What is the eye colour" → user wants to see COLOUR VALUES
    - "How many members attended" → user wants to see a COUNT
    - "List their ID, sex and disease" → user wants to see ID, SEX, DISEASE columns
+   - "Tally the element" / "What are the different types" → user wants DISTINCT values (use count_distinct)
 
 2. Identify: WHO/WHAT constrains the data?
    - "Which race was ALEX YOONG in" → Alex Yoong is the filter (find rows about this person)
@@ -48,10 +49,29 @@ HOW TO DECIDE:
    - "What is the SURNAME of the driver" → entity_of_interest = driver (we return driver attributes)
    - "eye COLOUR of the superhero" → entity_of_interest = colour (we return from colour table)
 
+4. operation guide:
+   - lookup: retrieve specific values for specific entities (no aggregation)
+   - count: "how many" → a single number
+   - count_distinct: "tally", "enumerate", "what different/unique X" → SELECT DISTINCT (list of unique values)
+   - sum/avg/ratio/percentage: arithmetic aggregation
+   - rank: "top N", "highest", "most"
+
+5. For PERCENTAGE questions ("what is the percentage of X in Y" / "In Y, what % are X"):
+   - who_to_filter_on = the POPULATION (denominator) — the broader group being measured
+   - what_to_return = the SUBSET CONDITION (numerator) — what you're counting within that population
+   - Example: "In employees aged 30-40, what is the percentage earning above 50k?"
+     → who_to_filter_on = "aged 30 to 40" (population)
+     → what_to_return = "earning above 50k" (subset being measured)
+   - Example: "What percentage of orders shipped domestically were returned?"
+     → who_to_filter_on = "shipped domestically" (population)
+     → what_to_return = "returned" (subset being measured)
+
 COMMON MISTAKES TO AVOID:
 - "Which race was X in" → entity is RACE not driver. The driver is the filter, not the output.
 - "What is the colour of X" → if colour is stored in a lookup table, entity is the LOOKUP table.
-- Do NOT confuse the filter entity with the output entity."""
+- Do NOT confuse the filter entity with the output entity.
+- "Tally" / "enumerate" / "what are the different" → operation is count_distinct, NOT lookup.
+- For percentage: do NOT merge population and subset into one filter. Keep them separate."""
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:

@@ -393,11 +393,19 @@ RULES:
             return ""
 
         # --- Find the numeric output column ---
+        # Prefer the column whose name appears in the formula text
         computation_type = (picked.get("computation_type") or "").lower()
+        formula_lower = formula.lower()
         numeric_col = None
         for node in output_nodes:
-            if node.role == "output":
-                numeric_col = f'"{node.table}"."{node.column}"'
+            if node.role != "output":
+                continue
+            col_ref = f'"{node.table}"."{node.column}"'
+            if node.column.lower() in formula_lower:
+                numeric_col = col_ref
+                break
+            if not numeric_col:
+                numeric_col = col_ref
 
         if not numeric_col:
             return ""

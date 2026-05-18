@@ -191,12 +191,11 @@ class KGPlanningMixin:
                 self._log("kg_repicked", json.dumps(repicked, default=str))
                 new_output, new_filter, _ = self._validate_picked_nodes(repicked, kg, db_path)
                 if new_output:
-                    _orig_comp_type = picked.get("computation_type", "simple_lookup")
                     picked = repicked
-                    # Preserve original computation_type if repick downgraded it
-                    if _orig_comp_type in ("sum", "avg", "count", "count_distinct", "ratio", "percentage"):
-                        if repicked.get("computation_type") == "simple_lookup":
-                            picked["computation_type"] = _orig_comp_type
+                    # Repick fixes filters/columns — never override the authoritative
+                    # computation_type from deterministic intent detection.
+                    if _det_comp_type:
+                        picked["computation_type"] = _det_comp_type
                     output_nodes = new_output
                     if _sanity_is_output_only and filter_nodes:
                         pass
