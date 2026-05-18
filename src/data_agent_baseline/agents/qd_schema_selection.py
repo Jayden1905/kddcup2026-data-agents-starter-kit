@@ -21,57 +21,97 @@ class SchemaSelectionMixin:
         domain_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:1000]}\n" if anchor_text else ""
         prompt = f"""QUESTION: {question}
 {schema_section}{domain_section}
-Decompose this question into its analytical intent. Return ONLY JSON:
+You are decomposing a data question into structured analytical signals. Think step by step about what the question is REALLY asking, then output JSON.
+
+STEP 1 — UNDERSTAND THE ANSWER
+Imagine the final answer printed on paper. What does it look like?
+- A single number or value? → answer_shape = "single_value"
+- A list of items (names, IDs, dates)? → answer_shape = "list"
+- A table with categories and their values? → answer_shape = "grouped_table"
+
+STEP 2 — IDENTIFY THE COMPUTATION
+Ask: "Can I answer this by simply reading a stored value, or do I need to CALCULATE something?"
+
+| The answer is...                                              | operation      |
+|---------------------------------------------------------------|----------------|
+| A value already stored in a column (name, date, status)       | lookup         |
+| The result of adding up values across rows                    | sum            |
+| The result of averaging values across rows                    | avg            |
+| A count of how many rows match a condition                    | count          |
+| A list of unique/distinct items (enumerate categories)        | count_distinct |
+| A fraction: subset-count divided by total-count × 100         | percentage     |
+| A fraction: one measurement divided by another measurement    | ratio          |
+| The item that scores highest/lowest on some measure           | rank           |
+| The extreme value itself (not which item has it)              | min_max        |
+
+Key distinction: if the question asks "WHICH item has the highest X" → rank (we return the item).
+If the question asks "WHAT IS the highest X" → min_max (we return the value itself).
+
+STEP 3 — SEPARATE OUTPUT FROM FILTER
+Every question has two parts:
+- OUTPUT: what the user wants to SEE in the answer (the columns they'd read)
+- FILTER: what constrains WHICH rows to look at (the conditions that narrow the data)
+
+The trick: the entity being filtered is NOT the entity being returned.
+- "What courses does Professor Smith teach?" → OUTPUT = course names, FILTER = Professor Smith
+- "Which department has the most employees?" → OUTPUT = department name, FILTER = none (all departments), but rank by employee count
+
+entity_of_interest = the table/entity whose attributes appear in the OUTPUT.
+
+STEP 4 — DETECT STRUCTURAL PATTERNS
+
+A. GROUP CONDITION — does the question require counting/summing within groups FIRST, then filtering on that aggregate?
+   Pattern: "entities that have [aggregate condition] on their related items"
+   - "departments with more than 5 employees" → group_condition = "more than 5 employees"
+   - "products that sold over 100 units" → group_condition = "sold over 100 units"
+   - "authors who published at least 3 books" → group_condition = "published at least 3 books"
+   This is fundamentally different from a simple row filter. It requires GROUP BY + HAVING.
+   If the threshold applies to individual rows (not a count/sum across rows) → NOT a group condition.
+
+B. TEMPORAL CONSTRAINT — does the question restrict to a time period?
+   - Any year, month, date range, season, or relative time reference ("last year", "in 2019", "before Q3")
+   - null if no time constraint is mentioned
+
+C. POSITIONAL SELECTOR — does the question ask for the Nth item in some ordering?
+   - "the 3rd most expensive", "runner-up", "champion", "last place", "second oldest"
+   - This implies ORDER BY + positional selection
+   - null if no position is implied
+
+D. SORT DIRECTION — if a superlative or comparison is implied:
+   - "highest", "most", "best", "latest", "newest", "largest" → DESC
+   - "lowest", "least", "worst", "earliest", "oldest", "smallest" → ASC
+   - null if no ordering is needed
+
+STEP 5 — PERCENTAGE / RATIO DECOMPOSITION
+For percentage questions, identify TWO populations:
+- POPULATION (denominator): the broader group — goes in who_to_filter_on
+- SUBSET (numerator): the condition that selects items WITHIN the population — goes in what_to_return
+
+Example: "Among tall employees, what percentage are managers?"
+→ who_to_filter_on = "tall employees" (population = denominator)
+→ what_to_return = "managers" (subset = numerator)
+
+For ratio questions, identify which TWO measurements are being divided.
+
+STEP 6 — GRAIN
+- "one answer for entire dataset" — the question expects a single result (a count, a name, a total)
+- "one row per entity" — the answer lists multiple items (all names, all IDs matching a condition)
+- "one row per group" — the answer is grouped (per category, per year, per department)
+
+Now return ONLY this JSON (no other text):
 {{
   "answer_shape": "single_value | list | grouped_table",
   "operation": "lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | rank",
   "grain": "one answer for entire dataset | one row per entity | one row per group",
-  "what_to_return": "the THING the user wants to see in the answer (e.g. 'race names', 'eye colour', 'total cost')",
-  "who_to_filter_on": "the NAMED ENTITY or CONDITION that selects the subset (e.g. 'Alex Yoong', 'Women\\'s Soccer', 'race 19')",
-  "entity_of_interest": "the database entity whose attributes the user wants RETURNED (not the filter entity)"
-}}
-
-HOW TO DECIDE:
-1. Read the question and identify: WHAT does the user want to SEE in the result?
-   - "Which race was X in" → user wants to see RACE NAMES
-   - "What is the eye colour" → user wants to see COLOUR VALUES
-   - "How many members attended" → user wants to see a COUNT
-   - "List their ID, sex and disease" → user wants to see ID, SEX, DISEASE columns
-   - "Tally the element" / "What are the different types" → user wants DISTINCT values (use count_distinct)
-
-2. Identify: WHO/WHAT constrains the data?
-   - "Which race was ALEX YOONG in" → Alex Yoong is the filter (find rows about this person)
-   - "the driver with the BEST lap time" → best is a superlative (ORDER BY, not a filter value)
-   - "in RACE NUMBER 19" → race 19 is a filter
-
-3. entity_of_interest = the entity whose ATTRIBUTES appear in the output.
-   - "Which RACE was Alex Yoong in" → entity_of_interest = race (we return race attributes)
-   - "What is the SURNAME of the driver" → entity_of_interest = driver (we return driver attributes)
-   - "eye COLOUR of the superhero" → entity_of_interest = colour (we return from colour table)
-
-4. operation guide:
-   - lookup: retrieve specific values for specific entities (no aggregation)
-   - count: "how many" → a single number
-   - count_distinct: "tally", "enumerate", "what different/unique X" → SELECT DISTINCT (list of unique values)
-   - sum/avg/ratio/percentage: arithmetic aggregation
-   - rank: "top N", "highest", "most"
-
-5. For PERCENTAGE questions ("what is the percentage of X in Y" / "In Y, what % are X"):
-   - who_to_filter_on = the POPULATION (denominator) — the broader group being measured
-   - what_to_return = the SUBSET CONDITION (numerator) — what you're counting within that population
-   - Example: "In employees aged 30-40, what is the percentage earning above 50k?"
-     → who_to_filter_on = "aged 30 to 40" (population)
-     → what_to_return = "earning above 50k" (subset being measured)
-   - Example: "What percentage of orders shipped domestically were returned?"
-     → who_to_filter_on = "shipped domestically" (population)
-     → what_to_return = "returned" (subset being measured)
-
-COMMON MISTAKES TO AVOID:
-- "Which race was X in" → entity is RACE not driver. The driver is the filter, not the output.
-- "What is the colour of X" → if colour is stored in a lookup table, entity is the LOOKUP table.
-- Do NOT confuse the filter entity with the output entity.
-- "Tally" / "enumerate" / "what are the different" → operation is count_distinct, NOT lookup.
-- For percentage: do NOT merge population and subset into one filter. Keep them separate."""
+  "what_to_return": "describe what appears in the output (the thing the user reads)",
+  "who_to_filter_on": "the named entity, condition, or population that narrows the data",
+  "entity_of_interest": "the database entity whose attributes are RETURNED (not the filter entity)",
+  "group_condition": "aggregate condition on groups (e.g. 'more than 5 orders') or null",
+  "columns_needed": ["column concepts needed in the answer"],
+  "temporal_filter": "time constraint mentioned in the question, or null",
+  "ordinal": "positional selector (1st, 2nd, last, champion, runner-up) or null",
+  "sort_direction": "ASC or DESC if ordering is implied, or null"
+}}"""
 
         messages = [ModelMessage(role="user", content=prompt)]
         try:
@@ -91,6 +131,18 @@ COMMON MISTAKES TO AVOID:
                     lines.append(f"Metric (SELECT): {parsed['what_to_return']}")
                 if parsed.get("entity_of_interest"):
                     lines.append(f"Entity of interest: {parsed['entity_of_interest']} (prefer this table's columns for output)")
+                if parsed.get("group_condition"):
+                    lines.append(f"Group condition (HAVING): {parsed['group_condition']}")
+                if parsed.get("columns_needed"):
+                    cols = parsed["columns_needed"]
+                    if isinstance(cols, list) and cols:
+                        lines.append(f"Columns needed: {', '.join(str(c) for c in cols)}")
+                if parsed.get("temporal_filter"):
+                    lines.append(f"Temporal filter: {parsed['temporal_filter']}")
+                if parsed.get("ordinal"):
+                    lines.append(f"Ordinal: {parsed['ordinal']}")
+                if parsed.get("sort_direction"):
+                    lines.append(f"Sort: {parsed['sort_direction']}")
                 return "\n".join(lines)
         except Exception:
             pass

@@ -187,69 +187,152 @@ def _build_data_notes(path: QueryPath, kg: KnowledgeGraph | None) -> list[str]:
     return notes
 
 
-def _route_sql_pattern(
-    comp_type: str, out_node: QueryNode | None, path: QueryPath,
-    kg: KnowledgeGraph | None,
+def _build_analytics_brief(
+    comp_type: str, path: QueryPath, kg: KnowledgeGraph | None,
+    goal: dict[str, Any],
 ) -> str | None:
-    """Layer 4: Route computation_type + schema topology to an explicit SQL pattern.
+    """Generate a concise analytics brief that teaches the SQL LLM the data semantics.
 
-    Absorbs Layer 1 (Normalization) constraints internally.
-    Returns a short SQL skeleton string or None if no special pattern applies.
+    Replaces heuristic routing (SQL EXPRESSION, COUNT TARGET, fan-out warnings)
+    with a single section the LLM reasons from.
     """
-    if not out_node or not kg:
-        return None
-    out_schema = kg.get_table(out_node.table)
-    if not out_schema:
+    if not kg or not path.edges or not path.output_nodes:
         return None
 
-    out_role = out_schema.role
-    out_col = out_node.column
-    is_measure = out_col in out_schema.measure_columns
-    is_pre_agg = out_schema.measure_agg_level.get(out_col) == "pre_aggregated"
-    has_join = bool(path.edges)
+    lines: list[str] = []
 
-    # Find entity table (the other side of the join)
-    entity_table = ""
-    entity_pk = ""
-    if has_join:
-        for edge in path.edges:
-            if edge.src_table == out_node.table:
-                entity_table = edge.dst_table
-            elif edge.dst_table == out_node.table:
-                entity_table = edge.src_table
-        if entity_table:
-            ets = kg.get_table(entity_table)
-            if ets and ets.columns:
-                entity_pk = ets.columns[0].name
+    # 1. Table roles (one line each)
+    for tname in (path.tables_in_path or []):
+        ts = kg.get_table(tname)
+        if not ts:
+            continue
+        role = ts.role or "table"
+        grain_desc = ""
+        if role == "bridge":
+            fk_targets: list[str] = []
+            for edge in (kg.graph.fk_edges if kg.graph else []):
+                src_tbl = edge.src.split(".")[0] if "." in edge.src else ""
+                dst_tbl = edge.dst.split(".")[0] if "." in edge.dst else ""
+                if src_tbl == tname:
+                    fk_targets.append(dst_tbl)
+            if len(fk_targets) >= 2:
+                grain_desc = f"1 row = 1 link between {fk_targets[0]} and {fk_targets[1]}"
+            elif fk_targets:
+                grain_desc = f"1 row = 1 detail record per {fk_targets[0]}"
+            else:
+                grain_desc = "1 row = 1 association"
+        elif role == "fact":
+            if ts.temporal_columns:
+                grain_desc = f"1 row = 1 transaction/event"
+            else:
+                grain_desc = "1 row = 1 record"
+        elif role == "dimension":
+            grain_desc = f"1 row = 1 entity ({ts.row_count} total)"
+        elif role == "snapshot":
+            grain_desc = f"1 row = 1 periodic snapshot"
+        else:
+            grain_desc = f"{ts.row_count} rows"
+        lines.append(f'  "{tname}" [{role}]: {grain_desc}')
 
-    if comp_type == "avg":
-        if out_role == "bridge" or (not is_measure and has_join and entity_table):
-            if entity_pk:
-                return (
-                    f'CAST(COUNT("{out_node.table}"."{out_col}") AS REAL) / '
-                    f'COUNT(DISTINCT "{entity_table}"."{entity_pk}")'
+    # 2. Join semantics (cardinality + meaning)
+    for edge in path.edges:
+        src_ts = kg.get_table(edge.src_table)
+        dst_ts = kg.get_table(edge.dst_table)
+        if not src_ts or not dst_ts:
+            continue
+        # Determine cardinality from roles and row counts
+        if src_ts.role == "bridge" or src_ts.row_count > dst_ts.row_count * 2:
+            card = "N:1"
+            meaning = f"many {edge.src_table} rows per {edge.dst_table}"
+        elif dst_ts.role == "bridge" or dst_ts.row_count > src_ts.row_count * 2:
+            card = "1:N"
+            meaning = f"many {edge.dst_table} rows per {edge.src_table}"
+        else:
+            card = "1:1"
+            meaning = "one-to-one"
+        lines.append(
+            f'  {edge.src_table}.{edge.src_column} → {edge.dst_table}.{edge.dst_column} [{card}]: {meaning}'
+        )
+
+    # 3. Computation implications — targeted to this specific query
+    eoi = goal.get("_entity_of_interest", "")
+    out_table = path.output_nodes[0].table
+    out_col = path.output_nodes[0].column
+    out_ts = kg.get_table(out_table)
+
+    # Find the many-side table in path
+    many_table = ""
+    one_table = ""
+    for edge in path.edges:
+        src_ts_e = kg.get_table(edge.src_table)
+        dst_ts_e = kg.get_table(edge.dst_table)
+        if src_ts_e and dst_ts_e:
+            if src_ts_e.row_count > dst_ts_e.row_count:
+                many_table = edge.src_table
+                one_table = edge.dst_table
+            else:
+                many_table = edge.dst_table
+                one_table = edge.src_table
+            break
+
+    implications: list[str] = []
+
+    if comp_type == "count":
+        if eoi and eoi.lower() != out_table.lower():
+            eoi_ts = kg.get_table(eoi)
+            if eoi_ts:
+                implications.append(
+                    f'COUNT what: rows in "{eoi}" (the many-side). '
+                    f'Each row = 1 thing to count. Filter on "{out_table}" to constrain which.'
                 )
-        if is_pre_agg:
-            return f'AVG("{out_node.table}"."{out_col}")'
-        if is_measure:
-            return f'AVG("{out_node.table}"."{out_col}")'
+        elif many_table and many_table != out_table:
+            implications.append(
+                f'COUNT what: rows in "{many_table}" (the many-side), not "{out_table}". '
+                f'Counting "{out_table}" rows after JOIN gives the wrong number.'
+            )
+        elif many_table == out_table:
+            implications.append(f'COUNT what: rows in "{out_table}" matching the filter conditions.')
 
-    elif comp_type == "sum":
-        # Layer 1 constraint: pre-aggregated measures should not be blindly SUMmed
-        if is_pre_agg and has_join:
-            return (
-                f'-- WARNING: "{out_col}" is pre-aggregated per period. '
-                f'SUM will double-count if JOINing to detail rows.\n'
-                f'SUM("{out_node.table}"."{out_col}")'
+    elif comp_type in ("sum", "avg"):
+        if out_ts and out_ts.measure_agg_level.get(out_col) == "pre_aggregated":
+            implications.append(
+                f'WARNING: "{out_col}" is pre-aggregated (each row already holds a period total). '
+                f'JOINing to detail rows will duplicate it. Filter/GROUP before aggregating.'
+            )
+        elif many_table and one_table == out_table:
+            implications.append(
+                f'FAN-OUT RISK: "{out_table}" is on the ONE side. Each row repeats per "{many_table}" row. '
+                f'Aggregating "{out_col}" directly multiplies the value. '
+                f'Either aggregate BEFORE the join, or aggregate from the many-side table.'
+            )
+        elif many_table == out_table:
+            implications.append(
+                f'SAFE: "{out_col}" is on the many-side table. {comp_type.upper()}() directly is correct.'
             )
 
-    elif comp_type == "count" and has_join:
-        if out_role == "dimension" and entity_table:
-            return f'COUNT(DISTINCT "{out_node.table}"."{out_col}")'
-        if entity_pk and out_node.table != entity_table:
-            return f'COUNT("{out_node.table}"."{out_col}")'
+    elif comp_type in ("ratio", "percentage"):
+        if many_table:
+            implications.append(
+                f'RATIO/PERCENTAGE: compute numerator and denominator from "{many_table}" rows. '
+                f'Numerator = COUNT/SUM with extra filter condition. Denominator = COUNT/SUM of all matching rows. '
+                f'Use CASE WHEN or filtered subquery, NOT separate JOINs.'
+            )
 
-    return None
+    elif comp_type == "simple_lookup" and many_table:
+        # DISTINCT hint
+        filter_tables = {n.table for n in (path.filter_nodes or [])}
+        if many_table in filter_tables and out_table != many_table:
+            implications.append(
+                f'DUPLICATES: filtering through "{many_table}" (many-side) may produce duplicate '
+                f'"{out_table}" rows. Use SELECT DISTINCT.'
+            )
+
+    if implications:
+        lines.append("  IMPLICATIONS:")
+        for imp in implications:
+            lines.append(f"    {imp}")
+
+    return "ANALYTICS CONTEXT:\n" + "\n".join(lines) if lines else None
 
 
 class GroundingFormatMixin:
@@ -284,13 +367,13 @@ class GroundingFormatMixin:
         # Layer 2 (ARCHITECT): decide query shape — single SQL or CTE
         query_shape = _decide_query_complexity(comp_type, path, kg)
 
-        # For "derived" computation type, give the model freedom — no pattern router
+        # Pass derived_logic to SQL LLM — it describes the computation in plain language
+        # and helps the SQL LLM understand the intent even when comp_type is imprecise.
         derived_logic = goal.get("derived_logic", "")
-        if comp_type == "derived" and derived_logic:
+        if derived_logic:
             parts.append(f"COMPUTATION: {derived_logic}")
 
-        # Layer 4 (GENERATOR): produce SQL expression or CTE plan
-        # Skip for derived — let the model figure it out from evidence
+        # Analytics brief — teaches the SQL LLM what each table/join means analytically
         if path.output_nodes and kg and comp_type != "derived":
             if query_shape == "cte":
                 _cte_plan = _build_cte_plan(comp_type, path, kg)
@@ -300,39 +383,13 @@ class GroundingFormatMixin:
                     query_shape = "single"
 
             if query_shape == "single":
-                _pattern = _route_sql_pattern(comp_type, path.output_nodes[0], path, kg)
-                if _pattern:
-                    parts.append(f"SQL EXPRESSION (derived from schema topology):\n  {_pattern}")
-                elif comp_type not in ("simple_lookup", "grouped_list") and path.edges:
-                    _out = path.output_nodes[0]
-                    _out_ts = kg.get_table(_out.table)
-                    _reasoning_lines = []
-                    if _out_ts:
-                        _reasoning_lines.append(f'Output table "{_out.table}" is a {_out_ts.role or "table"} ({_out_ts.row_count} rows)')
-                        if _out_ts.measure_columns:
-                            _reasoning_lines.append(f'  Measures: {_out_ts.measure_columns}')
-                        if _out_ts.grain_columns:
-                            _reasoning_lines.append(f'  Grain (one row per): {_out_ts.grain_columns}')
-                        agg_hint = _out_ts.measure_agg_level.get(_out.column, "")
-                        if agg_hint == "pre_aggregated":
-                            _reasoning_lines.append(f'  "{_out.column}" is pre-aggregated (row already holds a period total)')
-                    for edge in path.edges:
-                        _other = edge.dst_table if edge.src_table == _out.table else edge.src_table
-                        _other_ts = kg.get_table(_other)
-                        if _other_ts:
-                            _reasoning_lines.append(f'Joined to "{_other}" ({_other_ts.role or "table"}, {_other_ts.row_count} rows)')
-                    if _reasoning_lines:
-                        parts.append("SCHEMA CONTEXT:\n" + "\n".join(f"  {l}" for l in _reasoning_lines))
+                _brief = _build_analytics_brief(comp_type, path, kg, goal)
+                if _brief:
+                    parts.append(_brief)
 
-        # Tables: full schema for active tables (have output/filter nodes), compact for pass-through
+        # Tables: full schema for ALL tables in path — never omit columns.
+        # The SQL LLM needs complete information to write correct queries.
         if kg and path.tables_in_path:
-            active_tables = set()
-            for n in (path.output_nodes or []):
-                active_tables.add(n.table)
-            for n in (path.filter_nodes or []):
-                if not n.column.startswith("_expr:"):
-                    active_tables.add(n.table)
-
             table_lines: list[str] = []
             for tname in path.tables_in_path:
                 table_schema = kg.get_table(tname)
@@ -341,16 +398,11 @@ class GroundingFormatMixin:
                 role = table_schema.role or "table"
                 row_count = table_schema.row_count or "?"
                 grain = f" | grain: {table_schema.grain_columns}" if table_schema.grain_columns else ""
-                if tname in active_tables:
-                    cols = ", ".join(
-                        f'"{c.name}" ({c.sql_type})'
-                        for c in table_schema.columns
-                    )
-                    table_lines.append(f'  "{tname}" ({role}, {row_count} rows{grain}): [{cols}]')
-                else:
-                    # Pass-through table (only used for JOIN) — just show role and key columns
-                    key_cols = [c.name for c in table_schema.columns if c.is_pk or c.name.lower().endswith("id")][:3]
-                    table_lines.append(f'  "{tname}" ({role}, {row_count} rows) — join-through, keys: {key_cols}')
+                cols = ", ".join(
+                    f'"{c.name}" ({c.sql_type})'
+                    for c in table_schema.columns
+                )
+                table_lines.append(f'  "{tname}" ({role}, {row_count} rows{grain}): [{cols}]')
             if table_lines:
                 parts.append("TABLES:\n" + "\n".join(table_lines))
 
@@ -729,7 +781,10 @@ class GroundingFormatMixin:
                 for node in path.filter_nodes:
                     if node.column.startswith("_expr:"):
                         expr_sql = node.column[len("_expr:"):]
-                        fv_lines.append(f'  COMPUTED: WHERE {expr_sql} {node.operator} {node.value}')
+                        if re.match(r'(COUNT|SUM|AVG|MIN|MAX)\s*\(', expr_sql, re.IGNORECASE):
+                            fv_lines.append(f'  HAVING: {expr_sql} {node.operator} {node.value} (use GROUP BY + HAVING)')
+                        else:
+                            fv_lines.append(f'  COMPUTED: WHERE {expr_sql} {node.operator} {node.value}')
                     elif node.operator.upper() == "IS NOT NULL":
                         fv_lines.append(f'  "{node.table}"."{node.column}": IS NOT NULL')
                     elif node.operator.upper() == "LIKE":
@@ -790,7 +845,7 @@ class GroundingFormatMixin:
                 if node.operator == "=" and not node.column.startswith("_expr:"):
                     key = f"{node.table}.{node.column}"
                     col_values.setdefault(key, []).append(str(node.value))
-            q_lower = (goal.get("what_user_wants") or question).lower()
+            q_lower = (goal.get("what_user_wants") or goal.get("derived_logic") or "").lower()
             for col_key, values in col_values.items():
                 if len(values) > 1:
                     tbl, col = col_key.split(".", 1)
@@ -833,143 +888,7 @@ class GroundingFormatMixin:
                             f'AND another related row has value {values[1]}.'
                         )
 
-        # --- Aggregation duplication warning ---
-        # When SUM/AVG targets a NUMERIC column on the "one" side of a one-to-many join,
-        # the value gets multiplied. Only warn for numeric columns (not GROUP BY text columns).
-        if comp_type in ("sum", "avg") and path.edges and path.output_nodes and kg and kg.graph and not suppress_join:
-            child_to_parent: dict[str, str] = {}
-            for edge in kg.graph.fk_edges:
-                src_col = kg.graph.columns.get(edge.src)
-                dst_col = kg.graph.columns.get(edge.dst)
-                if src_col and dst_col:
-                    child_to_parent[src_col.table_id] = dst_col.table_id
-            tables_in_path = set(path.tables_in_path) if path.tables_in_path else set()
-            for node in path.output_nodes:
-                # Only warn for numeric columns (candidates for SUM/AVG), not text (GROUP BY)
-                node_col = kg.graph.columns.get(f"{node.table}.{node.column}")
-                if not node_col or node_col.sql_type.upper() not in ("REAL", "FLOAT", "NUMERIC", "INTEGER", "INT"):
-                    continue
-                child_tables_in_path = [
-                    child for child, parent in child_to_parent.items()
-                    if parent == node.table and child in tables_in_path
-                ]
-                if child_tables_in_path:
-                    child_table = child_tables_in_path[0]
-                    child_schema = kg.get_table(child_table)
-                    if child_schema:
-                        numeric_cols = [
-                            c.name for c in child_schema.columns
-                            if c.sql_type.upper() in ("REAL", "INTEGER", "NUMERIC", "FLOAT", "INT")
-                            and not c.name.lower().endswith("id")
-                            and "link" not in c.name.lower()
-                        ]
-                        if numeric_cols:
-                            parts.append(
-                                f'FAN-OUT: "{node.table}" is on the ONE side of a one-to-many join to "{child_table}". '
-                                f'Each "{node.table}" row repeats per child row. '
-                                f'Aggregating "{node.column}" directly would multiply the value. '
-                                f'"{child_table}"."{numeric_cols[0]}" has the per-row detail values.'
-                            )
-
-        # --- COUNT DISTINCT hint for count with JOINs ---
-        if comp_type == "count" and path.edges and path.output_nodes and not suppress_join:
-            # Determine what to count: prefer the entity of interest's FK/PK
-            count_table = path.output_nodes[0].table
-            count_col = None
-
-            # If there's an entity-of-interest that differs from the output table,
-            # count through its FK column in the bridge/output table
-            entity_of_interest = goal.get("_entity_of_interest", "")
-            if entity_of_interest and entity_of_interest.lower() != count_table.lower():
-                # Find FK column in the output table pointing to entity of interest
-                if kg:
-                    for edge in (kg.graph.fk_edges if kg.graph else []):
-                        src_tbl = edge.src.split(".")[0] if "." in edge.src else ""
-                        dst_tbl = edge.dst.split(".")[0] if "." in edge.dst else ""
-                        src_col = edge.src.split(".")[1] if "." in edge.src else ""
-                        if src_tbl.lower() == count_table.lower() and dst_tbl.lower() == entity_of_interest.lower():
-                            count_col = src_col
-                            break
-
-            # Structural fallback: on a bridge table with multiple FK edges,
-            # if the output column is an FK whose target table is equality-filtered
-            # to a single entity, counting that column gives trivially 1.
-            # Count the other FK instead.
-            if not count_col and kg and kg.graph and kg.graph.fk_edges:
-                output_col = path.output_nodes[0].column
-                # Collect FK columns in the count_table
-                fk_cols_in_table: list[tuple[str, str]] = []  # (src_col, dst_table)
-                for edge in kg.graph.fk_edges:
-                    src_tbl = edge.src.split(".")[0] if "." in edge.src else ""
-                    src_col = edge.src.split(".")[1] if "." in edge.src else ""
-                    dst_tbl = edge.dst.split(".")[0] if "." in edge.dst else ""
-                    if src_tbl.lower() == count_table.lower():
-                        fk_cols_in_table.append((src_col, dst_tbl))
-
-                if len(fk_cols_in_table) >= 2:
-                    # Check if the output column's FK target is equality-constrained
-                    output_fk_target = None
-                    for col, tgt in fk_cols_in_table:
-                        if col.lower() == output_col.lower():
-                            output_fk_target = tgt
-                            break
-
-                    if output_fk_target:
-                        # Is the target table equality-filtered?
-                        target_eq_filtered = any(
-                            fnode.table.lower() == output_fk_target.lower()
-                            and fnode.operator in ("=", "==")
-                            for fnode in (path.filter_nodes or [])
-                        )
-                        if target_eq_filtered:
-                            # Count the other FK instead
-                            for col, tgt in fk_cols_in_table:
-                                if col.lower() != output_col.lower():
-                                    count_col = col
-                                    break
-
-            if not count_col:
-                if kg:
-                    table_schema = kg.get_table(count_table)
-                    if table_schema and table_schema.columns:
-                        count_col = table_schema.columns[0].name
-                if not count_col:
-                    count_col = path.output_nodes[0].column
-
-            parts.append(
-                f'COUNT TARGET: "{count_table}"."{count_col}". '
-                f'The JOIN may produce duplicate rows (one-to-many fan-out).'
-            )
-
-        # (Cross-row hint moved to rules engine — injected via engine_out.sql_directives)
-
-        # --- DISTINCT hint for lookup queries joining to detail tables ---
-        if (comp_type == "simple_lookup" and path.edges and path.output_nodes
-                and path.filter_nodes and kg):
-            output_tables = {n.table for n in path.output_nodes}
-            filter_tables = {n.table for n in path.filter_nodes}
-            detail_tables = filter_tables - output_tables
-            if detail_tables:
-                # Confirm the filter table is on the "many" side (fact/bridge/higher row count)
-                needs_distinct = False
-                for dt in detail_tables:
-                    dt_schema = kg.get_table(dt)
-                    if dt_schema and dt_schema.role in ("fact", "bridge", ""):
-                        needs_distinct = True
-                        break
-                    # Fallback: if filter table has more rows, it's likely many-side
-                    for ot in output_tables:
-                        ot_schema = kg.get_table(ot)
-                        if dt_schema and ot_schema and dt_schema.row_count > ot_schema.row_count:
-                            needs_distinct = True
-                            break
-                if needs_distinct:
-                    parts.append(
-                        'DUPLICATES: The JOIN crosses to a detail table (many-side). '
-                        'Each entity may appear multiple times in the result.'
-                    )
-
-        # (Per-entity AVG pattern moved to Layer 4 pattern router — emitted near top of grounding)
+        # (Aggregation warnings, COUNT TARGET, and DISTINCT hints are now in the analytics brief above)
 
         # --- Temporal scope propagation ---
         # If date filters exist on one table but joined tables also have date columns,
@@ -1046,7 +965,12 @@ class GroundingFormatMixin:
         if order_by and isinstance(order_by, dict):
             col_ref = order_by.get("column", "")
             direction = order_by.get("direction", "ASC")
-            parts.append(f'ORDER: "{col_ref}" {direction} — if ties matter, a subquery (SELECT MIN/MAX) handles them')
+            min_or_max = "MIN" if direction.upper() == "ASC" else "MAX"
+            parts.append(
+                f'ORDER: "{col_ref}" {direction}\n'
+                f'  TIES: Use WHERE "{col_ref}" = (SELECT {min_or_max}("{col_ref}") FROM ...) '
+                f'to return ALL tied rows. Do NOT use LIMIT 1.'
+            )
 
         # --- Data distribution for numeric filter columns ---
         # Show actual min/max so the LLM can judge whether thresholds are meaningful

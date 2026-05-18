@@ -2761,94 +2761,127 @@ def _adaptive_loop(
     all_logs: list[tuple[str, str]],
     all_directives: list[str],
 ) -> None:
-    """Hypothesis-driven adaptive loop: assess → generate → score → select → validate.
+    """Deterministic adaptive loop: detect → fix using topology → validate → escalate.
 
-    Two-tier hypothesis generation:
-      Tier 1: Deterministic hypotheses (template-based, fast, no LLM)
-      Tier 2: LLM-generated hypotheses (creative, handles novel patterns)
-    Tier 2 only fires when Tier 1 produces no viable alternatives.
+    Uses KG value index and DB probes to find where filter values actually live.
+    Never uses LLM for fixing. Escalates to advisory note if deterministic fixes fail.
     """
+    report = _assess_plausibility(ctx)
+    if report.is_plausible:
+        all_logs.append(("adaptive_ok", f"iter=0: plausible (count={report.result_count})"))
+        return
+
+    all_logs.append(("adaptive_anomaly", f"{report.anomaly}"))
+
+    # --- Deterministic fix attempts using KG topology ---
+    fixed = False
+    graph = ctx.kg.graph if ctx.kg else None
+
     for iteration in range(3):
-        # Step 1: Assess plausibility
+        if fixed:
+            break
+
+        # Strategy 1: For each equality filter producing 0 results,
+        # check if the value exists in a DIFFERENT column (via KG value index).
+        for i, node in enumerate(ctx.filter_nodes):
+            if node.column.startswith("_expr:"):
+                continue
+            if node.operator not in ("=", "LIKE"):
+                continue
+
+            # Probe: does this single filter produce results?
+            single_count = _probe_result_count(ctx, [node])
+            if single_count != 0:
+                continue
+
+            # This filter value doesn't exist in the claimed column.
+            # Search the KG value index for where it actually lives.
+            val_str = str(node.value)
+            if not graph:
+                continue
+            locations = graph.find_value(val_str)
+            if not locations:
+                continue
+
+            # Try each location: replace the filter and probe
+            for alt_table, alt_col, _count in locations:
+                if alt_table == node.table and alt_col == node.column:
+                    continue
+                # Build candidate filter set with this node relocated
+                candidate = list(ctx.filter_nodes)
+                candidate[i] = QueryNode(
+                    table=alt_table, column=alt_col, role="filter",
+                    operator=node.operator, value=node.value,
+                )
+                # Validate: does the full filter set now produce results?
+                full_count = _probe_result_count(ctx, candidate)
+                if full_count > 0:
+                    ctx.filter_nodes = candidate
+                    all_logs.append((
+                        "adaptive_fix",
+                        f"Relocated filter: {node.table}.{node.column}→{alt_table}.{alt_col} "
+                        f"(value '{val_str}' found, {full_count} results)"
+                    ))
+                    fixed = True
+                    break
+
+        if fixed:
+            break
+
+        # Strategy 2: For numeric range filters that produce 0 results,
+        # check if the column's actual data range overlaps with the filter range.
+        if not ctx.db_path:
+            break
+        range_filters = [(i, n) for i, n in enumerate(ctx.filter_nodes)
+                         if n.operator in (">=", "<=", ">", "<") and not n.column.startswith("_expr:")]
+        if not range_filters:
+            break
+
+        try:
+            conn = sqlite3.connect(str(ctx.db_path), timeout=5)
+            for i, node in range_filters:
+                row = conn.execute(
+                    f'SELECT MIN(CAST("{node.column}" AS REAL)), MAX(CAST("{node.column}" AS REAL)) '
+                    f'FROM "{node.table}" WHERE "{node.column}" IS NOT NULL'
+                ).fetchone()
+                if not row or row[0] is None:
+                    continue
+                db_min, db_max = float(row[0]), float(row[1])
+                try:
+                    filter_val = float(node.value)
+                except (ValueError, TypeError):
+                    continue
+                # If filter value is completely outside the data range, it's wrong
+                if node.operator in (">=", ">") and filter_val > db_max:
+                    all_logs.append((
+                        "adaptive_range_note",
+                        f"{node.table}.{node.column} {node.operator} {node.value} "
+                        f"but max in data is {db_max}"
+                    ))
+                elif node.operator in ("<=", "<") and filter_val < db_min:
+                    all_logs.append((
+                        "adaptive_range_note",
+                        f"{node.table}.{node.column} {node.operator} {node.value} "
+                        f"but min in data is {db_min}"
+                    ))
+            conn.close()
+        except Exception:
+            pass
+        break  # Only one pass for range checks
+
+    # Re-assess after fixes
+    if fixed:
         report = _assess_plausibility(ctx)
         if report.is_plausible:
-            all_logs.append(("adaptive_ok", f"iter={iteration}: plausible (count={report.result_count})"))
-            break
+            all_logs.append(("adaptive_ok", f"fixed: plausible (count={report.result_count})"))
+            return
 
-        all_logs.append(("adaptive_anomaly", f"iter={iteration+1}: {report.anomaly}"))
-
-        # Step 2: Gather evidence
-        evidence = _gather_evidence(ctx)
-
-        # Step 3: Generate deterministic hypotheses (Tier 1)
-        hypotheses = _generate_hypotheses(ctx, evidence, report.anomaly)
-
-        # Step 4: Score each hypothesis by probing DB
-        for h in hypotheses:
-            _score_hypothesis(ctx, h)
-
-        # Filter out impossible hypotheses
-        viable = [h for h in hypotheses if h.result_count > 0 or h.label == "current"]
-        non_current_viable = [h for h in viable if h.label != "current" and h.score > 0]
-
-        # Step 4b: If deterministic hypotheses all fail → LLM generates novel ones (Tier 2)
-        if not non_current_viable and model_call:
-            failed_labels = [h.label for h in hypotheses if h.label != "current"]
-            all_logs.append(("adaptive_tier2", "Deterministic hypotheses failed, invoking LLM generation"))
-            llm_hypotheses = _llm_generate_hypotheses(
-                ctx, evidence, report.anomaly, model_call, failed_labels,
-            )
-            for h in llm_hypotheses:
-                _score_hypothesis(ctx, h)
-            hypotheses.extend(llm_hypotheses)
-            viable = [h for h in hypotheses if h.result_count > 0 or h.label == "current"]
-            non_current_viable = [h for h in viable if h.label != "current" and h.score > 0]
-
-        all_logs.append(("adaptive_hypotheses",
-                        f"Generated {len(hypotheses)}, {len(viable)} viable: " +
-                        ", ".join(f"{h.label}({h.result_count})" for h in viable)))
-
-        # Step 5: If only one viable non-current hypothesis, pick it without LLM
-        if len(non_current_viable) == 1 and non_current_viable[0].score > 5:
-            chosen = non_current_viable[0]
-            all_logs.append(("adaptive_auto", f"Single clear winner: {chosen.label} → {chosen.reasoning}"))
-            enforced = _enforce_domain_locks(ctx, chosen.filter_nodes, all_logs)
-            ctx.filter_nodes = enforced
-            ctx.filter_nodes = _apply_domain_column_fixes(ctx)
-            if chosen.sql_directives:
-                all_directives.extend(chosen.sql_directives)
-            continue
-
-        # Step 6: Multiple viable options — LLM selects
-        if not model_call:
-            if non_current_viable:
-                best = max(non_current_viable, key=lambda h: h.score)
-                enforced = _enforce_domain_locks(ctx, best.filter_nodes, all_logs)
-                ctx.filter_nodes = enforced
-                ctx.filter_nodes = _apply_domain_column_fixes(ctx)
-                if best.sql_directives:
-                    all_directives.extend(best.sql_directives)
-                all_logs.append(("adaptive_pick", f"Best score: {best.label} (score={best.score:.1f})"))
-            break
-
-        chosen = _llm_select_hypothesis(ctx, viable, evidence, report.anomaly, model_call, iteration + 1)
-        if chosen and chosen.label != "current":
-            enforced = _enforce_domain_locks(ctx, chosen.filter_nodes, all_logs)
-            ctx.filter_nodes = enforced
-            ctx.filter_nodes = _apply_domain_column_fixes(ctx)
-            if chosen.sql_directives:
-                all_directives.extend(chosen.sql_directives)
-            all_logs.append(("adaptive_llm_pick", f"iter={iteration+1}: chose {chosen.label} — {chosen.reasoning}"))
-        else:
-            all_logs.append(("adaptive_llm_no_change", f"iter={iteration+1}: LLM kept current filters"))
-            break
-
-        # Re-run cross-row detection after filter changes
-        cross_result = rule_cross_row_structure(ctx)
-        if cross_result:
-            all_directives[:] = [d for d in all_directives if "CROSS-ROW" not in d]
-            all_directives.extend(cross_result.sql_directives)
-            all_logs.extend(cross_result.log_entries)
+    # --- Escalate: emit advisory note if deterministic fixes didn't resolve ---
+    if not fixed or not report.is_plausible:
+        all_directives.append(
+            f"DATA NOTE: Filters produce 0 results. "
+            f"This may be correct (answer is 0/empty), or a filter value may not exist in the data."
+        )
 
 
 def run_rules_engine(

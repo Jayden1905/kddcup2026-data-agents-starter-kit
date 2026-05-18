@@ -129,7 +129,9 @@ _STOPWORDS = {
 }
 
 
-def _extract_question_specific_keywords(question: str, schema_keywords: set[str]) -> set[str]:
+def _extract_question_specific_keywords(
+    question: str, schema_keywords: set[str]
+) -> set[str]:
     return _tokenize(question) - _STOPWORDS - schema_keywords
 
 
@@ -148,7 +150,10 @@ def _find_id_key(records: list[dict[str, Any]]) -> str | None:
     if not candidates:
         for key in records[0]:
             vals = [r.get(key) for r in records[:20] if r.get(key) is not None]
-            if vals and all(isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()) for v in vals):
+            if vals and all(
+                isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit())
+                for v in vals
+            ):
                 unique = len(set(str(v) for v in vals))
                 if unique == len(vals):
                     candidates.append(key)

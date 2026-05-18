@@ -1190,7 +1190,15 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                             return fix_result
 
         # Fix 2: Detect raw FK IDs in output and re-query with JOIN for human-readable values
-        if rows and cols:
+        # Skip when the output column name appears in the question (user asked for it)
+        _q_lower_shape = question.lower()
+        _output_col_requested = any(
+            col.lower().replace("_", " ") in _q_lower_shape
+            or col.lower().replace("_", "") in _q_lower_shape.replace(" ", "")
+            or col.lower() in _q_lower_shape
+            for col in cols
+        )
+        if rows and cols and not _output_col_requested:
             has_raw_id = False
             raw_id_cols = []
             for i, col in enumerate(cols):

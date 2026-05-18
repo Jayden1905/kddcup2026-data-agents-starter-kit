@@ -15,7 +15,9 @@ from data_agent_baseline.pipeline.kg_path_planner import (
     QueryNode,
     QueryPath,
     QueryPlan,
+    build_adjacency,
     build_query_path,
+    find_shortest_path,
 )
 
 
@@ -35,7 +37,7 @@ class KGPlanningMixin:
         if not db_path or not kg:
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
 
-        # --- Step 1: Domain anchors + user intent ---
+        # --- Step 1: User intent (primary) + domain anchors (supporting context) ---
         anchor_text = self._extract_domain_anchors(question, knowledge_text, db_path=db_path)
         user_intent = self._detect_user_intent_only(question, kg_context=kg_context, anchor_text=anchor_text)
 
@@ -91,7 +93,9 @@ class KGPlanningMixin:
                     _det_comp_type = _op
                 break
 
-        # --- Step 2: LLM picks nodes from graph (1 call) ---
+        # ===================================================================
+        # PHASE 1: PICK + VALIDATE (one LLM call, then deterministic checks)
+        # ===================================================================
         _t_pick = time.monotonic()
         picked = self._pick_graph_nodes(question, kg, anchor_text, user_intent)
         self._log("pick_nodes_time", f"{time.monotonic() - _t_pick:.1f}s")
@@ -104,7 +108,7 @@ class KGPlanningMixin:
 
         self._log("kg_picked", json.dumps(picked, default=str))
 
-        # --- Step 3: Validate picks against graph (deterministic) ---
+        # Validate picks against actual schema
         output_nodes, filter_nodes, errors = self._validate_picked_nodes(picked, kg, db_path)
         if errors:
             self._log("kg_validation_errors", "; ".join(errors))
@@ -112,7 +116,7 @@ class KGPlanningMixin:
             self._log("kg_path", "No valid output nodes after validation, falling back")
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
 
-        # Disambiguate: prefer entity-of-interest table for columns that exist in multiple tables
+        # Disambiguate output: prefer entity-of-interest table
         _entity_pref_match = re.search(r'Entity of interest:\s*(\w+)', user_intent)
         if _entity_pref_match and kg:
             _pref_table = _entity_pref_match.group(1)
@@ -122,7 +126,6 @@ class KGPlanningMixin:
                 _new_output = []
                 for node in output_nodes:
                     if node.table.lower() != _pref_table.lower() and node.column.lower() in _pref_col_names:
-                        # Try preferred table first, then alternatives, then original
                         if self._db_check(db_path, _pref_table, node.column):
                             _new_output.append(QueryNode(table=_pref_table, column=node.column, role="output"))
                         else:
@@ -141,89 +144,36 @@ class KGPlanningMixin:
                         _new_output.append(node)
                 output_nodes = _new_output
 
-        self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
-        self._log("kg_filter_nodes", ", ".join(
-            f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
-        ))
-
-        # --- Step 3a: Sanity check — does the pick match the question? ---
+        # Sanity check: detect computation_type mismatch + missing entities
         sanity_issues, entity_col_map = self._sanity_check_picks(
             question, picked, output_nodes, filter_nodes, user_intent, kg, anchor_text, db_path,
         )
         if sanity_issues:
             self._log("kg_sanity", sanity_issues)
-
-            # Handle computation_type mismatch deterministically — no LLM repick needed
-            comp_type_fix = re.search(
-                r'Change computation_type to "(\w+)"', sanity_issues,
-            )
+            # Fix computation_type deterministically
+            comp_type_fix = re.search(r'Change computation_type to "(\w+)"', sanity_issues)
             if comp_type_fix:
                 picked["computation_type"] = comp_type_fix.group(1)
-                # Remove this issue so remaining issues (if any) still trigger repick
                 sanity_issues = re.sub(
                     r'Intent says operation is "[^"]+" but computation_type is "[^"]+"\. '
                     r'Change computation_type to "\w+"\.\n?',
                     "", sanity_issues,
                 ).strip()
-                if not sanity_issues:
-                    # Only issue was computation_type — no repick needed
-                    sanity_issues = ""
+            # Inject missing entity filters deterministically (from DB probe)
+            if entity_col_map:
+                existing_filter_vals = {str(n.value).lower() for n in filter_nodes}
+                for entity_val, tbl_col in entity_col_map.items():
+                    if entity_val.lower() in existing_filter_vals:
+                        continue
+                    if "." in tbl_col:
+                        tbl, col = tbl_col.split(".", 1)
+                        filter_nodes.append(QueryNode(
+                            table=tbl, column=col, role="filter",
+                            operator="LIKE", value=f"%{entity_val}%",
+                        ))
+                        self._log("kg_inject_filter", f"Added {tbl}.{col} LIKE '%{entity_val}%' (from DB probe)")
 
-            if not sanity_issues:
-                pass  # skip repick entirely
-            else:
-                pass  # fall through to repick below
-
-        if sanity_issues:
-            # Detect if sanity issues are output-only (no filter corrections needed)
-            _sanity_is_output_only = (
-                ("output" in sanity_issues.lower() or "select the" in sanity_issues.lower())
-                and "filter" not in sanity_issues.lower()
-                and "Add a" not in sanity_issues
-            )
-
-            # Re-prompt with sanity feedback
-            repicked = self._pick_graph_nodes(
-                question, kg, anchor_text,
-                user_intent + f"\n\nCORRECTIONS (from sanity check):\n{sanity_issues}",
-            )
-            if repicked and repicked.get("select_columns"):
-                self._log("kg_repicked", json.dumps(repicked, default=str))
-                new_output, new_filter, _ = self._validate_picked_nodes(repicked, kg, db_path)
-                if new_output:
-                    picked = repicked
-                    # Repick fixes filters/columns — never override the authoritative
-                    # computation_type from deterministic intent detection.
-                    if _det_comp_type:
-                        picked["computation_type"] = _det_comp_type
-                    output_nodes = new_output
-                    if _sanity_is_output_only and filter_nodes:
-                        pass
-                    else:
-                        filter_nodes = new_filter
-                    # Strip spurious filters the repick may have re-introduced
-                    filter_nodes = self._strip_spurious_filters(question, filter_nodes, user_intent, db_path)
-                    self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
-                    self._log("kg_filter_nodes", ", ".join(
-                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
-                    ))
-            else:
-                # Repick failed — inject filters deterministically
-                if entity_col_map:
-                    existing_filter_vals = {str(n.value).lower() for n in filter_nodes}
-                    for entity_val, tbl_col in entity_col_map.items():
-                        if entity_val.lower() in existing_filter_vals:
-                            continue
-                        if "." in tbl_col:
-                            tbl, col = tbl_col.split(".", 1)
-                            filter_nodes.append(QueryNode(
-                                table=tbl, column=col, role="filter",
-                                operator="LIKE", value=f"%{entity_val}%",
-                            ))
-                            self._log("kg_inject_filter", f"Added {tbl}.{col} LIKE '%{entity_val}%' (from DB probe)")
-
-            # Doc-based injection: resolve entities mentioned in question but missing from filters
-            # Runs after both repick success and failure — checks if flagged entities are still unresolved
+            # Doc-based injection for entities found in documents
             if hasattr(self, '_doc_paths') and self._doc_paths and db_path:
                 flagged = re.findall(r'The question mentions "([^"]+)" but it is not', sanity_issues)
                 current_filter_text = " ".join(str(n.value).lower() for n in filter_nodes)
@@ -276,7 +226,7 @@ class KGPlanningMixin:
                                         table=entity_table, column=fk_col, role="filter",
                                         operator="=", value=cid,
                                     ))
-                                    self._log("kg_inject_filter", f"Added {entity_table}.{fk_col} = {cid} (from doc paragraph)")
+                                    self._log("kg_inject_filter", f"Added {entity_table}.{fk_col} = {cid} (from doc)")
                                     injected = True
                                     break
                             conn.close()
@@ -284,34 +234,23 @@ class KGPlanningMixin:
                             pass
                         if injected:
                             break
-                    if injected:
-                        self._log("kg_filter_nodes", ", ".join(
-                            f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
-                        ))
 
-            # Knowledge-based keyword → value injection (runs regardless of repick success)
-            # e.g. anchor line "- SEX: ... denoted as 'M' for male" and population mentions "male"
+            # Knowledge-based keyword → value injection
             if anchor_text and db_path:
                 pop_match = re.search(r'population filter is "([^"]+)"', sanity_issues)
                 if pop_match:
                     pop_words = set(re.findall(r'[a-z]+', pop_match.group(1).lower()))
                     existing_filter_vals = {str(n.value).lower() for n in filter_nodes}
-                    # Parse field definition lines: "- FIELD_NAME (type): ..." or "- FIELD_NAME: ..."
-                    anchor_lines = anchor_text.split("\n")
-                    found = False
-                    for line in anchor_lines:
+                    for line in anchor_text.split("\n"):
                         field_match = re.match(r"^-\s+(\w[\w\-]*)\s*(?:\([^)]*\))?\s*:", line)
                         if not field_match:
                             continue
                         field_name = field_match.group(1)
-                        # Find 'VALUE' for KEYWORD patterns on this line
+                        found = False
                         for m in re.finditer(r"'([^']+)'\s+for\s+(\w+)", line):
                             val, keyword = m.group(1), m.group(2).lower()
                             if keyword not in pop_words or val.lower() in existing_filter_vals:
                                 continue
-                            # Find the column matching field_name that contains this value
-                            # Prefer the table with the most rows for better coverage
-                            found = False
                             try:
                                 conn = sqlite3.connect(str(db_path), timeout=5)
                                 field_lower = field_name.lower()
@@ -333,7 +272,7 @@ class KGPlanningMixin:
                                         table=best_match[0], column=best_match[1], role="filter",
                                         operator="=", value=val,
                                     ))
-                                    self._log("kg_inject_filter", f"Added {best_match[0]}.{best_match[1]} = '{val}' (from knowledge: '{val}' for {keyword})")
+                                    self._log("kg_inject_filter", f"Added {best_match[0]}.{best_match[1]} = '{val}' (from knowledge)")
                                     found = True
                                 conn.close()
                             except Exception:
@@ -343,75 +282,94 @@ class KGPlanningMixin:
                         if found:
                             break
 
-        # --- Step 3b: Probe actual value formats for text filters ---
+        # Ensure entity_of_interest is in path for aggregate queries
+        _comp = picked.get("computation_type", "")
+        if _comp in ("count", "sum", "avg", "count_distinct") and _entity_pref_match and kg:
+            _eoi_table = _entity_pref_match.group(1)
+            _all_tables = {n.table.lower() for n in output_nodes} | {n.table.lower() for n in filter_nodes}
+            if _eoi_table.lower() not in _all_tables:
+                _eoi_schema = kg.get_table(_eoi_table)
+                if _eoi_schema and _eoi_schema.columns:
+                    _eoi_col = _eoi_schema.columns[0].name
+                    output_nodes.append(QueryNode(table=_eoi_table, column=_eoi_col, role="output"))
+                    self._log("kg_inject_eoi", f"Added {_eoi_table}.{_eoi_col} to ensure path reaches entity")
+
+        # Enforce multi-column output from intent's "Columns needed:" line
+        if user_intent and output_nodes and kg:
+            _cols_needed_match = re.search(r'Columns needed:\s*(.+)', user_intent)
+            if _cols_needed_match:
+                _needed_names = [
+                    c.strip().lower() for c in _cols_needed_match.group(1).split(",")
+                ]
+                _existing_cols = {n.column.lower() for n in output_nodes}
+                _out_table = output_nodes[0].table
+                for needed in _needed_names:
+                    if needed in _existing_cols:
+                        continue
+                    # Search for column in output table first, then all path tables
+                    _found = False
+                    for t in [kg.get_table(_out_table)] + [kg.get_table(n.table) for n in filter_nodes]:
+                        if not t:
+                            continue
+                        for c in t.columns:
+                            if c.name.lower() == needed or needed in c.name.lower():
+                                if c.name.lower() not in _existing_cols:
+                                    output_nodes.append(QueryNode(table=t.name, column=c.name, role="output"))
+                                    _existing_cols.add(c.name.lower())
+                                    self._log("kg_inject_col", f"Added {t.name}.{c.name} (from intent 'Columns needed')")
+                                    _found = True
+                                    break
+                        if _found:
+                            break
+
+        self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
+        self._log("kg_filter_nodes", ", ".join(
+            f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
+        ))
+
+        # ===================================================================
+        # PHASE 2: TRANSFORM (deterministic, no plausibility probes)
+        # Each transform fixes a known structural pattern — they don't conflict
+        # because each operates on a different aspect (format, domain, structure).
+        # ===================================================================
+
+        # 2a. Fix value formats (case, prefix, LIKE patterns)
         filter_nodes = self._probe_filter_values(filter_nodes, db_path, kg, question)
 
-        # --- Step 3b1: Domain column fixes (deterministic swap) ---
+        # 2b. Domain column fixes (swap column based on knowledge definitions)
         _pre_domain_cols = {f"{n.table}.{n.column}" for n in filter_nodes}
         filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text, db_path)
         _post_domain_cols = {f"{n.table}.{n.column}" for n in filter_nodes}
         domain_locked_columns = _post_domain_cols - _pre_domain_cols
 
-        # --- Step 3b1a: Knowledge-defined value mappings ---
-        # When anchors explicitly define "column = 'value' for keyword" and the filter
-        # concept matches that keyword, override the filter with the canonical form.
+        # 2c. Knowledge-defined value mappings (canonical forms)
         filter_nodes = self._apply_knowledge_value_mappings(filter_nodes, anchor_text, kg, db_path)
 
-        # (Impossible threshold fix moved to rules engine — Step 3d)
-
-        # --- Step 3b2: Check filter discriminating power ---
-        _weak_filter_hint = ""
-        weak_filters = self._check_filter_selectivity(filter_nodes, db_path)
-        if weak_filters:
-            self._log("kg_weak_filter", weak_filters)
-            repicked2 = self._pick_graph_nodes(
-                question, kg, anchor_text,
-                user_intent + f"\n\nCORRECTIONS:\n{weak_filters}",
-            )
-            repick_fixed = False
-            if repicked2 and repicked2.get("select_columns"):
-                self._log("kg_repicked", json.dumps(repicked2, default=str))
-                new_output2, new_filter2, _ = self._validate_picked_nodes(repicked2, kg, db_path)
-                if new_filter2:
-                    # Only take filters from weak_filter repick — preserve existing output
-                    picked["filter_conditions"] = repicked2.get("filter_conditions", [])
-                    filter_nodes = self._probe_filter_values(new_filter2, db_path, kg, question)
-                    _pre2 = {f"{n.table}.{n.column}" for n in filter_nodes}
-                    filter_nodes = self._apply_domain_column_fixes(question, filter_nodes, kg, anchor_text, db_path)
-                    _post2 = {f"{n.table}.{n.column}" for n in filter_nodes}
-                    domain_locked_columns |= (_post2 - _pre2)
-                    self._log("kg_filter_nodes", ", ".join(
-                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
-                    ))
-                    weak_again = self._check_filter_selectivity(filter_nodes, db_path)
-                    if not weak_again:
-                        repick_fixed = True
-            if not repick_fixed:
-                # Deterministic fallback: replace vacuous range filters with best alternative
-                filter_nodes = self._auto_fix_vacuous_filters(filter_nodes, db_path)
-                weak_after_fix = self._check_filter_selectivity(filter_nodes, db_path)
-                if weak_after_fix:
-                    _weak_filter_hint = f"COLUMN WARNING: {weak_filters}\nThe filter column above is likely WRONG — use the suggested alternative column instead."
-                else:
-                    self._log("kg_filter_nodes", ", ".join(
-                        f"{n.table}.{n.column}{n.operator}{n.value}" for n in filter_nodes
-                    ))
-
-        # --- Step 3 post-0: Detect "per unit" computed filters ---
-        # Runs AFTER all repick cycles so the transform isn't overwritten.
-        _pre_per_unit = len(filter_nodes)
+        # 2d. Per-unit computed expressions (price/quantity patterns)
         filter_nodes = self._detect_per_unit_filters(question, filter_nodes, kg)
-        if len(filter_nodes) != _pre_per_unit or any(n.column.startswith("_expr:") for n in filter_nodes):
-            _weak_filter_hint = ""
 
-        # --- Step 3 post: Deterministic column override from exact question-word matches ---
-        # Runs AFTER all repick cycles so it has the final say on output columns.
+        # 2e. Intent signal enforcement (group HAVING, temporal, ordinal)
+        order_nodes: list[QueryNode] = []
+        order_by = picked.get("order_by")
+        if order_by and isinstance(order_by, dict):
+            ob_col = order_by.get("column", "")
+            if "." in ob_col:
+                ob_table, ob_name = ob_col.split(".", 1)
+                ob_table = ob_table.strip('"').strip("'")
+                ob_name = ob_name.strip('"').strip("'")
+                matched = self._fuzzy_match_column(ob_table, ob_name, kg)
+                if matched:
+                    order_nodes.append(QueryNode(table=matched[0], column=matched[1], role="order"))
+                elif kg.graph and f"{ob_table}.{ob_name}" in kg.graph.columns:
+                    order_nodes.append(QueryNode(table=ob_table, column=ob_name, role="order"))
+
+        filter_nodes, order_nodes = self._enforce_intent_signals(
+            user_intent, filter_nodes, order_nodes, output_nodes, picked, kg, db_path,
+        )
+
+        # 2f. Output column refinements
         output_nodes = self._override_columns_from_question(question, output_nodes, filter_nodes, kg, db_path)
 
-        # --- Step 3 post-a1: For SUM/AVG, prefer numeric column from the filter's detail table ---
-        # If the aggregation target is on a parent table but we filter on a child table,
-        # the sum should come from the child (actual values, not budgets/allocations).
-        # Only apply when the parent column name isn't explicitly mentioned in the question.
         _agg_comp = picked.get("computation_type", "simple_lookup")
         if _agg_comp in ("sum", "avg") and output_nodes and filter_nodes and db_path:
             _q_words_agg = set(re.findall(r'[a-z_]+', question.lower()))
@@ -420,7 +378,6 @@ class KGPlanningMixin:
             detail_tables = filter_tables - output_tables
             if detail_tables:
                 for i, node in enumerate(output_nodes):
-                    # Skip if the question explicitly mentions this column name
                     if node.column.lower() in _q_words_agg:
                         continue
                     ts = kg.get_table(node.table) if kg else None
@@ -435,7 +392,6 @@ class KGPlanningMixin:
                         continue
                     if node.table in detail_tables:
                         continue
-                    # This numeric output is on a parent table — look for better column in detail
                     for dt in detail_tables:
                         dt_schema = kg.get_table(dt)
                         if not dt_schema:
@@ -445,26 +401,17 @@ class KGPlanningMixin:
                                 cl = c.name.lower()
                                 if cl.endswith("id") or cl.startswith("link"):
                                     continue
-                                output_nodes[i] = QueryNode(
-                                    table=dt, column=c.name, role="output",
-                                )
+                                output_nodes[i] = QueryNode(table=dt, column=c.name, role="output")
                                 self._log("agg_detail_fix",
-                                    f"SUM/AVG target: {node.table}.{node.column} → {dt}.{c.name} "
-                                    f"(detail table has filter)")
+                                    f"SUM/AVG target: {node.table}.{node.column} → {dt}.{c.name}")
                                 break
                         break
 
-        # --- Step 3 post-a2: Resolve FK output columns to their display value ---
-        # If the output column is a foreign key (link_to_X, X_id with FK edge), replace it
-        # with the human-readable label column from the referenced table.
-        # Skip for aggregate operations — the FK column is being counted/summed, not displayed.
         _comp_type_for_resolve = picked.get("computation_type", "simple_lookup")
         if _comp_type_for_resolve not in ("avg", "count", "count_distinct", "sum", "ratio", "percentage"):
             output_nodes = self._resolve_fk_output_columns(output_nodes, kg, db_path)
 
-        # --- Step 3 post-b: List+lookup → PK when no attribute column named in question ---
-        # If shape=list, operation=lookup, and the question doesn't mention any non-PK column
-        # from the entity table, the user wants to enumerate rows → select the PK.
+        # List+lookup → PK when question doesn't name a specific attribute
         if output_nodes and kg and user_intent:
             _shape = ""
             _operation = ""
@@ -473,8 +420,6 @@ class KGPlanningMixin:
                     _shape = _line.split("Answer shape:")[1].strip().lower()
                 elif "Operation:" in _line:
                     _operation = _line.split("Operation:")[1].strip().lower()
-            # Only override for "list all" enumeration, NOT "which/what" questions
-            # (those ask for the display column, not the PK)
             _q_lower_pk = question.lower().strip()
             _is_enumeration = (
                 _q_lower_pk.startswith("list ")
@@ -518,22 +463,32 @@ class KGPlanningMixin:
                         output_nodes = [QueryNode(table=entity_table, column=pk_col, role="output")]
                         self._log("kg_list_pk_override", f"Overrode to {entity_table}.{pk_col}")
 
-        # --- Step 3c: Extract order_by column as a node for path planning ---
-        order_nodes: list[QueryNode] = []
-        order_by = picked.get("order_by")
-        if order_by and isinstance(order_by, dict):
-            ob_col = order_by.get("column", "")
-            if "." in ob_col:
-                ob_table, ob_name = ob_col.split(".", 1)
-                ob_table = ob_table.strip('"').strip("'")
-                ob_name = ob_name.strip('"').strip("'")
-                matched = self._fuzzy_match_column(ob_table, ob_name, kg)
-                if matched:
-                    order_nodes.append(QueryNode(table=matched[0], column=matched[1], role="order"))
-                elif kg.graph and f"{ob_table}.{ob_name}" in kg.graph.columns:
-                    order_nodes.append(QueryNode(table=ob_table, column=ob_name, role="order"))
+        # ===================================================================
+        # PHASE 3: VALIDATE-AND-FIX LOOP (probe DB, diagnose, fix)
+        # One unified loop replaces scattered repick + adaptive + weak-filter.
+        # Exit condition: filter set is plausible against the DB.
+        # ===================================================================
 
-        # --- Step 3d: Rules Engine (evidence-based filter/structure decisions) ---
+        # Drop filters on unreachable tables before probing
+        _output_tables = {n.table for n in output_nodes}
+        _filter_tables = {n.table for n in filter_nodes if not n.column.startswith("_expr:")}
+        _foreign_filter_tables = _filter_tables - _output_tables
+        if _foreign_filter_tables and kg:
+            _adj = build_adjacency(kg)
+            _anchor_table = output_nodes[0].table if output_nodes else ""
+            _unreachable: set[str] = set()
+            for ft in _foreign_filter_tables:
+                if find_shortest_path(_adj, _anchor_table, ft) is None:
+                    _unreachable.add(ft)
+            if _unreachable:
+                self._log("kg_path_unreachable",
+                          f"Tables {_unreachable} have no FK path to '{_anchor_table}'")
+                filter_nodes = [
+                    n for n in filter_nodes
+                    if n.table not in _unreachable or n.column.startswith("_expr:")
+                ]
+
+        # Run rules engine (threshold inference, ratio structure, decomposition)
         from data_agent_baseline.pipeline.rules_engine import run_rules_engine
         comp_type = picked.get("computation_type", "simple_lookup")
         engine_out = run_rules_engine(
@@ -588,8 +543,6 @@ class KGPlanningMixin:
         # Inject rules engine directives into grounding
         if engine_out.sql_directives:
             grounding += "\n" + "\n".join(engine_out.sql_directives)
-        if _weak_filter_hint:
-            grounding += "\n" + _weak_filter_hint
 
         # --- Step 5b: Positional (Nth) with PREFIX_N ID pattern → numeric ordering ---
         ordinal_match = re.search(
@@ -753,8 +706,8 @@ class KGPlanningMixin:
 
         graph_dump = "\n\n".join(graph_parts)
 
-        anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:2000]}" if anchor_text else ""
-        intent_section = f"\nUSER INTENT:\n{user_intent}" if user_intent else ""
+        intent_section = f"\nUSER INTENT (primary — this is what the user wants):\n{user_intent}" if user_intent else ""
+        anchor_section = f"\nDOMAIN KNOWLEDGE (supports the intent — defines terms and valid values):\n{anchor_text[:2000]}" if anchor_text else ""
 
         # Question-filtered context: only surface entries relevant to THIS question
         q_words = set(question.lower().split())
@@ -805,11 +758,55 @@ class KGPlanningMixin:
                     + "\n".join(ont_lines[:10])
                 )
 
+        # Value pre-grounding: look up question terms in the KG value index
+        # so the LLM knows exactly WHERE each filter value lives
+        value_section = ""
+        if g:
+            _stop = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "on", "at",
+                     "to", "for", "and", "or", "by", "with", "from", "that", "this",
+                     "it", "its", "be", "has", "had", "have", "do", "does", "did",
+                     "how", "many", "much", "what", "which", "who", "where", "when",
+                     "than", "more", "less", "most", "least", "not", "no", "all",
+                     "each", "every", "any", "some", "their", "them", "they", "we",
+                     "our", "he", "she", "his", "her", "among", "between", "into",
+                     "about", "over", "under", "above", "below", "after", "before"}
+            _q_tokens = [w.strip("?.,!\"'()") for w in question.split()]
+            _q_tokens_lower = [t.lower() for t in _q_tokens if t]
+            # Build candidate phrases: bigrams first (more specific), then unigrams
+            _candidates: list[str] = []
+            for i in range(len(_q_tokens_lower) - 1):
+                a, b = _q_tokens_lower[i], _q_tokens_lower[i + 1]
+                if a not in _stop and b not in _stop and len(a) > 1 and len(b) > 1:
+                    _candidates.append(f"{_q_tokens[i]} {_q_tokens[i + 1]}")
+            for i, t in enumerate(_q_tokens_lower):
+                if t not in _stop and len(t) > 2:
+                    _candidates.append(_q_tokens[i])
+            # Look up each candidate, deduplicate by (table, column, value)
+            _seen_matches: set[str] = set()
+            _value_lines: list[str] = []
+            for phrase in _candidates:
+                if len(_value_lines) >= 10:
+                    break
+                hits = g.find_value(phrase)
+                for tbl, col, cnt in hits:
+                    key = f"{tbl}.{col}={phrase.lower()}"
+                    if key in _seen_matches:
+                        continue
+                    _seen_matches.add(key)
+                    _value_lines.append(f'  "{phrase}" → {tbl}.{col}')
+                    if len(_value_lines) >= 10:
+                        break
+            if _value_lines:
+                value_section = (
+                    "\nVALUE MATCHES (these values EXIST in the DB — use these exact columns for filters):\n"
+                    + "\n".join(_value_lines)
+                )
+
         prompt = f"""QUESTION: {question}
 
 PROPERTY GRAPH:
 {graph_dump[:6000]}
-{anchor_section}{intent_section}{concept_section}{ontology_section}
+{intent_section}{anchor_section}{concept_section}{ontology_section}{value_section}
 
 HOW TO READ THE GRAPH:
 - Each TABLE has columns with their SQL types. Some columns show known "values:" — these are categorical values in that column.
@@ -820,10 +817,12 @@ HOW TO READ THE GRAPH:
 YOUR TASK: Pick exact columns from this graph to answer the question.
 
 PRIORITY (resolve conflicts in this order):
-1. QUESTION — the user's exact words. If a word matches a column name, use that column.
-2. DOMAIN KNOWLEDGE — defines what terms mean in this database. Overrides everyday English.
-3. CONCEPT MAP — if a question term doesn't match any column name, check the concept map for the best column mapping.
-4. Your own inference — only if 1-3 don't apply.
+1. USER INTENT — this tells you what the user wants returned and how to compute it. Follow it.
+2. DOMAIN KNOWLEDGE — defines what terms mean in this database. When a question term (like "track number") is defined in domain knowledge, use the column it maps to — even if another column literally contains the word.
+3. VALUE MATCHES — if a value is confirmed to exist in a specific column, filter on that column.
+4. QUESTION — the user's exact words. Only use literal column name matching if 1-3 don't resolve it.
+5. CONCEPT MAP — if a question term doesn't match any column name, check the concept map for the best column mapping.
+6. Your own inference — only if 1-5 don't apply.
 
 Return ONLY JSON:
 {{
@@ -844,7 +843,7 @@ CONSTRAINTS:
 - For "best/lowest/highest/fastest" questions, use order_by instead of equality filters on position/rank columns.
 - For filter values, use the EXACT format shown in "values:" or DOMAIN KNOWLEDGE. If unsure of the format, use LIKE with a partial match.
 - "List all X" / "What are the X" without specifying WHICH columns to show → select ONLY the primary key or identifier column of the entity (e.g. trans_id, Id, order_id). Do NOT guess descriptive columns unless the question explicitly asks for them (e.g. "list the names", "show dates and amounts").
-- ONE filter per concept: if two columns in the same table both contain a matching value, pick the column whose overall vocabulary best describes the concept. Do not filter on both — redundant filters risk returning 0 rows.
+- ONE filter per concept: if VALUE MATCHES shows which column holds a value, use THAT column. Otherwise, if two columns in the same table both contain a matching value, pick the column whose overall vocabulary best describes the concept. Do not filter on both — redundant filters risk returning 0 rows.
 - "Normal level" means the value falls WITHIN the healthy range — use TWO conditions: >= lower_bound AND <= upper_bound (e.g. WBC >= 3.5 AND WBC <= 9.0 keeps only normal values). "Abnormal level" means the value falls OUTSIDE the healthy range — use a SINGLE condition on whichever side the data actually falls (e.g. Column < lower OR Column > upper), OR use IS NOT NULL if the column's data range (shown above) is entirely outside the standard normal range."""
 
         messages = [ModelMessage(role="user", content=prompt)]
@@ -914,6 +913,18 @@ CONSTRAINTS:
             value = cond.get("value", "")
             if "." not in col_ref:
                 errors.append(f"Invalid filter column (no dot): {col_ref}")
+                continue
+
+            # Detect aggregate filter: "COUNT(table.col)", "SUM(table.col)", etc.
+            agg_match = re.match(
+                r'(COUNT|SUM|AVG|MIN|MAX)\((\w+)\.(\w+)\)', col_ref, re.IGNORECASE
+            )
+            if agg_match:
+                agg_func, agg_table, agg_col = agg_match.groups()
+                filter_nodes.append(QueryNode(
+                    table=agg_table, column=f"_expr:{agg_func}(\"{agg_table}\".\"{agg_col}\")",
+                    role="filter", operator=operator, value=value,
+                ))
                 continue
 
             # Detect computed expressions: "table.col1/table.col2" or "table.col1/col2"
@@ -1689,4 +1700,297 @@ CONSTRAINTS:
                     )
 
         return "\n".join(issues), entity_found_in
+
+    # ------------------------------------------------------------------
+    # Deterministic intent signal enforcement
+    # ------------------------------------------------------------------
+
+    def _enforce_intent_signals(
+        self,
+        user_intent: str,
+        filter_nodes: list[QueryNode],
+        order_nodes: list[QueryNode],
+        output_nodes: list[QueryNode],
+        picked: dict[str, Any],
+        kg: KnowledgeGraph,
+        db_path: Path | None,
+    ) -> tuple[list[QueryNode], list[QueryNode]]:
+        """Deterministically enforce intent signals that the picker LLM may have missed.
+
+        Consumes: group_condition, temporal_filter, ordinal, sort_direction.
+        Returns updated (filter_nodes, order_nodes).
+        """
+        if not user_intent:
+            return filter_nodes, order_nodes
+
+        # Parse intent signals
+        group_condition = ""
+        temporal_filter = ""
+        ordinal = ""
+        sort_direction = ""
+        for line in user_intent.split("\n"):
+            if "Group condition (HAVING):" in line:
+                group_condition = line.split("Group condition (HAVING):")[1].strip()
+            elif "Temporal filter:" in line:
+                temporal_filter = line.split("Temporal filter:")[1].strip()
+            elif "Ordinal:" in line:
+                ordinal = line.split("Ordinal:")[1].strip()
+            elif "Sort:" in line:
+                sort_direction = line.split("Sort:")[1].strip()
+
+        # --- 1. Group condition → HAVING filter ---
+        # If intent detected a group condition but no _expr: filter exists, inject one.
+        if group_condition:
+            has_expr_filter = any(n.column.startswith("_expr:") for n in filter_nodes)
+            if not has_expr_filter:
+                injected = self._inject_group_condition(
+                    group_condition, filter_nodes, output_nodes, kg, db_path,
+                )
+                if injected:
+                    filter_nodes = injected
+                    self._log("intent_enforce_having",
+                              f"Injected HAVING from group_condition: {group_condition}")
+
+        # --- 2. Temporal filter → date/year condition ---
+        # If intent detected a time constraint but no date filter exists, inject one.
+        if temporal_filter:
+            has_temporal = any(
+                "date" in n.column.lower() or "year" in n.column.lower()
+                or "time" in n.column.lower() or "season" in n.column.lower()
+                for n in filter_nodes
+            )
+            if not has_temporal:
+                injected = self._inject_temporal_filter(
+                    temporal_filter, filter_nodes, output_nodes, kg, db_path,
+                )
+                if injected:
+                    filter_nodes = injected
+                    self._log("intent_enforce_temporal",
+                              f"Injected temporal filter: {temporal_filter}")
+
+        # --- 3. Ordinal + sort_direction → ORDER BY ---
+        # If intent detected a positional selector but picker has no order_by, inject one.
+        if ordinal and not order_nodes:
+            new_order = self._inject_ordinal_order(
+                ordinal, sort_direction, output_nodes, filter_nodes, kg, db_path,
+            )
+            if new_order:
+                order_nodes = new_order
+                self._log("intent_enforce_ordinal",
+                          f"Injected ORDER BY from ordinal={ordinal}, dir={sort_direction}")
+        elif sort_direction and sort_direction.upper() in ("ASC", "DESC") and not order_nodes:
+            new_order = self._inject_ordinal_order(
+                "", sort_direction, output_nodes, filter_nodes, kg, db_path,
+            )
+            if new_order:
+                order_nodes = new_order
+                self._log("intent_enforce_sort",
+                          f"Injected ORDER BY from sort_direction={sort_direction}")
+
+        return filter_nodes, order_nodes
+
+    def _inject_group_condition(
+        self,
+        group_condition: str,
+        filter_nodes: list[QueryNode],
+        output_nodes: list[QueryNode],
+        kg: KnowledgeGraph,
+        db_path: Path | None,
+    ) -> list[QueryNode] | None:
+        """Parse a group condition string and inject a HAVING _expr: filter."""
+        # Extract the aggregate pattern: "more than N", "at least N", "total X > N"
+        cond_lower = group_condition.lower()
+
+        # Parse threshold
+        num_match = re.search(r'(\d+(?:\.\d+)?)', group_condition)
+        if not num_match:
+            return None
+        threshold = num_match.group(1)
+
+        # Parse operator
+        if "more than" in cond_lower or "greater than" in cond_lower or "above" in cond_lower:
+            operator = ">"
+        elif "at least" in cond_lower or "no less than" in cond_lower:
+            operator = ">="
+        elif "fewer than" in cond_lower or "less than" in cond_lower or "below" in cond_lower:
+            operator = "<"
+        elif "at most" in cond_lower or "no more than" in cond_lower:
+            operator = "<="
+        else:
+            operator = ">"
+
+        # Determine aggregate function
+        if re.search(r'\b(?:total|sum)\b', cond_lower):
+            agg_func = "SUM"
+        elif re.search(r'\b(?:average|avg|mean)\b', cond_lower):
+            agg_func = "AVG"
+        else:
+            agg_func = "COUNT"
+
+        # Find the table to count from. Look for a detail/child table that
+        # connects to the output table via FK.
+        entity_table = output_nodes[0].table if output_nodes else ""
+        if not entity_table:
+            return None
+
+        # Find a table that references the entity table (child → parent FK)
+        count_table = ""
+        count_col = ""
+        if kg and kg.graph:
+            for edge in kg.graph.fk_edges:
+                src_col_node = kg.graph.columns.get(edge.src)
+                dst_col_node = kg.graph.columns.get(edge.dst)
+                if not src_col_node or not dst_col_node:
+                    continue
+                # Child table's FK → parent table's PK
+                if dst_col_node.table_id == entity_table and src_col_node.table_id != entity_table:
+                    count_table = src_col_node.table_id
+                    count_col = src_col_node.name
+                    break
+                # Or: entity is the child, parent is different
+                if src_col_node.table_id == entity_table and dst_col_node.table_id != entity_table:
+                    count_table = dst_col_node.table_id
+                    count_col = dst_col_node.name
+                    break
+
+        if not count_table or not count_col:
+            # Fallback: use entity table itself with its PK
+            ts = kg.get_table(entity_table)
+            if ts and ts.columns:
+                count_table = entity_table
+                count_col = ts.columns[0].name
+            else:
+                return None
+
+        # Build the _expr: filter
+        expr_sql = f'{agg_func}("{count_table}"."{count_col}")'
+        new_filter = QueryNode(
+            table=count_table, column=f"_expr:{expr_sql}",
+            role="filter", operator=operator, value=threshold,
+        )
+        return list(filter_nodes) + [new_filter]
+
+    def _inject_temporal_filter(
+        self,
+        temporal_filter: str,
+        filter_nodes: list[QueryNode],
+        output_nodes: list[QueryNode],
+        kg: KnowledgeGraph,
+        db_path: Path | None,
+    ) -> list[QueryNode] | None:
+        """Inject a year/date filter from the temporal_filter intent signal."""
+        if not db_path or not db_path.exists():
+            return None
+
+        # Extract year(s) from temporal_filter
+        year_match = re.search(r'\b((?:19|20)\d{2})\b', temporal_filter)
+        if not year_match:
+            return None
+        year = year_match.group(1)
+
+        # Find date/year columns in tables involved in the query + 1-hop neighbors
+        involved_tables = {n.table for n in output_nodes} | {n.table for n in filter_nodes}
+        if not involved_tables:
+            return None
+
+        best_col: tuple[str, str] | None = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            for tname in involved_tables:
+                ts = kg.get_table(tname)
+                if not ts:
+                    continue
+                for col in ts.columns:
+                    cl = col.name.lower()
+                    if "date" in cl or "year" in cl or cl == "season" or "time" in cl:
+                        # Verify the year exists in this column
+                        row = conn.execute(
+                            f'SELECT 1 FROM "{tname}" WHERE CAST("{col.name}" AS TEXT) LIKE ? LIMIT 1',
+                            (f"%{year}%",),
+                        ).fetchone()
+                        if row:
+                            best_col = (tname, col.name)
+                            break
+                if best_col:
+                    break
+            conn.close()
+        except Exception:
+            return None
+
+        if not best_col:
+            return None
+
+        tname, col_name = best_col
+        # Decide filter format based on column type
+        ts = kg.get_table(tname)
+        col_type = "TEXT"
+        if ts:
+            for c in ts.columns:
+                if c.name == col_name:
+                    col_type = c.sql_type.upper()
+                    break
+
+        if "year" in col_name.lower() or col_type in ("INTEGER", "INT"):
+            new_filter = QueryNode(
+                table=tname, column=col_name,
+                role="filter", operator="=", value=year,
+            )
+        else:
+            new_filter = QueryNode(
+                table=tname, column=col_name,
+                role="filter", operator="LIKE", value=f"%{year}%",
+            )
+
+        return list(filter_nodes) + [new_filter]
+
+    def _inject_ordinal_order(
+        self,
+        ordinal: str,
+        sort_direction: str,
+        output_nodes: list[QueryNode],
+        filter_nodes: list[QueryNode],
+        kg: KnowledgeGraph,
+        db_path: Path | None,
+    ) -> list[QueryNode] | None:
+        """Inject an ORDER BY node from ordinal/sort_direction intent signals."""
+        # Determine direction
+        direction = "ASC"
+        if sort_direction and sort_direction.upper() in ("ASC", "DESC"):
+            direction = sort_direction.upper()
+        elif ordinal:
+            ord_lower = ordinal.lower()
+            if any(w in ord_lower for w in ("last", "latest", "newest", "highest", "most", "best", "top", "champion", "winner")):
+                direction = "DESC"
+            elif any(w in ord_lower for w in ("first", "earliest", "oldest", "lowest", "least", "worst", "bottom")):
+                direction = "ASC"
+
+        # Find the best ordering column from the output/filter tables
+        entity_table = output_nodes[0].table if output_nodes else ""
+        if not entity_table:
+            return None
+
+        ts = kg.get_table(entity_table)
+        if not ts:
+            return None
+
+        # Look for a numeric column that makes sense for ordering
+        # Priority: date columns > numeric non-PK columns > PK
+        order_col = None
+        for col in ts.columns:
+            cl = col.name.lower()
+            if "date" in cl or "time" in cl or "year" in cl:
+                order_col = col.name
+                break
+        if not order_col:
+            for col in ts.columns:
+                cl = col.name.lower()
+                if col.sql_type.upper() in ("REAL", "FLOAT", "INTEGER", "INT", "NUMERIC"):
+                    if not (cl.endswith("id") or cl.startswith("link")):
+                        order_col = col.name
+                        break
+
+        if not order_col:
+            return None
+
+        return [QueryNode(table=entity_table, column=order_col, role="order")]
 
