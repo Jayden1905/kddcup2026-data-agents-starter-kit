@@ -409,8 +409,12 @@ class GroundingFormatMixin:
         # Pass derived_logic to SQL LLM — it describes the computation in plain language
         # and helps the SQL LLM understand the intent even when comp_type is imprecise.
         # Suppress if it references columns contradicting OUTPUT COLUMNS (picker hallucination).
+        # Also suppress when question involves normal/abnormal thresholds — the derived_logic
+        # contains pre-correction threshold values that may conflict with rule-corrected CONDITIONS.
         derived_logic = goal.get("derived_logic", "")
-        if derived_logic and path.output_nodes:
+        _q_lower_dl = (user_intent or goal.get("what_user_wants", "")).lower()
+        _has_normal_abnormal = "normal" in _q_lower_dl or "abnormal" in _q_lower_dl
+        if derived_logic and path.output_nodes and not _has_normal_abnormal:
             _out_tables = {n.table.lower() for n in path.output_nodes}
             _mentioned_cols = re.findall(r'(\w+)\.(\w+)', derived_logic)
             _contradicts = any(
@@ -935,8 +939,34 @@ class GroundingFormatMixin:
                     )
             else:
                 fv_lines: list[str] = []
+                # Detect OR-range patterns: same column with < and > (abnormal = outside range)
+                _range_or_cols: set[str] = set()
+                _col_ops: dict[str, list[str]] = {}
+                for node in path.filter_nodes:
+                    if node.operator in ("<", ">"):
+                        _col_key = f"{node.table}.{node.column}"
+                        _col_ops.setdefault(_col_key, []).append(node.operator)
+                for _ck, _ops in _col_ops.items():
+                    if "<" in _ops and ">" in _ops:
+                        _range_or_cols.add(_ck)
+
+                _range_or_emitted: set[str] = set()
                 for node in path.filter_nodes:
                     if having_skeleton_fk and node.column == having_skeleton_fk:
+                        continue
+                    _col_key = f"{node.table}.{node.column}"
+                    # Emit OR-range as a single line instead of two contradictory AND lines
+                    if _col_key in _range_or_cols and node.operator in ("<", ">"):
+                        if _col_key not in _range_or_emitted:
+                            _range_or_emitted.add(_col_key)
+                            _lo_nodes = [n for n in path.filter_nodes if f"{n.table}.{n.column}" == _col_key and n.operator == "<"]
+                            _hi_nodes = [n for n in path.filter_nodes if f"{n.table}.{n.column}" == _col_key and n.operator == ">"]
+                            lo_val = _lo_nodes[0].value if _lo_nodes else None
+                            hi_val = _hi_nodes[0].value if _hi_nodes else None
+                            tbl, col = _col_key.split(".", 1)
+                            fv_lines.append(
+                                f'  "{tbl}"."{col}": < {lo_val} OR > {hi_val} (abnormal = outside [{lo_val}, {hi_val}])'
+                            )
                         continue
                     if node.column.startswith("_expr:"):
                         if having_skeleton:

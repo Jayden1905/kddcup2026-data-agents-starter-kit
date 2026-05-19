@@ -328,14 +328,28 @@ def rule_coverage_simplification(ctx: EngineContext) -> RuleResult | None:
     Trigger: numeric condition matches every non-null row (the threshold is below min or above max).
     Evidence: count with threshold == count without threshold.
     Action: Replace with IS NOT NULL (the condition is vacuous but existence matters).
+
+    Exception: Skip columns related to normal/abnormal semantics — the explicit threshold
+    is informational for the LLM even when it matches all rows.
     """
     if not ctx.db_path:
         return None
+
+    # Identify columns involved in normal/abnormal semantics — keep their thresholds explicit.
+    # A range filter (< or >) on a column near "normal"/"abnormal" was likely set by
+    # rule_normal_abnormal_resolution — don't erase its semantic content.
+    q = ctx.question_lower
+    has_normal_abnormal = "normal" in q or "abnormal" in q
 
     changes: list[tuple[int, str]] = []
     for i, n in enumerate(ctx.filter_nodes):
         if n.operator in ("=", "LIKE", "IN", "IS NOT NULL"):
             continue
+        # Don't simplify range thresholds on columns involved in normal/abnormal semantics
+        if has_normal_abnormal and n.operator in ("<", ">", "<=", ">="):
+            col_lower = n.column.lower()
+            if _col_near_keyword(col_lower, "normal", q) or _col_near_keyword(col_lower, "abnormal", q):
+                continue
         total = ctx.total_non_null(n.table, n.column)
         if total <= 0:
             continue
@@ -409,13 +423,23 @@ def rule_cross_row_structure(ctx: EngineContext) -> RuleResult | None:
     subq_parts: list[str] = []
     for col, filters in col_groups.items():
         conditions: list[str] = []
-        for f in filters:
-            if f.operator == "IS NOT NULL":
-                conditions.append(f'"{f.column}" IS NOT NULL')
-            else:
-                conditions.append(f'"{f.column}" {f.operator} \'{f.value}\'')
-        conditions = list(dict.fromkeys(conditions))
-        where_clause = " AND ".join(conditions)
+        has_lt = any(f.operator == "<" for f in filters)
+        has_gt = any(f.operator == ">" for f in filters)
+        if has_lt and has_gt:
+            # OR-range: abnormal = outside normal range
+            for f in filters:
+                if f.operator in ("<", ">"):
+                    conditions.append(f'"{f.column}" {f.operator} \'{f.value}\'')
+            conditions = list(dict.fromkeys(conditions))
+            where_clause = " OR ".join(conditions)
+        else:
+            for f in filters:
+                if f.operator == "IS NOT NULL":
+                    conditions.append(f'"{f.column}" IS NOT NULL')
+                else:
+                    conditions.append(f'"{f.column}" {f.operator} \'{f.value}\'')
+            conditions = list(dict.fromkeys(conditions))
+            where_clause = " AND ".join(conditions)
         subq_parts.append(
             f'"{entity_table}"."{pk_col}" IN '
             f'(SELECT "{pk_col}" FROM "{entity_table}" WHERE {where_clause})'
@@ -514,46 +538,51 @@ def rule_normal_abnormal_resolution(ctx: EngineContext) -> RuleResult | None:
         if is_abnormal_target:
             if normal_range:
                 norm_low, norm_high = normal_range
-                if data_max < norm_low or data_min > norm_high:
+                below_count = ctx.count_matching(table, column, "<", norm_low)
+                above_count = ctx.count_matching(table, column, ">", norm_high)
+                if below_count > 0 and above_count > 0:
                     replacements[indices[0]] = QueryNode(
                         table=table, column=column, role="filter",
-                        operator="IS NOT NULL", value="",
+                        operator="<", value=str(norm_low),
                     )
-                    for idx in indices[1:]:
-                        replacements[idx] = None
-                    log_entries.append(("rule_abnormal", f"{key}: data [{data_min},{data_max}] entirely outside normal [{norm_low},{norm_high}] → IS NOT NULL"))
-                else:
-                    below_count = ctx.count_matching(table, column, "<", norm_low)
-                    above_count = ctx.count_matching(table, column, ">", norm_high)
-                    if below_count > 0 and above_count > 0:
-                        replacements[indices[0]] = QueryNode(
-                            table=table, column=column, role="filter",
-                            operator="<", value=str(norm_low),
-                        )
-                        if len(indices) > 1:
-                            replacements[indices[1]] = QueryNode(
-                                table=table, column=column, role="filter",
-                                operator=">", value=str(norm_high),
-                            )
-                        for idx in indices[2:]:
-                            replacements[idx] = None
-                        log_entries.append(("rule_abnormal", f"{key}: abnormal = < {norm_low} OR > {norm_high}"))
-                    elif below_count > 0:
-                        replacements[indices[0]] = QueryNode(
-                            table=table, column=column, role="filter",
-                            operator="<", value=str(norm_low),
-                        )
-                        for idx in indices[1:]:
-                            replacements[idx] = None
-                        log_entries.append(("rule_abnormal", f"{key}: abnormal = < {norm_low}"))
-                    elif above_count > 0:
-                        replacements[indices[0]] = QueryNode(
+                    if len(indices) > 1:
+                        replacements[indices[1]] = QueryNode(
                             table=table, column=column, role="filter",
                             operator=">", value=str(norm_high),
                         )
-                        for idx in indices[1:]:
-                            replacements[idx] = None
-                        log_entries.append(("rule_abnormal", f"{key}: abnormal = > {norm_high}"))
+                    for idx in indices[2:]:
+                        replacements[idx] = None
+                    log_entries.append(("rule_abnormal", f"{key}: abnormal = < {norm_low} OR > {norm_high}"))
+                elif below_count > 0:
+                    replacements[indices[0]] = QueryNode(
+                        table=table, column=column, role="filter",
+                        operator="<", value=str(norm_low),
+                    )
+                    for idx in indices[1:]:
+                        replacements[idx] = None
+                    log_entries.append(("rule_abnormal", f"{key}: abnormal = < {norm_low}"))
+                elif above_count > 0:
+                    replacements[indices[0]] = QueryNode(
+                        table=table, column=column, role="filter",
+                        operator=">", value=str(norm_high),
+                    )
+                    for idx in indices[1:]:
+                        replacements[idx] = None
+                    log_entries.append(("rule_abnormal", f"{key}: abnormal = > {norm_high}"))
+                else:
+                    # No data outside normal range — keep explicit threshold so SQL returns 0
+                    replacements[indices[0]] = QueryNode(
+                        table=table, column=column, role="filter",
+                        operator="<", value=str(norm_low),
+                    )
+                    if len(indices) > 1:
+                        replacements[indices[1]] = QueryNode(
+                            table=table, column=column, role="filter",
+                            operator=">", value=str(norm_high),
+                        )
+                    for idx in indices[2:]:
+                        replacements[idx] = None
+                    log_entries.append(("rule_abnormal", f"{key}: abnormal = < {norm_low} OR > {norm_high} (0 rows match)"))
 
         elif is_normal_target:
             if normal_range:

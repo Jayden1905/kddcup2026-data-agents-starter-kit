@@ -761,6 +761,24 @@ class QuestionDrivenAgent(
             keep_sections.extend(current_section)
         step_grounding = "\n".join(keep_sections).strip()
 
+        # Remove CONDITIONS lines where the same column appears multiple times
+        # (these are per-step values like position=1 and position=33 that confuse the LLM).
+        # Keep only conditions on columns that appear once (shared population filters).
+        cond_lines = re.findall(r'^\s*"(\w+)"\."(\w+)":.+$', step_grounding, re.MULTILINE)
+        if cond_lines:
+            col_counts: dict[str, int] = {}
+            for tbl, col in cond_lines:
+                col_counts[f"{tbl}.{col}"] = col_counts.get(f"{tbl}.{col}", 0) + 1
+            dup_cols = {k for k, v in col_counts.items() if v > 1}
+            if dup_cols:
+                filtered_lines = []
+                for line in step_grounding.split("\n"):
+                    m = re.match(r'^\s*"(\w+)"\."(\w+)":', line)
+                    if m and f"{m.group(1)}.{m.group(2)}" in dup_cols:
+                        continue
+                    filtered_lines.append(line)
+                step_grounding = "\n".join(filtered_lines)
+
         prompt = f"""Step: {step_description}
 
 {step_grounding}
