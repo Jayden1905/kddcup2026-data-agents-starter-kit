@@ -23,7 +23,6 @@ from data_agent_baseline.agents.runtime import AgentRunResult
 from data_agent_baseline.benchmark.schema import PublicTask
 from data_agent_baseline.pipeline.context_scanner import scan_context
 from data_agent_baseline.pipeline.kg_builder import (
-    KnowledgeGraph,
     build_kg_from_sqlite,
     build_ontology,
     classify_columns_with_llm,
@@ -417,6 +416,7 @@ class QuestionDrivenAgent(
             # Step 5c: Threshold inference — infer normal/abnormal ranges if needed
             threshold_context = self._infer_thresholds(
                 question, db_path, kg, ctx.knowledge_text,
+                grounding_context=grounding_context,
             )
             if threshold_context:
                 self._log("threshold_inference", threshold_context)
@@ -467,6 +467,16 @@ class QuestionDrivenAgent(
                     break
 
                 self._log("sql_generated" if attempt == 0 else f"sql_retry_{attempt}", sql)
+
+                # Concept coverage check: verify all grounding filter concepts appear in SQL
+                if attempt == 0:
+                    missing = self._check_concept_coverage(sql, grounding_context, question)
+                    if missing:
+                        self._log("concept_gap", missing)
+                        gaps = f"MISSING FILTER CONCEPTS: {missing}\nFailed SQL: {sql}"
+                        failed_sqls.append(sql)
+                        continue
+
                 data_result = self._try_sql(db_path, sql)
 
                 if data_result and data_result.get("rows"):
@@ -729,7 +739,7 @@ class QuestionDrivenAgent(
         # Strip grounding to factual sections only —
         # remove USER WANTS, COMPUTATION TYPE, VALUE COMPARISON, RATIO PATTERN, etc.
         # that cause the LLM to solve the whole question instead of one step.
-        keep_headers = ("SCHEMA", "JOIN PATHS", "FILTER VALUES", "ORDER BY")
+        keep_headers = ("TABLES:", "SCHEMA", "JOIN", "FILTER VALUES", "ORDER BY", "CONDITIONS:")
         keep_sections: list[str] = []
         current_section: list[str] = []
         current_header = ""
@@ -761,6 +771,7 @@ Write ONE SQL that returns exactly one row with one numeric value.
 - SELECT one column only. No subqueries in SELECT.
 - Simple: SELECT col FROM table WHERE ... LIMIT 1
 - Quote identifiers with double-quotes.
+- ONLY use table and column names from the TABLES section above. NEVER invent column names.
 - For non-aggregate: WHERE col IS NOT NULL. For AVG/SUM/COUNT: do NOT add IS NOT NULL on aggregated columns.
 - If a JOIN returns 0 rows, use WHERE "col" IN (SELECT ...) instead.
 
@@ -913,12 +924,11 @@ Return ONLY: {{"result": <number>}}"""
             agg_pattern = re.compile(
                 r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(', re.IGNORECASE,
             )
-            agg_idx = next(
-                (i for i, c in enumerate(columns) if agg_pattern.match(c)), None,
-            )
-            if agg_idx is not None:
+            agg_indices = [i for i, c in enumerate(columns) if agg_pattern.match(c)]
+            # Only drop when exactly ONE column is aggregate (the other is descriptive)
+            if len(agg_indices) == 1:
+                agg_idx = agg_indices[0]
                 q_lower = question.lower()
-                # Only drop if the question does NOT explicitly ask for counts/breakdown
                 asks_for_count = bool(re.search(
                     r'\bhow many (?:of each|per|for each|times each)\b'
                     r'|\bcount (?:of|for) each\b'
@@ -1358,6 +1368,19 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                 if fix_result and fix_result.get("rows") and 0 < len(fix_result["rows"]) < len(rows):
                     self._log("shape_fixed_singular", f"Narrowed from {len(rows)} to {len(fix_result['rows'])} rows")
                     return fix_result
+
+        # Deduplicate: when a single-column result is overwhelmingly duplicates,
+        # it's almost certainly meant to be distinct values (e.g., 78 rows with 7 unique).
+        rows = data_result.get("rows", [])
+        cols = data_result.get("columns", [])
+        if len(cols) == 1 and len(rows) > 1:
+            unique_vals = list(dict.fromkeys(tuple(r) for r in rows))
+            if len(unique_vals) < len(rows) * 0.3:
+                data_result = {
+                    "columns": cols,
+                    "rows": [list(v) for v in unique_vals],
+                }
+                self._log("dedup_result", f"Deduped {len(rows)} → {len(unique_vals)} unique values")
 
         return data_result
 

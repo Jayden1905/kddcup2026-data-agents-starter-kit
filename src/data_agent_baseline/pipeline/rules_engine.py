@@ -483,6 +483,18 @@ def rule_normal_abnormal_resolution(ctx: EngineContext) -> RuleResult | None:
             is_normal_target = _col_near_keyword(col_lower, "normal", ctx.question_lower)
             is_abnormal_target = _col_near_keyword(col_lower, "abnormal", ctx.question_lower)
 
+        # When both flags are set, disambiguate by checking which clause the column belongs to
+        if is_normal_target and is_abnormal_target:
+            in_normal_clause = _col_in_clause_with_keyword(col_lower, "normal", ctx.question_lower)
+            in_abnormal_clause = _col_in_clause_with_keyword(col_lower, "abnormal", ctx.question_lower)
+            if in_normal_clause and not in_abnormal_clause:
+                is_abnormal_target = False
+            elif in_abnormal_clause and not in_normal_clause:
+                is_normal_target = False
+            else:
+                is_normal_target = False
+                is_abnormal_target = False
+
         if not is_normal_target and not is_abnormal_target:
             continue
 
@@ -903,12 +915,36 @@ def rule_ratio_pattern(ctx: EngineContext) -> RuleResult | None:
                 f"  Use: SELECT CAST(SUM(CASE WHEN [numerator_condition] THEN value END) AS REAL) / SUM(CASE WHEN [denominator_condition] THEN value END)"
             )
     else:
-        directive = (
-            f"RATIO PATTERN: This is a percentage/ratio question.\n"
-            f"  Population (denominator): {population_text}\n"
-            f"  Subset (numerator): {metric_text}\n"
-            f"  Use: SELECT CAST(COUNT(CASE WHEN [subset_condition] THEN 1 END) AS REAL) * 100 / COUNT(*)"
-        )
+        # Detect independent ratio: filters on 2+ tables with same entity value,
+        # where the filter columns are NOT the FK columns joining the tables.
+        # In that case, counts must be computed as independent scalar subqueries.
+        _filter_tables_by_val: dict[str, set[str]] = {}
+        for fn in ctx.filter_nodes:
+            if not fn.column.startswith("_expr:") and fn.operator == "=":
+                _filter_tables_by_val.setdefault(fn.table, set()).add(str(fn.value))
+        _ft_list = list(_filter_tables_by_val.keys())
+        _shared_entity_vals = set()
+        if len(_ft_list) >= 2:
+            _shared_entity_vals = _filter_tables_by_val[_ft_list[0]]
+            for _ft in _ft_list[1:]:
+                _shared_entity_vals = _shared_entity_vals & _filter_tables_by_val[_ft]
+
+        if _shared_entity_vals and len(_ft_list) >= 2:
+            directive = (
+                f"INDEPENDENT RATIO: The numerator and denominator are independent counts from "
+                f"separate tables — do NOT JOIN them. Compute each as a scalar subquery.\n"
+                f"  Numerator: COUNT rows in first table matching the entity filter\n"
+                f"  Denominator: COUNT rows in second table matching the entity filter\n"
+                f"  Use: SELECT CAST((SELECT COUNT(*) FROM table1 WHERE filter) AS REAL) "
+                f"/ (SELECT COUNT(*) FROM table2 WHERE filter)"
+            )
+        else:
+            directive = (
+                f"RATIO PATTERN: This is a percentage/ratio question.\n"
+                f"  Population (denominator): {population_text}\n"
+                f"  Subset (numerator): {metric_text}\n"
+                f"  Use: SELECT CAST(COUNT(CASE WHEN [subset_condition] THEN 1 END) AS REAL) * 100 / COUNT(*)"
+            )
     return RuleResult(
         sql_directives=[directive],
         log_entries=[("rule_ratio", "Detected ratio pattern")]
@@ -1419,6 +1455,15 @@ def _col_near_keyword(col_lower: str, keyword: str, question: str) -> bool:
             for kp in kw_positions:
                 if abs(tp - kp) < 60:
                     return True
+    return False
+
+
+def _col_in_clause_with_keyword(col_lower: str, keyword: str, text: str) -> bool:
+    """Check if column appears in the same clause as the keyword when split on 'and'/commas."""
+    clauses = re.split(r'\band\b|,', text)
+    for clause in clauses:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', clause) and _col_mentioned_in(col_lower, clause):
+            return True
     return False
 
 

@@ -53,13 +53,14 @@ class KGPlanningMixin:
                 if "Answer shape: single_value" in user_intent:
                     user_intent = re.sub(r'Answer shape: \w+', 'Answer shape: list', user_intent)
 
+        # --- Step 1a: Resolve Columns needed from KG (single authoritative resolver) ---
+        if user_intent and kg:
+            resolved_cols = self._resolve_columns_from_kg(question, user_intent, kg, anchor_text)
+            if resolved_cols:
+                user_intent += f"\nColumns needed: {', '.join(resolved_cols)}"
+
         if user_intent:
             self._log("user_intent", user_intent)
-
-        # --- Step 1b: Deterministic column resolution from question words ---
-        col_hints = self._resolve_question_columns(question, kg, anchor_text)
-        if col_hints:
-            user_intent = (user_intent or "") + f"\n\nCOLUMN RESOLUTION (use these exact columns):\n{col_hints}"
 
         # --- Step 1c: Early formula extraction for multi-table ratio hints ---
         early_formula = self._extract_domain_formula(question, anchor_text)
@@ -116,33 +117,120 @@ class KGPlanningMixin:
             self._log("kg_path", "No valid output nodes after validation, falling back")
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
 
-        # Disambiguate output: prefer entity-of-interest table
-        _entity_pref_match = re.search(r'Entity of interest:\s*(\w+)', user_intent)
-        if _entity_pref_match and kg:
-            _pref_table = _entity_pref_match.group(1)
-            _pref_schema = kg.get_table(_pref_table)
-            if _pref_schema:
-                _pref_col_names = {c.name.lower() for c in _pref_schema.columns}
-                _new_output = []
-                for node in output_nodes:
-                    if node.table.lower() != _pref_table.lower() and node.column.lower() in _pref_col_names:
-                        if self._db_check(db_path, _pref_table, node.column):
-                            _new_output.append(QueryNode(table=_pref_table, column=node.column, role="output"))
-                        else:
-                            alt_found = False
-                            for t in kg.tables:
-                                if t.name.lower() in (_pref_table.lower(), node.table.lower()):
-                                    continue
-                                if any(c.name.lower() == node.column.lower() for c in t.columns):
-                                    if self._db_check(db_path, t.name, node.column):
-                                        _new_output.append(QueryNode(table=t.name, column=node.column, role="output"))
-                                        alt_found = True
+        # Remove spurious filters where value matches a table name that the filter is ON
+        # (entity self-reference: "members" interpreted as position='Member' on the member table)
+        _table_names_lower = {t.name.lower() for t in kg.tables} if kg else set()
+        _quoted_in_q = {v.lower() for tup in re.findall(r"'([^']+)'|\"([^\"]+)\"", question) for v in tup if v}
+        _cleaned_filters: list[QueryNode] = []
+        for fn in filter_nodes:
+            if fn.column.startswith("_expr:"):
+                _cleaned_filters.append(fn)
+                continue
+            val_lower = str(fn.value).lower().rstrip("s")
+            if (val_lower == fn.table.lower().rstrip("s")
+                    and str(fn.value).lower() not in _quoted_in_q
+                    and fn.operator == "="):
+                self._log("kg_drop_filter", f"Dropped {fn.table}.{fn.column}={fn.value} (self-referential entity filter)")
+                continue
+            _cleaned_filters.append(fn)
+        filter_nodes = _cleaned_filters
+
+        # Override output columns with KG-resolved Columns needed (authoritative)
+        _cols_overridden = False
+        _picker_output = list(output_nodes)  # preserve LLM picker output before override
+        _cols_needed_m = re.search(r'Columns needed:\s*(.+)', user_intent) if user_intent else None
+        if _cols_needed_m:
+            _resolved_output: list[QueryNode] = []
+            for ref in _cols_needed_m.group(1).split(","):
+                ref = ref.strip()
+                if "." in ref:
+                    _tbl, _col = ref.split(".", 1)
+                    _t = kg.get_table(_tbl)
+                    if _t:
+                        _actual_col = next((c.name for c in _t.columns if c.name.lower() == _col.lower()), None)
+                        if _actual_col:
+                            _resolved_output.append(QueryNode(table=_t.name, column=_actual_col, role="output"))
+            if _resolved_output:
+                # Prefer picker's choice when it has an equivalent column on the filtered table
+                # (e.g. picker chose posts.LastEditorDisplayName, intent says postHistory.UserDisplayName)
+                _filter_tbls = {n.table.lower() for n in filter_nodes}
+                _upgraded: list[QueryNode] = []
+                for rn in _resolved_output:
+                    if rn.table.lower() not in _filter_tbls:
+                        _rn_split = re.sub(r'([a-z])([A-Z])', r'\1_\2', rn.column).lower()
+                        _rn_words = set(re.findall(r'[a-z]+', _rn_split))
+                        if "name" in _rn_words or "display" in _rn_words:
+                            # Check if picker has equivalent on filtered table
+                            _picker_equiv = None
+                            for pn in _picker_output:
+                                if pn.table.lower() in _filter_tbls:
+                                    _pn_split = re.sub(r'([a-z])([A-Z])', r'\1_\2', pn.column).lower()
+                                    _pn_words = set(re.findall(r'[a-z]+', _pn_split))
+                                    if ("name" in _pn_words or "display" in _pn_words) and _rn_words & _pn_words:
+                                        _picker_equiv = pn
                                         break
-                            if not alt_found:
-                                _new_output.append(node)
+                            if _picker_equiv:
+                                _upgraded.append(_picker_equiv)
+                                continue
+                    _upgraded.append(rn)
+                _resolved_output = _upgraded
+                # Merge picker columns that complement intent columns (e.g. last_name for "full name")
+                _resolved_ids = {f"{n.table}.{n.column}".lower() for n in _resolved_output}
+                _resolved_tables = {n.table.lower() for n in _resolved_output}
+                _resolved_suffixes = set()
+                for n in _resolved_output:
+                    parts = re.split(r'[_.]', n.column.lower())
+                    if len(parts) >= 2:
+                        _resolved_suffixes.add(parts[-1])
+                for pn in _picker_output:
+                    pn_id = f"{pn.table}.{pn.column}".lower()
+                    if pn_id not in _resolved_ids and pn.table.lower() in _resolved_tables:
+                        pn_parts = re.split(r'[_.]', pn.column.lower())
+                        pn_suffix = pn_parts[-1] if pn_parts else ""
+                        if pn_suffix in _resolved_suffixes:
+                            _resolved_output.append(pn)
+                            _resolved_ids.add(pn_id)
+                output_nodes = _resolved_output
+                _cols_overridden = True
+
+        # Remove filter columns from output (they're criteria, not answer values)
+        filter_col_ids = {f"{n.table}.{n.column}".lower() for n in filter_nodes if not n.column.startswith("_expr:")}
+        output_nodes = [n for n in output_nodes if f"{n.table}.{n.column}".lower() not in filter_col_ids]
+        if not output_nodes:
+            output_nodes, _, _ = self._validate_picked_nodes(picked, kg, db_path)
+
+        # Disambiguate output: prefer entity-of-interest table (only when single entity)
+        _entity_pref_match = re.search(r'Entity of interest:\s*(.+?)(?:\s*\(|$)', user_intent) if user_intent else None
+        _entity_tables: list[str] = []
+        if _entity_pref_match:
+            _entity_raw = _entity_pref_match.group(1).strip()
+            _entity_tables = [w.strip() for w in re.split(r'\s+and\s+|,\s*', _entity_raw) if w.strip()]
+        _pref_schema = None
+        if len(_entity_tables) == 1 and kg:
+            _pref_table = _entity_tables[0]
+            _pref_schema = kg.get_table(_pref_table)
+        if _pref_schema and kg:
+            _pref_col_names = {c.name.lower() for c in _pref_schema.columns}
+            _new_output = []
+            for node in output_nodes:
+                if node.table.lower() != _pref_table.lower() and node.column.lower() in _pref_col_names:
+                    if self._db_check(db_path, _pref_table, node.column):
+                        _new_output.append(QueryNode(table=_pref_table, column=node.column, role="output"))
                     else:
-                        _new_output.append(node)
-                output_nodes = _new_output
+                        alt_found = False
+                        for t in kg.tables:
+                            if t.name.lower() in (_pref_table.lower(), node.table.lower()):
+                                continue
+                            if any(c.name.lower() == node.column.lower() for c in t.columns):
+                                if self._db_check(db_path, t.name, node.column):
+                                    _new_output.append(QueryNode(table=t.name, column=node.column, role="output"))
+                                    alt_found = True
+                                    break
+                        if not alt_found:
+                            _new_output.append(node)
+                else:
+                    _new_output.append(node)
+            output_nodes = _new_output
 
         # Sanity check: detect computation_type mismatch + missing entities
         sanity_issues, entity_col_map = self._sanity_check_picks(
@@ -282,45 +370,138 @@ class KGPlanningMixin:
                         if found:
                             break
 
-        # Ensure entity_of_interest is in path for aggregate queries
+        # For ratio/percentage: if output is on a dimension table but entity is a fact table,
+        # move output to entity's PK so the ratio denominator uses the correct population
         _comp = picked.get("computation_type", "")
-        if _comp in ("count", "sum", "avg", "count_distinct") and _entity_pref_match and kg:
-            _eoi_table = _entity_pref_match.group(1)
+        if _comp in ("percentage", "ratio") and _entity_tables and kg and not _cols_overridden:
+            _output_tables = {n.table.lower() for n in output_nodes}
+            for _et in _entity_tables:
+                _et_schema = kg.get_table(_et)
+                if not _et_schema:
+                    continue
+                if _et.lower() in _output_tables:
+                    break
+                # Entity table not in output — check if it's larger (fact table)
+                _out_schema = kg.get_table(output_nodes[0].table) if output_nodes else None
+                if _out_schema and _et_schema.row_count and _out_schema.row_count:
+                    if _et_schema.row_count > _out_schema.row_count:
+                        _pk_col = _et_schema.columns[0].name if _et_schema.columns else "Id"
+                        output_nodes = [QueryNode(table=_et_schema.name, column=_pk_col, role="output")]
+                        self._log("kg_ratio_rebase", f"Moved output to {_et_schema.name}.{_pk_col} (fact table for ratio base)")
+                        break
+
+        # Ensure entity_of_interest is in path for aggregate queries
+        # Skip when authoritative columns were resolved — they're already correct
+        if _comp in ("count", "sum", "avg", "count_distinct") and _entity_tables and kg and not _cols_overridden:
             _all_tables = {n.table.lower() for n in output_nodes} | {n.table.lower() for n in filter_nodes}
-            if _eoi_table.lower() not in _all_tables:
+            _eoi_table = next((t for t in _entity_tables if t.lower() not in _all_tables), None)
+            if _eoi_table:
                 _eoi_schema = kg.get_table(_eoi_table)
                 if _eoi_schema and _eoi_schema.columns:
                     _eoi_col = _eoi_schema.columns[0].name
                     output_nodes.append(QueryNode(table=_eoi_table, column=_eoi_col, role="output"))
                     self._log("kg_inject_eoi", f"Added {_eoi_table}.{_eoi_col} to ensure path reaches entity")
 
-        # Enforce multi-column output from intent's "Columns needed:" line
-        if user_intent and output_nodes and kg:
-            _cols_needed_match = re.search(r'Columns needed:\s*(.+)', user_intent)
-            if _cols_needed_match:
-                _needed_names = [
-                    c.strip().lower() for c in _cols_needed_match.group(1).split(",")
-                ]
-                _existing_cols = {n.column.lower() for n in output_nodes}
-                _out_table = output_nodes[0].table
-                for needed in _needed_names:
-                    if needed in _existing_cols:
-                        continue
-                    # Search for column in output table first, then all path tables
-                    _found = False
-                    for t in [kg.get_table(_out_table)] + [kg.get_table(n.table) for n in filter_nodes]:
-                        if not t:
+
+        # Prefer normalized FK display columns over denormalized copies.
+        # Denormalized columns (e.g. postHistory.UserDisplayName) can be stale/empty;
+        # the FK path (postHistory.UserId → users.DisplayName) is always authoritative.
+        # Exception: skip substitution when the column is a denormalized name on a filtered table
+        # AND is not itself a filter column (co-located output avoids unnecessary join).
+        _filter_tables_lower = {n.table.lower() for n in filter_nodes}
+        _filter_col_ids_lower = {f"{n.table}.{n.column}".lower() for n in filter_nodes if not n.column.startswith("_expr:")}
+        if kg and kg.graph:
+            _new_output: list[QueryNode] = []
+            for node in output_nodes:
+                _substituted = False
+                _col_lower = node.column.lower()
+                _node_id_lower = f"{node.table}.{node.column}".lower()
+                # Only attempt for columns that look like denormalized names
+                # Skip if on filtered table but NOT itself a filter column (avoids unnecessary join)
+                _skip_subst = (
+                    node.table.lower() in _filter_tables_lower
+                    and _node_id_lower not in _filter_col_ids_lower
+                )
+                if ("name" in _col_lower or "display" in _col_lower) and not _skip_subst:
+                    _col_split = re.sub(r'([a-z])([A-Z])', r'\1_\2', node.column).lower()
+                    _col_name_words = set(re.findall(r'[a-z]+', _col_split))
+                    # Strategy 1: check fk_display_map
+                    for fk_col_id, display_col_id in kg.graph.fk_display_map.items():
+                        if not fk_col_id.lower().startswith(f"{node.table.lower()}."):
                             continue
-                        for c in t.columns:
-                            if c.name.lower() == needed or needed in c.name.lower():
-                                if c.name.lower() not in _existing_cols:
-                                    output_nodes.append(QueryNode(table=t.name, column=c.name, role="output"))
-                                    _existing_cols.add(c.name.lower())
-                                    self._log("kg_inject_col", f"Added {t.name}.{c.name} (from intent 'Columns needed')")
-                                    _found = True
+                        if "." not in display_col_id:
+                            continue
+                        _disp_tbl, _disp_col = display_col_id.split(".", 1)
+                        if _disp_tbl.lower() == node.table.lower():
+                            continue
+                        _disp_split = re.sub(r'([a-z])([A-Z])', r'\1_\2', _disp_col).lower()
+                        _disp_words = set(re.findall(r'[a-z]+', _disp_split))
+                        if _col_name_words & _disp_words:
+                            _disp_schema = kg.get_table(_disp_tbl)
+                            if _disp_schema:
+                                _new_output.append(QueryNode(table=_disp_tbl, column=_disp_col, role="output"))
+                                self._log("kg_fk_display", f"Replaced {node.table}.{node.column} with {display_col_id} (FK display map)")
+                                _substituted = True
+                                break
+                    # Strategy 2: check FK edges directly for a target table with label column
+                    if not _substituted:
+                        for edge in kg.graph.fk_edges:
+                            src_col = kg.graph.columns.get(edge.src)
+                            if not src_col or src_col.table_id.lower() != node.table.lower():
+                                continue
+                            dst_col = kg.graph.columns.get(edge.dst)
+                            if not dst_col or dst_col.table_id.lower() == node.table.lower():
+                                continue
+                            # FK column must share a word with the output column
+                            # (e.g. UserId shares "user" with UserDisplayName)
+                            _fk_split = re.sub(r'([a-z])([A-Z])', r'\1_\2', src_col.name).lower()
+                            _fk_words = set(re.findall(r'[a-z]+', _fk_split)) - {"id"}
+                            if not (_fk_words & _col_name_words):
+                                continue
+                            # Check if target table has a label column with name overlap
+                            _target_tbl = kg.get_table(dst_col.table_id)
+                            if not _target_tbl:
+                                continue
+                            for tc in _target_tbl.columns:
+                                _tc_split = re.sub(r'([a-z])([A-Z])', r'\1_\2', tc.name).lower()
+                                _tc_words = set(re.findall(r'[a-z]+', _tc_split))
+                                if _col_name_words & _tc_words and "name" in _tc_words:
+                                    _new_output.append(QueryNode(table=_target_tbl.name, column=tc.name, role="output"))
+                                    self._log("kg_fk_display", f"Replaced {node.table}.{node.column} with {_target_tbl.name}.{tc.name} (FK to dimension)")
+                                    _substituted = True
                                     break
-                        if _found:
-                            break
+                            if _substituted:
+                                break
+                if not _substituted:
+                    _new_output.append(node)
+            # Deduplicate: same table.column
+            _seen_ids: set[str] = set()
+            _deduped: list[QueryNode] = []
+            for n in _new_output:
+                _nid = f"{n.table}.{n.column}"
+                if _nid not in _seen_ids:
+                    _seen_ids.add(_nid)
+                    _deduped.append(n)
+            # Semantic dedup: if a "name" column on a non-filtered table duplicates
+            # a "name" column already on the filtered table, drop the non-filtered one
+            _filtered_name_words: set[str] = set()
+            for n in _deduped:
+                if n.table.lower() in _filter_tables_lower:
+                    _ns = re.sub(r'([a-z])([A-Z])', r'\1_\2', n.column).lower()
+                    _nw = set(re.findall(r'[a-z]+', _ns))
+                    if "name" in _nw or "display" in _nw:
+                        _filtered_name_words.update(_nw)
+            if _filtered_name_words:
+                _final: list[QueryNode] = []
+                for n in _deduped:
+                    if n.table.lower() not in _filter_tables_lower:
+                        _ns2 = re.sub(r'([a-z])([A-Z])', r'\1_\2', n.column).lower()
+                        _nw2 = set(re.findall(r'[a-z]+', _ns2))
+                        if ("name" in _nw2 or "display" in _nw2) and _nw2 & _filtered_name_words:
+                            continue
+                    _final.append(n)
+                _deduped = _final
+            output_nodes = _deduped
 
         self._log("kg_output_nodes", ", ".join(f"{n.table}.{n.column}" for n in output_nodes))
         self._log("kg_filter_nodes", ", ".join(
@@ -366,46 +547,6 @@ class KGPlanningMixin:
         filter_nodes, order_nodes = self._enforce_intent_signals(
             user_intent, filter_nodes, order_nodes, output_nodes, picked, kg, db_path,
         )
-
-        # 2f. Output column refinements
-        output_nodes = self._override_columns_from_question(question, output_nodes, filter_nodes, kg, db_path)
-
-        _agg_comp = picked.get("computation_type", "simple_lookup")
-        if _agg_comp in ("sum", "avg") and output_nodes and filter_nodes and db_path:
-            _q_words_agg = set(re.findall(r'[a-z_]+', question.lower()))
-            filter_tables = {n.table for n in filter_nodes}
-            output_tables = {n.table for n in output_nodes}
-            detail_tables = filter_tables - output_tables
-            if detail_tables:
-                for i, node in enumerate(output_nodes):
-                    if node.column.lower() in _q_words_agg:
-                        continue
-                    ts = kg.get_table(node.table) if kg else None
-                    if not ts:
-                        continue
-                    col_type = ""
-                    for c in ts.columns:
-                        if c.name == node.column:
-                            col_type = c.sql_type.upper()
-                            break
-                    if col_type not in ("REAL", "FLOAT", "INTEGER", "INT", "NUMERIC"):
-                        continue
-                    if node.table in detail_tables:
-                        continue
-                    for dt in detail_tables:
-                        dt_schema = kg.get_table(dt)
-                        if not dt_schema:
-                            continue
-                        for c in dt_schema.columns:
-                            if c.sql_type.upper() in ("REAL", "FLOAT", "INTEGER", "INT", "NUMERIC"):
-                                cl = c.name.lower()
-                                if cl.endswith("id") or cl.startswith("link"):
-                                    continue
-                                output_nodes[i] = QueryNode(table=dt, column=c.name, role="output")
-                                self._log("agg_detail_fix",
-                                    f"SUM/AVG target: {node.table}.{node.column} → {dt}.{c.name}")
-                                break
-                        break
 
         _comp_type_for_resolve = picked.get("computation_type", "simple_lookup")
         if _comp_type_for_resolve not in ("avg", "count", "count_distinct", "sum", "ratio", "percentage"):
@@ -515,6 +656,48 @@ class KGPlanningMixin:
         if not path:
             self._log("kg_path", "No path found, falling back")
             return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+
+        # Inject route tables missing from path (needed for computation but no nodes reference them)
+        _route_tables = getattr(self, '_route_tables', None) or []
+        _path_tables = set(path.tables_in_path)
+        _missing_route = [t for t in _route_tables if t not in _path_tables]
+        if _missing_route and kg and kg.graph:
+            _derived = picked.get("derived_logic", "") or ""
+            _extra_tables = list(path.tables_in_path)
+            _extra_edges = list(path.edges)
+            for mt in _missing_route:
+                if mt.lower() not in _derived.lower():
+                    continue
+                for edge in kg.graph.fk_edges:
+                    src_col = kg.graph.columns.get(edge.src)
+                    dst_col = kg.graph.columns.get(edge.dst)
+                    if not src_col or not dst_col:
+                        continue
+                    if src_col.table_id == mt and dst_col.table_id in _path_tables:
+                        from data_agent_baseline.pipeline.kg_path_planner import GraphEdge
+                        _extra_edges.append(GraphEdge(
+                            src_table=src_col.table_id, src_column=src_col.name,
+                            dst_table=dst_col.table_id, dst_column=dst_col.name,
+                            weight=edge.overlap_ratio,
+                        ))
+                        _extra_tables.append(mt)
+                        break
+                    elif dst_col.table_id == mt and src_col.table_id in _path_tables:
+                        from data_agent_baseline.pipeline.kg_path_planner import GraphEdge
+                        _extra_edges.append(GraphEdge(
+                            src_table=src_col.table_id, src_column=src_col.name,
+                            dst_table=dst_col.table_id, dst_column=dst_col.name,
+                            weight=edge.overlap_ratio,
+                        ))
+                        _extra_tables.append(mt)
+                        break
+            if len(_extra_tables) > len(path.tables_in_path):
+                path = QueryPath(
+                    edges=tuple(_extra_edges),
+                    output_nodes=path.output_nodes,
+                    filter_nodes=path.filter_nodes,
+                    tables_in_path=tuple(_extra_tables),
+                )
 
         self._log("kg_path_edges", " → ".join(
             f"{e.src_table}.{e.src_column}={e.dst_table}.{e.dst_column}" for e in path.edges
@@ -627,37 +810,92 @@ class KGPlanningMixin:
         anchor_text: str,
         user_intent: str,
     ) -> dict[str, Any] | None:
-        """LLM picks columns/filters/joins from the property graph. One call."""
-        g = kg.graph
+        """LLM picks columns via query-based graph traversal.
 
-        # Build FK target map: src_col_id → (dst_table, dst_col) for annotation
+        Step 1: LLM sees table overview + relationships, decides which tables to explore.
+        Step 2: LLM sees full column details for selected tables, makes final pick.
+        """
+        g = kg.graph
+        q_lower = question.lower()
+
+        # --- Build table overview (names, roles, row counts, FK links) ---
+        overview_lines: list[str] = []
+        for table in kg.tables:
+            role = table.role or "table"
+            col_names = [c.name for c in table.columns]
+            overview_lines.append(
+                f'  "{table.name}" [{role}, {table.row_count} rows]: columns={col_names}'
+            )
+
+        # FK relationships
+        fk_lines: list[str] = []
         fk_targets: dict[str, tuple[str, str]] = {}
         if g:
             for edge in g.fk_edges:
+                src_col = g.columns.get(edge.src)
                 dst_col = g.columns.get(edge.dst)
-                if dst_col:
+                if src_col and dst_col:
                     fk_targets[edge.src] = (dst_col.table_id, dst_col.name)
+                    fk_lines.append(
+                        f'  "{src_col.table_id}"."{src_col.name}" → "{dst_col.table_id}"."{dst_col.name}"'
+                    )
 
-        # Build graph dump for LLM: tables with columns, FK edges, categorical values
-        graph_parts: list[str] = []
+        overview = "TABLES:\n" + "\n".join(overview_lines)
+        if fk_lines:
+            overview += "\n\nRELATIONSHIPS:\n" + "\n".join(fk_lines)
+
+        intent_section = f"\nUSER INTENT:\n{user_intent}" if user_intent else ""
+        anchor_section = f"\nDOMAIN KNOWLEDGE:\n{anchor_text[:2000]}" if anchor_text else ""
+
+        # --- Step 1: Route — which tables matter? ---
+        route_prompt = f"""QUESTION: {question}
+{intent_section}{anchor_section}
+
+DATABASE OVERVIEW:
+{overview}
+
+Think step by step about what the question needs:
+1. What entity/value does the question ask ABOUT? → which table has it?
+2. What filters does the question mention? → which tables have those columns?
+3. What metric (sum/count/value) is needed? → which table stores it?
+4. If a qualifier word (like "approved", "active", "completed") matches a column name, that table likely holds the metric too.
+
+Return JSON:
+{{"tables": ["table1", "table2", ...], "reasoning": "one sentence explaining the data path"}}"""
+
+        messages = [ModelMessage(role="user", content=route_prompt)]
+        try:
+            raw = self._model_call_with_retry(messages, thinking=False)
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict) and parsed.get("tables"):
+                selected_tables = parsed["tables"]
+                self._log("kg_route", f"Tables: {selected_tables} — {parsed.get('reasoning', '')}")
+                self._route_tables = selected_tables
+            else:
+                selected_tables = [t.name for t in kg.tables]
+                self._route_tables = selected_tables
+        except Exception:
+            selected_tables = [t.name for t in kg.tables]
+
+        # --- Build detailed view of selected tables ---
+        detail_parts: list[str] = []
         for table in kg.tables:
+            if table.name not in selected_tables:
+                continue
             cols_desc: list[str] = []
             for col in table.columns:
                 parts = [f'"{col.name}" ({col.sql_type})']
                 if col.description:
                     parts.append(f"-- {col.description}")
                 col_id = f"{table.name}.{col.name}"
-                # Annotate FK reference columns
                 is_fk_col = col_id in fk_targets
                 if is_fk_col:
                     ref_t, ref_c = fk_targets[col_id]
-                    # Show display column if known (human-readable value to SELECT instead)
                     display_col = g.fk_display_map.get(col_id, "") if g else ""
                     if display_col:
                         parts.append(f'→ references "{ref_t}"."{ref_c}" (display: "{display_col}")')
                     else:
                         parts.append(f'→ references "{ref_t}"."{ref_c}"')
-                # Show sample values (skip FK columns — their IDs are opaque)
                 if not is_fk_col:
                     if g and col_id in g.contains_value:
                         val_nodes = g.get_column_values(col_id)
@@ -668,7 +906,6 @@ class KGPlanningMixin:
                         samples = table.sample_values[col.name][:5]
                         if samples:
                             parts.append(f"e.g. {samples}")
-                    # For numeric columns: always show range (helps LLM reason about normal/abnormal)
                     if col.sql_type.upper() in ("REAL", "FLOAT", "INTEGER", "INT", "NUMERIC"):
                         if col.name.lower() not in ("id",) and not col.name.lower().endswith("_id"):
                             if hasattr(table, 'col_stats') and col.name in table.col_stats:
@@ -676,90 +913,14 @@ class KGPlanningMixin:
                                 if "min" in s and "max" in s:
                                     parts.append(f"range: [{s['min']}, {s['max']}]")
                 cols_desc.append("  " + " ".join(parts))
-            graph_parts.append(f'TABLE "{table.name}" ({table.row_count} rows):\n' + "\n".join(cols_desc))
+            detail_parts.append(f'TABLE "{table.name}" ({table.row_count} rows):\n' + "\n".join(cols_desc))
 
-        # FK edges
-        fk_lines: list[str] = []
-        if g:
-            for edge in g.fk_edges:
-                src_col = g.columns.get(edge.src)
-                dst_col = g.columns.get(edge.dst)
-                if src_col and dst_col:
-                    fk_lines.append(
-                        f'  "{src_col.table_id}"."{src_col.name}" → "{dst_col.table_id}"."{dst_col.name}" (overlap: {edge.overlap_ratio:.0%})'
-                    )
         if fk_lines:
-            graph_parts.append("JOIN RELATIONSHIPS (foreign keys):\n" + "\n".join(fk_lines))
+            detail_parts.append("JOIN RELATIONSHIPS:\n" + "\n".join(fk_lines))
 
-        # Semantic edges (for bridge table discovery)
-        sem_lines: list[str] = []
-        if g:
-            for edge in g.semantic_edges:
-                src_col = g.columns.get(edge.src)
-                dst_col = g.columns.get(edge.dst)
-                if src_col and dst_col:
-                    sem_lines.append(
-                        f'  "{src_col.table_id}"."{src_col.name}" ↔ "{dst_col.table_id}"."{dst_col.name}" (similarity: {edge.similarity_score:.0%})'
-                    )
-        if sem_lines:
-            graph_parts.append("SEMANTIC LINKS (likely joinable by matching IDs):\n" + "\n".join(sem_lines))
+        graph_detail = "\n\n".join(detail_parts)
 
-        graph_dump = "\n\n".join(graph_parts)
-
-        intent_section = f"\nUSER INTENT (primary — this is what the user wants):\n{user_intent}" if user_intent else ""
-        anchor_section = f"\nDOMAIN KNOWLEDGE (supports the intent — defines terms and valid values):\n{anchor_text[:2000]}" if anchor_text else ""
-
-        # Question-filtered context: only surface entries relevant to THIS question
-        q_words = set(question.lower().split())
-        q_lower = question.lower()
-
-        # Concept map: only entries whose concept word appears in the question
-        concept_section = ""
-        if hasattr(kg, 'concept_map') and kg.concept_map:
-            relevant = [
-                (k, v) for k, v in kg.concept_map.items()
-                if k in q_lower or any(w in q_words for w in k.split())
-            ]
-            if relevant:
-                cmap_lines = [f'  "{k}" → {v}' for k, v in relevant]
-                concept_section = "\nCONCEPT MAP:\n" + "\n".join(cmap_lines)
-
-        # Ontology: show vocab for columns whose meanings match the question
-        # Show FULL vocab (all values) so the LLM can distinguish between columns
-        ontology_section = ""
-        if hasattr(kg, 'ontology') and kg.ontology:
-            ont_lines = []
-            for col_ref, entry in kg.ontology.items():
-                vocab = entry.get("value_vocab")
-                if vocab and isinstance(vocab, dict):
-                    matched = any(
-                        str(k).lower() in q_lower or str(v).lower() in q_lower
-                        for k, v in vocab.items()
-                    )
-                    if not matched:
-                        continue
-                    # Show purpose + all values so LLM can distinguish columns
-                    purpose = entry.get("purpose", "")
-                    purpose_prefix = f"({purpose}) " if purpose else ""
-                    if len(vocab) <= 12:
-                        vocab_str = ", ".join(f"{k}={v}" for k, v in vocab.items())
-                    else:
-                        vocab_str = ", ".join(f"{k}={v}" for k, v in list(vocab.items())[:10]) + ", ..."
-                    ont_lines.append(f'  {col_ref}: {purpose_prefix}{{{vocab_str}}}')
-                elif entry.get("hierarchy"):
-                    h = entry["hierarchy"]
-                    level = h.get("level", "")
-                    if level.lower() in q_lower:
-                        ont_lines.append(f'  {col_ref}: hierarchy level={level}')
-            if ont_lines:
-                ontology_section = (
-                    "\nVALUE MEANINGS (when multiple columns match the same concept, "
-                    "pick the column whose PURPOSE best fits — use only ONE column per concept):\n"
-                    + "\n".join(ont_lines[:10])
-                )
-
-        # Value pre-grounding: look up question terms in the KG value index
-        # so the LLM knows exactly WHERE each filter value lives
+        # Value pre-grounding
         value_section = ""
         if g:
             _stop = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "on", "at",
@@ -772,7 +933,6 @@ class KGPlanningMixin:
                      "about", "over", "under", "above", "below", "after", "before"}
             _q_tokens = [w.strip("?.,!\"'()") for w in question.split()]
             _q_tokens_lower = [t.lower() for t in _q_tokens if t]
-            # Build candidate phrases: bigrams first (more specific), then unigrams
             _candidates: list[str] = []
             for i in range(len(_q_tokens_lower) - 1):
                 a, b = _q_tokens_lower[i], _q_tokens_lower[i + 1]
@@ -781,7 +941,6 @@ class KGPlanningMixin:
             for i, t in enumerate(_q_tokens_lower):
                 if t not in _stop and len(t) > 2:
                     _candidates.append(_q_tokens[i])
-            # Look up each candidate, deduplicate by (table, column, value)
             _seen_matches: set[str] = set()
             _value_lines: list[str] = []
             for phrase in _candidates:
@@ -798,31 +957,70 @@ class KGPlanningMixin:
                         break
             if _value_lines:
                 value_section = (
-                    "\nVALUE MATCHES (these values EXIST in the DB — use these exact columns for filters):\n"
+                    "\nVALUE MATCHES (these values EXIST in the DB — use these columns for filters):\n"
                     + "\n".join(_value_lines)
                 )
 
-        prompt = f"""QUESTION: {question}
+        # Concept map
+        concept_section = ""
+        q_words = set(question.lower().split())
+        if hasattr(kg, 'concept_map') and kg.concept_map:
+            relevant = [
+                (k, v) for k, v in kg.concept_map.items()
+                if k in q_lower or any(w in q_words for w in k.split())
+            ]
+            if relevant:
+                cmap_lines = [f'  "{k}" → {v}' for k, v in relevant]
+                concept_section = "\nCONCEPT MAP:\n" + "\n".join(cmap_lines)
 
-PROPERTY GRAPH:
-{graph_dump[:6000]}
-{intent_section}{anchor_section}{concept_section}{ontology_section}{value_section}
+        # Ontology
+        ontology_section = ""
+        if hasattr(kg, 'ontology') and kg.ontology:
+            ont_lines = []
+            for col_ref, entry in kg.ontology.items():
+                vocab = entry.get("value_vocab")
+                if vocab and isinstance(vocab, dict):
+                    matched = any(
+                        str(k).lower() in q_lower or str(v).lower() in q_lower
+                        for k, v in vocab.items()
+                    )
+                    if not matched:
+                        continue
+                    purpose = entry.get("purpose", "")
+                    purpose_prefix = f"({purpose}) " if purpose else ""
+                    if len(vocab) <= 12:
+                        vocab_str = ", ".join(f"{k}={v}" for k, v in vocab.items())
+                    else:
+                        vocab_str = ", ".join(f"{k}={v}" for k, v in list(vocab.items())[:10]) + ", ..."
+                    ont_lines.append(f'  {col_ref}: {purpose_prefix}{{{vocab_str}}}')
+                elif entry.get("hierarchy"):
+                    h = entry["hierarchy"]
+                    level = h.get("level", "")
+                    if level.lower() in q_lower:
+                        ont_lines.append(f'  {col_ref}: hierarchy level={level}')
+            if ont_lines:
+                ontology_section = (
+                    "\nVALUE MEANINGS:\n" + "\n".join(ont_lines[:10])
+                )
 
-HOW TO READ THE GRAPH:
-- Each TABLE has columns with their SQL types. Some columns show known "values:" — these are categorical values in that column.
-- Columns marked "→ references Table.Column" are FOREIGN KEYS that store IDs pointing to another table. To get human-readable values (names, labels), you must SELECT from the referenced table, not the FK column itself.
-- JOIN RELATIONSHIPS show which columns link tables together. SEMANTIC LINKS show columns with matching ID patterns (useful for bridge/junction tables).
-- When you need to connect tables that have no direct FK, look for a BRIDGE TABLE that has FKs to both.
+        # --- Step 2: Pick — select exact columns from the explored tables ---
+        pick_prompt = f"""QUESTION: {question}
+{intent_section}{anchor_section}
 
-YOUR TASK: Pick exact columns from this graph to answer the question.
+SELECTED TABLES (detailed schema):
+{graph_detail[:5000]}
+{concept_section}{ontology_section}{value_section}
 
-PRIORITY (resolve conflicts in this order):
-1. USER INTENT — this tells you what the user wants returned and how to compute it. Follow it.
-2. DOMAIN KNOWLEDGE — defines what terms mean in this database. When a question term (like "track number") is defined in domain knowledge, use the column it maps to — even if another column literally contains the word.
-3. VALUE MATCHES — if a value is confirmed to exist in a specific column, filter on that column.
-4. QUESTION — the user's exact words. Only use literal column name matching if 1-3 don't resolve it.
-5. CONCEPT MAP — if a question term doesn't match any column name, check the concept map for the best column mapping.
-6. Your own inference — only if 1-5 don't apply.
+YOUR TASK: Pick exact columns to answer the question.
+
+RULES:
+- select_columns: columns whose values appear in the final answer.
+- filter_conditions: constraints that narrow rows (WHERE clause).
+- If a qualifier word in the question (e.g., "approved") matches a column name, add it as a filter AND select the metric from that same table.
+- DOMAIN KNOWLEDGE overrides USER INTENT when they conflict. If domain knowledge defines a term (e.g., "type"), use that column — even if the intent interpreted it differently.
+- Validate the intent against the schema: if the intent references a concept (e.g., "expense category") but that column doesn't exist in the referenced table, re-read the QUESTION and DOMAIN KNOWLEDGE to find the correct column.
+- FK columns (marked →): JOIN to the referenced table, select human-readable columns there.
+- For filter values, use EXACT format from "values:" lists or DOMAIN KNOWLEDGE.
 
 Return ONLY JSON:
 {{
@@ -834,19 +1032,9 @@ Return ONLY JSON:
   "order_by": {{"column": "Table.Column", "direction": "ASC | DESC"}} or null,
   "computation_type": "simple_lookup | count | sum | avg | min_max | ratio | percentage | derived",
   "derived_logic": "natural language description of the computation (only if computation_type is 'derived')"
-}}
+}}"""
 
-CONSTRAINTS:
-- You may ONLY use Table.Column names that appear in the PROPERTY GRAPH above.
-- You may ONLY use values from "values:" lists, DOMAIN KNOWLEDGE, or the QUESTION itself.
-- If a column is a FK reference (marked with →), do NOT select it directly — instead JOIN to the referenced table and select the human-readable column there (e.g. the name/label column, not the ID).
-- For "best/lowest/highest/fastest" questions, use order_by instead of equality filters on position/rank columns.
-- For filter values, use the EXACT format shown in "values:" or DOMAIN KNOWLEDGE. If unsure of the format, use LIKE with a partial match.
-- "List all X" / "What are the X" without specifying WHICH columns to show → select ONLY the primary key or identifier column of the entity (e.g. trans_id, Id, order_id). Do NOT guess descriptive columns unless the question explicitly asks for them (e.g. "list the names", "show dates and amounts").
-- ONE filter per concept: if VALUE MATCHES shows which column holds a value, use THAT column. Otherwise, if two columns in the same table both contain a matching value, pick the column whose overall vocabulary best describes the concept. Do not filter on both — redundant filters risk returning 0 rows.
-- "Normal level" means the value falls WITHIN the healthy range — use TWO conditions: >= lower_bound AND <= upper_bound (e.g. WBC >= 3.5 AND WBC <= 9.0 keeps only normal values). "Abnormal level" means the value falls OUTSIDE the healthy range — use a SINGLE condition on whichever side the data actually falls (e.g. Column < lower OR Column > upper), OR use IS NOT NULL if the column's data range (shown above) is entirely outside the standard normal range."""
-
-        messages = [ModelMessage(role="user", content=prompt)]
+        messages = [ModelMessage(role="user", content=pick_prompt)]
         try:
             raw = self._model_call_with_retry(messages, thinking=False)
             parsed = self._parse_json(raw)
@@ -948,6 +1136,12 @@ CONSTRAINTS:
             table = table.strip('"').strip("'")
             col = col.strip('"').strip("'")
             col_id = f"{table}.{col}"
+            # Skip if value is a table.column reference (join condition, not a filter)
+            val_str = str(value or "")
+            if re.match(r'\w+\.\w+$', val_str):
+                val_parts = val_str.split(".", 1)
+                if g and f"{val_parts[0]}.{val_parts[1]}" in g.columns:
+                    continue
             if g and col_id in g.columns:
                 filter_nodes.append(QueryNode(
                     table=table, column=col, role="filter",
@@ -1058,162 +1252,6 @@ CONSTRAINTS:
                         return (t.name, c.name)
         return None
 
-    def _override_columns_from_question(
-        self, question: str, output_nodes: list[QueryNode],
-        filter_nodes: list[QueryNode], kg: KnowledgeGraph,
-        db_path: Path | None = None,
-    ) -> list[QueryNode]:
-        """Deterministically replace output columns when the question contains an exact column name
-        that exists in the graph but the picker chose a different column with the same structural role.
-
-        E.g., question says "type" and there's a column named "type" in the graph,
-        but picker chose "category" — swap to "type".
-        """
-        if not kg or not kg.graph or not output_nodes:
-            return output_nodes
-        q_lower = question.lower()
-        q_tokens = set(re.findall(r'[a-z_]+', q_lower))
-
-        # Columns already used as filters should NOT be considered as output replacements
-        filter_col_names = {n.column.lower() for n in filter_nodes}
-
-        # Build map: col_name_lower → [(table, col_name, sql_type)]
-        exact_cols: dict[str, list[tuple[str, str, str]]] = {}
-        for col_id, col_node in kg.graph.columns.items():
-            cn = col_node.name.lower()
-            if cn.endswith("id") or "link" in cn or "ref" in cn:
-                continue
-            table_schema = kg.get_table(col_node.table_id)
-            sql_type = ""
-            if table_schema:
-                for c in table_schema.columns:
-                    if c.name == col_node.name:
-                        sql_type = c.sql_type.upper()
-                        break
-            exact_cols.setdefault(cn, []).append((col_node.table_id, col_node.name, sql_type))
-
-        # Detect tokens near a numeric value — likely filter context, not output
-        # e.g. "number less than 20", "age over 30", "round 5"
-        _q_words = q_lower.split()
-        _filter_context_tokens: set[str] = set()
-        for i, w in enumerate(_q_words):
-            if w in exact_cols:
-                # Check if any word within 3 positions contains digits
-                window = _q_words[max(0, i - 2):i + 4]
-                if any(re.search(r'\d', tok) for tok in window):
-                    _filter_context_tokens.add(w)
-
-        # Find question tokens that exactly match column names (exclude filter columns)
-        matched_cols: dict[str, list[tuple[str, str, str]]] = {}
-        for token in q_tokens:
-            if len(token) < 3:
-                continue
-            if token in filter_col_names:
-                continue
-            if token in _filter_context_tokens:
-                continue
-            if token in exact_cols:
-                matched_cols[token] = exact_cols[token]
-
-        # Also match multi-word column names (CamelCase or snake_case) against question words
-        # e.g., "UpVotes" → ["up", "votes"], "up_votes" → ["up", "votes"]
-        for col_lower, candidates in exact_cols.items():
-            if col_lower in matched_cols:
-                continue
-            original_name = candidates[0][1]
-            # Split CamelCase: "UpVotes" → ["Up", "Votes"]
-            parts = re.findall(r'[A-Z][a-z]+|[a-z]+', original_name)
-            # Split snake_case: "up_votes" → ["up", "votes"]
-            if len(parts) < 2 and "_" in original_name:
-                parts = [p for p in original_name.lower().split("_") if p]
-            if len(parts) >= 2:
-                all_in_q = all(p.lower() in q_tokens for p in parts)
-                if all_in_q and col_lower not in filter_col_names:
-                    matched_cols[col_lower] = candidates
-
-        if not matched_cols:
-            return output_nodes
-
-        # For each output node, check if there's an exact-match column
-        # that the question directly references
-        new_output: list[QueryNode] = []
-        for node in output_nodes:
-            node_type = ""
-            table_schema = kg.get_table(node.table)
-            if table_schema:
-                for c in table_schema.columns:
-                    if c.name == node.column:
-                        node_type = c.sql_type.upper()
-                        break
-            is_text = node_type in ("TEXT", "VARCHAR", "CHAR", "STRING")
-            is_numeric = node_type in ("REAL", "FLOAT", "NUMERIC", "INTEGER", "INT")
-
-            # Check if this node's column is already directly referenced in the question
-            node_col_lower = node.column.lower()
-            node_mentioned = node_col_lower in q_tokens
-            if not node_mentioned:
-                # Also check CamelCase or snake_case split
-                node_parts = re.findall(r'[A-Z][a-z]+|[a-z]+', node.column)
-                if len(node_parts) < 2 and "_" in node.column:
-                    node_parts = [p for p in node.column.lower().split("_") if p]
-                if len(node_parts) >= 2:
-                    node_mentioned = all(p.lower() in q_tokens for p in node_parts)
-                # Partial match: require ALL substantive parts to appear in question
-                # (skip parts that are table names — they're structural, not semantic)
-                if not node_mentioned and node_parts:
-                    table_names = {t.name.lower() for t in kg.tables} if kg else set()
-                    semantic_parts = [p.lower() for p in node_parts if p.lower() not in table_names and len(p) >= 4]
-                    if semantic_parts and all(
-                        pl in q_tokens or pl + "s" in q_tokens or pl.rstrip("s") in q_tokens
-                        for pl in semantic_parts
-                    ):
-                        node_mentioned = True
-
-            if not node_mentioned:
-                # This output column is NOT directly referenced in the question.
-                # Check if there's a matched column with compatible type.
-                # Skip columns already in another output node.
-                existing_cols = {(n.table, n.column) for n in output_nodes}
-                # Tables already in the query (reachable without extra joins)
-                query_tables = {n.table.lower() for n in output_nodes} | {n.table.lower() for n in filter_nodes}
-                # Tables with direct FK edges to query tables
-                reachable_tables = set(query_tables)
-                if kg.graph and kg.graph.fk_edges:
-                    for edge in kg.graph.fk_edges:
-                        src_tbl = edge.src.split(".")[0].lower() if "." in edge.src else ""
-                        dst_tbl = edge.dst.split(".")[0].lower() if "." in edge.dst else ""
-                        if src_tbl in query_tables:
-                            reachable_tables.add(dst_tbl)
-                        if dst_tbl in query_tables:
-                            reachable_tables.add(src_tbl)
-
-                replacement = None
-                type_set = (
-                    ("TEXT", "VARCHAR", "CHAR", "STRING") if is_text
-                    else ("REAL", "FLOAT", "NUMERIC", "INTEGER", "INT") if is_numeric
-                    else ()
-                )
-                if type_set:
-                    # Collect all reachable, type-compatible candidates
-                    all_candidates = []
-                    for token, candidates in matched_cols.items():
-                        for tbl, col_name, sql_type in candidates:
-                            if sql_type in type_set and (tbl, col_name) not in existing_cols:
-                                if tbl.lower() in reachable_tables:
-                                    all_candidates.append((tbl, col_name))
-                    # Try each until one has data
-                    for cand in all_candidates:
-                        if self._db_check(db_path, cand[0], cand[1]):
-                            replacement = cand
-                            break
-                if replacement:
-                    new_output.append(QueryNode(
-                        table=replacement[0], column=replacement[1], role="output",
-                    ))
-                    continue
-            new_output.append(node)
-
-        return new_output
 
     def _resolve_fk_output_columns(
         self, output_nodes: list[QueryNode], kg: KnowledgeGraph, db_path: Path | None,
@@ -1279,80 +1317,267 @@ CONSTRAINTS:
                 new_output.append(node)
         return new_output
 
-    def _resolve_question_columns(
-        self, question: str, kg: KnowledgeGraph, anchor_text: str,
-    ) -> str:
-        """Deterministically resolve question words to exact columns in the graph.
+    def _resolve_columns_from_kg(
+        self, question: str, user_intent: str, kg: KnowledgeGraph, anchor_text: str,
+    ) -> list[str]:
+        """Resolve Columns needed by querying the KG.
 
-        Two strategies:
-        1. Exact match: question word == column name → hard hint
-        2. Table mention: question mentions table → surface its structural columns
+        Hybrid approach:
+        1. Deterministic word-matching scores columns against question terms.
+        2. If top score is high (≥3), trust it — column name directly in question.
+        3. If low confidence, LLM picks from the full KG column list with bias
+           toward columns whose names appear in the question.
         """
-        if not kg or not kg.graph:
-            return ""
-        q_lower = question.lower()
-        q_tokens = set(re.findall(r'[a-z_]+', q_lower))
-        hints: list[str] = []
+        metric_m = re.search(r'Metric \(SELECT\):\s*(.+)', user_intent)
+        metric_text = metric_m.group(1) if metric_m else ""
+        entity_m = re.search(r'Entity of interest:\s*(\w+)', user_intent)
+        entity_table = entity_m.group(1).lower() if entity_m else ""
 
-        # --- Strategy 1: Exact column name matches ---
-        # If a question word exactly matches a column name, that's a direct reference
-        col_by_name: dict[str, list[str]] = {}  # col_name_lower → [table.col, ...]
-        for col_id, col_node in kg.graph.columns.items():
-            cn = col_node.name.lower()
-            # Skip FK/PK columns — they're structural, not meaningful references
-            if cn.endswith("id") or "link" in cn or "ref" in cn:
-                continue
-            col_by_name.setdefault(cn, []).append(f'"{col_node.table_id}"."{col_node.name}"')
+        metric_tokens = set(re.findall(r'[a-z]+', metric_text.lower())) if metric_text else set()
+        question_tokens = set(re.findall(r'[a-z]+', question.lower()))
+        pop_m = re.search(r'Population \(WHERE\):\s*(.+)', user_intent)
+        pop_tokens = set(re.findall(r'[a-z]+', pop_m.group(1).lower())) if pop_m else set()
 
-        for token in q_tokens:
-            if len(token) < 3:
-                continue
-            if token in col_by_name:
-                cols = col_by_name[token]
-                hints.append(f'"{token}" in question matches column: {", ".join(cols)}')
+        def _s(w: str) -> str:
+            return w.rstrip("s") if len(w) > 3 else w
 
-        # --- Strategy 1b: Multi-word column name matching ---
-        # Column names like "home_team_goal" or "Phone" should match "home team goal" or "phone"
-        for col_lower, col_refs in col_by_name.items():
-            col_words = set(col_lower.replace("_", " ").split())
-            if len(col_words) >= 2 and col_words.issubset(q_tokens):
-                if not any(col_lower in h for h in hints):
-                    hints.append(f'question words match multi-word column "{col_lower}": {", ".join(col_refs)}')
+        metric_stems = {_s(t) for t in metric_tokens if len(t) >= 2}
+        question_stems = {_s(t) for t in question_tokens if len(t) >= 2}
+        pop_stems = {_s(t) for t in pop_tokens if len(t) >= 2}
 
-        # --- Strategy 2: Table mention → structural columns ---
+        _q_mentions_id = bool(re.search(r'\bid\b', question.lower())) or "id" in metric_stems
+        _col_null_ratio: dict[str, float] = {}
+        col_candidates: list[tuple[str, str, str, set[str]]] = []
         for table in kg.tables:
-            table_lower = table.name.lower()
-            table_stem = table_lower.rstrip("s").rstrip("e")
-            mentioned = any(
-                (len(table_stem) >= 4 and table_stem in tok) or
-                (len(tok) >= 4 and tok in table_lower)
-                for tok in q_tokens
-            )
-            if not mentioned:
-                continue
-
-            descriptor_col = None
-            measure_col = None
             for col in table.columns:
-                cn = col.name.lower()
-                is_fk_or_pk = ("id" in cn or "link" in cn or "ref" in cn or "key" in cn)
-                is_text = col.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR", "STRING")
-                is_numeric = col.sql_type.upper() in ("REAL", "FLOAT", "NUMERIC", "INTEGER", "INT")
+                cn = col.name
+                cn_lower = cn.lower()
+                if "link" in cn_lower or "ref" in cn_lower:
+                    continue
+                if cn_lower == "id" and not _q_mentions_id:
+                    continue
+                if cn_lower != "id" and cn_lower.endswith("id"):
+                    continue
+                camel_parts = re.findall(r'[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', cn)
+                space_parts = re.findall(r'[a-z]+', cn_lower.replace("_", " "))
+                words = {w.lower() for w in camel_parts} | set(space_parts)
+                words = {w for w in words if len(w) >= 2}
+                if words:
+                    col_candidates.append((table.name, col.name, cn_lower, words))
+                    if hasattr(col, 'null_ratio') and col.null_ratio and col.null_ratio >= 0.95:
+                        _col_null_ratio[f"{table.name}.{col.name}"] = col.null_ratio
 
-                if is_text and not is_fk_or_pk and not descriptor_col:
-                    descriptor_col = col.name
-                if is_numeric and not is_fk_or_pk and not measure_col:
-                    measure_col = col.name
+        q_stem_list = [_s(t) for t in re.findall(r'[a-z]+', question.lower()) if len(t) >= 2]
+        q_bigrams = {(q_stem_list[i], q_stem_list[i+1]) for i in range(len(q_stem_list)-1)}
 
-            if descriptor_col or measure_col:
-                parts = [f'The question references "{table.name}" table:']
-                if descriptor_col:
-                    parts.append(f'  descriptor column → "{table.name}"."{descriptor_col}"')
-                if measure_col:
-                    parts.append(f'  measure column → "{table.name}"."{measure_col}"')
-                hints.append("\n".join(parts))
+        scored: list[tuple[float, str, str, set[str]]] = []
+        for table_name, col_name, col_lower, words in col_candidates:
+            col_stems = {_s(w) for w in words}
+            metric_match = col_stems & metric_stems
+            question_match = col_stems & question_stems
+            pop_only = (col_stems & pop_stems) - metric_stems
+            score = len(metric_match) * 2 + len(question_match - metric_stems)
+            if not metric_match and pop_only and len(pop_only) >= len(question_match):
+                score *= 0.5
+            col_stem_list = list(col_stems)
+            for a in col_stem_list:
+                for b in col_stem_list:
+                    if a != b and (a, b) in q_bigrams:
+                        score += 2
+                        break
+                else:
+                    continue
+                break
+            if score >= 1:
+                if table_name.lower() == entity_table:
+                    score += 1
+                if f"{table_name}.{col_name}" in _col_null_ratio:
+                    score *= 0.3
+                scored.append((score, table_name, col_name, words))
 
-        return "\n".join(hints)
+        scored.sort(key=lambda x: -x[0])
+
+        # Build FK adjacency for joinability check
+        connected: dict[str, set[str]] = {}
+        if kg.graph:
+            for edge in kg.graph.fk_edges:
+                src_tbl = edge.src.split(".")[0] if "." in edge.src else ""
+                dst_tbl = edge.dst.split(".")[0] if "." in edge.dst else ""
+                if src_tbl and dst_tbl:
+                    connected.setdefault(src_tbl.lower(), set()).add(dst_tbl.lower())
+                    connected.setdefault(dst_tbl.lower(), set()).add(src_tbl.lower())
+
+        # Confidence gate: top score ≥ 3 means direct name match is strong
+        top_score = scored[0][0] if scored else 0
+        if top_score >= 3:
+            resolved = self._select_from_scored(scored, connected, entity_table, question_stems, metric_stems)
+            self._log("kg_col_resolve", f"deterministic={resolved}, top={top_score}")
+            if resolved:
+                # Structural gap check: how many output values does the metric expect?
+                metric_phrases = re.split(r'\band\b|,', metric_text)
+                expected_count = sum(1 for p in metric_phrases if len(p.strip().split()) >= 2)
+                if len(resolved) >= expected_count or expected_count <= 1:
+                    return resolved
+                # Found fewer columns than expected — LLM fills gaps
+                self._log("kg_col_resolve", f"gap: have {len(resolved)}, expect {expected_count}")
+                llm_cols = self._resolve_columns_llm(
+                    question, user_intent, kg, entity_table, connected,
+                )
+                seen = {r.lower() for r in resolved}
+                for lc in llm_cols:
+                    if lc.lower() not in seen:
+                        resolved.append(lc)
+                        seen.add(lc.lower())
+                return resolved[:5]
+
+        # Low confidence — full LLM resolution
+        self._log("kg_col_resolve", f"low confidence, top={top_score}, falling to LLM")
+        return self._resolve_columns_llm(
+            question, user_intent, kg, entity_table, connected,
+        )
+
+    def _select_from_scored(
+        self,
+        scored: list[tuple[float, str, str, set[str]]],
+        connected: dict[str, set[str]],
+        entity_table: str,
+        question_stems: set[str] | None = None,
+        metric_stems: set[str] | None = None,
+    ) -> list[str]:
+        """Select columns from scored list with joinability + coverage filtering."""
+        def _s(w: str) -> str:
+            return w.rstrip("s") if len(w) > 3 else w
+
+        all_relevant_stems = (question_stems or set()) | (metric_stems or set())
+        resolved: list[str] = []
+        seen_cols: set[str] = set()
+        selected_tables: set[str] = set()
+        covered_stems: set[str] = set()
+        min_score = 2
+        for score, table_name, col_name, words in scored:
+            if score < min_score:
+                break
+            col_key = col_name.lower()
+            if col_key in seen_cols:
+                continue
+            col_stems = {_s(w) for w in words}
+            # Coverage: does this column contribute a NEW relevant stem?
+            if resolved and all_relevant_stems:
+                relevant_new = (col_stems & all_relevant_stems) - covered_stems
+                if not relevant_new:
+                    continue
+            tbl_lower = table_name.lower()
+            if selected_tables and tbl_lower not in selected_tables:
+                reachable = any(
+                    tbl_lower in connected.get(st, set())
+                    for st in selected_tables
+                )
+                if not reachable:
+                    continue
+            seen_cols.add(col_key)
+            selected_tables.add(tbl_lower)
+            covered_stems |= col_stems
+            resolved.append(f"{table_name}.{col_name}")
+            if len(resolved) >= 5:
+                break
+        return resolved
+
+    def _resolve_columns_llm(
+        self,
+        question: str,
+        user_intent: str,
+        kg: KnowledgeGraph,
+        entity_table: str,
+        connected: dict[str, set[str]],
+    ) -> list[str]:
+        """LLM picks output columns from KG schema when deterministic match is weak."""
+        # Build column list grouped by table
+        table_cols: list[str] = []
+        for table in kg.tables:
+            cols = []
+            for col in table.columns:
+                cn_lower = col.name.lower()
+                if cn_lower == "id" or cn_lower.endswith("id"):
+                    continue
+                desc = f" -- {col.description}" if col.description else ""
+                cols.append(f'    "{col.name}" ({col.sql_type}){desc}')
+            if cols:
+                table_cols.append(f'  TABLE "{table.name}":\n' + "\n".join(cols))
+
+        schema_text = "\n".join(table_cols)
+
+        prompt = f"""QUESTION: {question}
+
+{user_intent}
+
+AVAILABLE COLUMNS:
+{schema_text}
+
+Pick the OUTPUT columns needed to answer this question (the columns whose values appear in the final answer).
+Do NOT pick filter/WHERE columns — only columns whose values the user wants to SEE.
+
+RULES:
+- Strongly prefer columns whose names directly match words in the question
+- Only pick columns from tables that can be joined together
+- Pick 1-4 columns maximum
+- If the question mentions a concept that maps to a specific column (e.g. "earnings" → Salary, "popularity" → ViewCount), pick that column
+
+Return JSON: {{"columns": ["table.column", ...]}}"""
+
+        messages = [ModelMessage(role="user", content=prompt)]
+        try:
+            raw = self._model_call_with_retry(messages, thinking=False)
+            parsed = self._parse_json(raw)
+            if not isinstance(parsed, dict) or not parsed.get("columns"):
+                return []
+        except Exception:
+            return []
+
+        # Validate against actual KG schema + joinability
+        resolved: list[str] = []
+        seen_cols: set[str] = set()
+        selected_tables: set[str] = set()
+        for ref in parsed["columns"]:
+            if "." not in ref:
+                continue
+            tbl, col = ref.split(".", 1)
+            tbl = tbl.strip('"').strip("'")
+            col = col.strip('"').strip("'")
+            table_schema = kg.get_table(tbl)
+            if not table_schema:
+                # Try case-insensitive match
+                for t in kg.tables:
+                    if t.name.lower() == tbl.lower():
+                        table_schema = t
+                        tbl = t.name
+                        break
+            if not table_schema:
+                continue
+            actual_col = next(
+                (c.name for c in table_schema.columns if c.name.lower() == col.lower()), None
+            )
+            if not actual_col:
+                continue
+            col_key = actual_col.lower()
+            if col_key in seen_cols:
+                continue
+            # Joinability check
+            tbl_lower = tbl.lower()
+            if selected_tables and tbl_lower not in selected_tables:
+                reachable = any(
+                    tbl_lower in connected.get(st, set())
+                    for st in selected_tables
+                )
+                if not reachable:
+                    continue
+            seen_cols.add(col_key)
+            selected_tables.add(tbl_lower)
+            resolved.append(f"{tbl}.{actual_col}")
+            if len(resolved) >= 5:
+                break
+
+        return resolved
+
 
     def _sanity_check_picks(
         self,
@@ -1396,15 +1621,18 @@ CONSTRAINTS:
         named_entities.extend(proper_nouns)
         # Also catch single capitalized words that match known column values in the graph
         single_caps = re.findall(r'\b([A-Z][a-z]{2,})\b', question)
-        stop_words = {"the", "which", "what", "how", "many", "list", "give",
-                      "find", "show", "all", "are", "for", "from", "with",
-                      "calculate", "identify", "please", "among", "total"}
+        # Identify sentence-start positions (pos 0 or after ./?/! + space)
+        _sentence_starts: set[int] = {0}
+        for m in re.finditer(r'[.?!]\s+', question):
+            _sentence_starts.add(m.end())
         # Track which DB column each named entity was found in (for better sanity messages)
         entity_found_in: dict[str, str] = {}
         table_names_lower = {t.name.lower() for t in kg.tables} if kg else set()
         if kg and kg.graph:
             for word in single_caps:
-                if word.lower() in stop_words:
+                # Skip words that are capitalized only because they start a sentence
+                _word_pos = question.find(word)
+                if _word_pos in _sentence_starts:
                     continue
                 if word in named_entities:
                     continue
@@ -1428,7 +1656,7 @@ CONSTRAINTS:
                             # Get context words around the entity in the question
                             word_pos = question.find(word)
                             context_window = question[max(0, word_pos - 30):word_pos + len(word) + 50].lower()
-                            context_words = set(re.findall(r'[a-z]{3,}', context_window)) - stop_words
+                            context_words = set(re.findall(r'[a-z]{3,}', context_window))
                             matches: list[tuple[str, str, int]] = []
                             for t in kg.tables:
                                 for col in t.columns:
@@ -1632,6 +1860,7 @@ CONSTRAINTS:
 
         # --- Check 9: Question words matching column names that imply a filter ---
         # e.g., "approved" in the question when there's an "approved" column with boolean values
+        # Inject the filter directly (not just warn) so the table enters the query path
         if kg and kg.graph:
             filter_col_names = {n.column.lower() for n in filter_nodes}
             output_col_names = {n.column.lower() for n in output_nodes}
@@ -1639,16 +1868,20 @@ CONSTRAINTS:
             for col_id, col_node in kg.graph.columns.items():
                 col_lower = col_node.name.lower()
                 if col_lower in q_words and col_lower not in filter_col_names and col_lower not in output_col_names:
-                    # Check if this column has boolean/status-like values
                     val_nodes = kg.graph.get_column_values(col_id)
                     if val_nodes:
                         vals = [str(v.value).lower() for v in val_nodes]
                         is_boolean = set(vals) <= {"true", "false", "yes", "no", "0", "1", "t", "f"}
                         if is_boolean and len(vals) <= 4:
+                            positive_val = "true" if "true" in vals else vals[0]
+                            filter_nodes.append(QueryNode(
+                                table=col_node.table_id, column=col_node.name,
+                                role="filter", operator="=", value=positive_val,
+                            ))
+                            filter_col_names.add(col_lower)
                             issues.append(
-                                f'The question mentions "{col_lower}" which is a column in '
-                                f'"{col_node.table_id}" with values {vals}. '
-                                f'Add a filter: "{col_node.table_id}"."{col_node.name}" = \'true\' (or appropriate value).'
+                                f'Injected filter: "{col_node.table_id}"."{col_node.name}" = \'{positive_val}\' '
+                                f'(question word "{col_lower}" matches boolean column).'
                             )
 
         # --- Check 10: Spurious filters — value not grounded in question or intent ---

@@ -23,6 +23,9 @@ class SchemaSelectionMixin:
 {schema_section}{domain_section}
 You are decomposing a data question into structured analytical signals. Think step by step about what the question is REALLY asking, then output JSON.
 
+STEP 0 — GROUND TERMS
+Before interpreting the question, check if any words match column names or terms defined in DOMAIN KNOWLEDGE. If a match exists, use the database-defined meaning — not the everyday English meaning.
+
 STEP 1 — UNDERSTAND THE ANSWER
 Imagine the final answer printed on paper. What does it look like?
 - A single number or value? → answer_shape = "single_value"
@@ -107,7 +110,6 @@ Now return ONLY this JSON (no other text):
   "who_to_filter_on": "the named entity, condition, or population that narrows the data",
   "entity_of_interest": "the database entity whose attributes are RETURNED (not the filter entity)",
   "group_condition": "aggregate condition on groups (e.g. 'more than 5 orders') or null",
-  "columns_needed": ["column concepts needed in the answer"],
   "temporal_filter": "time constraint mentioned in the question, or null",
   "ordinal": "positional selector (1st, 2nd, last, champion, runner-up) or null",
   "sort_direction": "ASC or DESC if ordering is implied, or null"
@@ -133,10 +135,6 @@ Now return ONLY this JSON (no other text):
                     lines.append(f"Entity of interest: {parsed['entity_of_interest']} (prefer this table's columns for output)")
                 if parsed.get("group_condition"):
                     lines.append(f"Group condition (HAVING): {parsed['group_condition']}")
-                if parsed.get("columns_needed"):
-                    cols = parsed["columns_needed"]
-                    if isinstance(cols, list) and cols:
-                        lines.append(f"Columns needed: {', '.join(str(c) for c in cols)}")
                 if parsed.get("temporal_filter"):
                     lines.append(f"Temporal filter: {parsed['temporal_filter']}")
                 if parsed.get("ordinal"):

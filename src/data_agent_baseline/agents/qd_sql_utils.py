@@ -120,21 +120,29 @@ def _sanitize_sql(sql: str, db_path: Path) -> str:
 
 
 def _enforce_grounding_filters(sql: str, grounding_context: str, db_path: Path) -> str:
-    """Replace incorrect filter columns with those specified in FILTER VALUES."""
-    if "FILTER VALUES" not in grounding_context:
-        return sql
-    # Parse grounding filters: "table"."column": operator value
+    """Replace incorrect filter columns/values with those specified in CONDITIONS.
+
+    Handles two cases:
+    1. LLM used a different column from the same table (original behavior)
+    2. LLM used the semantic value (e.g. 'carcinogenic') instead of the coded value
+       (e.g. '+') that CONDITIONS specifies for the correct column
+    """
+    # Parse CONDITIONS section (the authoritative grounding filters)
     grounding_filters: list[tuple[str, str, str, str]] = []
+    # Match both CONDITIONS: and FILTER VALUES: sections
     for m in re.finditer(
         r'"(\w+)"\."(\w+)":\s*(=|>=|<=|>|<|LIKE|IS NOT NULL)\s*(.*)',
         grounding_context,
     ):
-        grounding_filters.append((m.group(1), m.group(2), m.group(3), m.group(4).strip()))
+        val = m.group(4).strip()
+        # Strip COLLATE NOCASE suffix
+        val = re.sub(r'\s+COLLATE\s+NOCASE\s*$', '', val, flags=re.IGNORECASE).strip()
+        # Strip surrounding quotes
+        val = val.strip("'\"")
+        grounding_filters.append((m.group(1), m.group(2), m.group(3), val))
     if not grounding_filters:
         return sql
 
-    # Check each grounding filter: if the SQL filters the same table but on a
-    # different column with a non-matching value, replace it
     try:
         conn = sqlite3.connect(str(db_path), timeout=5)
         tables_cols: dict[str, list[str]] = {}
@@ -150,27 +158,43 @@ def _enforce_grounding_filters(sql: str, grounding_context: str, db_path: Path) 
     for tbl, col, op, val in grounding_filters:
         if tbl not in tables_cols or col not in tables_cols[tbl]:
             continue
-        # Only handle simple equality filters (safest replacement)
         if op != "=":
             continue
-        # Only replace if the grounding column is NOT already used in the SQL
-        if f'"{col}"' in sql or f'.{col}' in sql:
-            continue
-        # Check if SQL references a different column from the same table with a string value
-        # that looks like it's trying to filter for the same concept
-        other_cols = [c for c in tables_cols[tbl] if c != col and c.lower() != "_id" and c.lower() != "id"]
-        for other_col in other_cols:
-            # Look for patterns like "table"."other_col" = 'something' or other_col = 'something'
-            patterns = [
-                rf'"{re.escape(tbl)}"\."{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
-                rf'"{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
+
+        # Case 2: Grounding says table.col = 'coded_value' but LLM used a DIFFERENT
+        # column from the same table with a human-readable value (semantic equivalent).
+        # e.g. CONDITIONS says molecule.label = '+' but LLM wrote molecule.storage_label = 'carcinogenic'
+        # Detect: grounding column IS NOT in SQL, but another col from same table IS used with = 'something'
+        col_in_sql = f'"{col}"' in sql or f'.{col}' in sql or f'."{col}"' in sql
+        if not col_in_sql:
+            other_cols = [c for c in tables_cols[tbl] if c != col and c.lower() != "_id" and c.lower() != "id"]
+            for other_col in other_cols:
+                patterns = [
+                    rf'"{re.escape(tbl)}"\."{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
+                    rf'"{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
+                    rf'(?:\w+\.)?"{re.escape(other_col)}"\s*=\s*\'[^\']*\'',
+                ]
+                for pat in patterns:
+                    match = re.search(pat, sql)
+                    if match:
+                        old_cond = match.group(0)
+                        new_cond = f'"{tbl}"."{col}" = \'{val}\''
+                        sql = sql.replace(old_cond, new_cond)
+                        break
+        else:
+            # Case 2b: Grounding column IS in SQL but with WRONG value
+            # e.g. CONDITIONS says molecule.label = '+' but LLM wrote molecule.label = 'carcinogenic'
+            wrong_val_patterns = [
+                rf'("{re.escape(tbl)}"\.)?"{re.escape(col)}"\s*=\s*\'([^\']*)\'',
             ]
-            for pat in patterns:
+            for pat in wrong_val_patterns:
                 match = re.search(pat, sql)
                 if match:
-                    old_cond = match.group(0)
-                    new_cond = f'"{tbl}"."{col}" = \'{val}\''
-                    sql = sql.replace(old_cond, new_cond)
+                    used_val = match.group(2) if match.lastindex >= 2 else ""
+                    if used_val and used_val != val and used_val.lower() != val.lower():
+                        old_cond = match.group(0)
+                        new_cond = f'"{tbl}"."{col}" = \'{val}\''
+                        sql = sql.replace(old_cond, new_cond)
                     break
     return sql
 
@@ -196,7 +220,7 @@ def _apply_null_guard(sql: str) -> str:
     )
     if minmax_match:
         col = minmax_match.group(2)
-        table = minmax_match.group(3)
+        minmax_match.group(3)  # table (unused but parsed)
         # Add WHERE col != '' inside the subquery if not already there
         subq_start = minmax_match.start()
         subq_end = guarded.find(")", subq_start + 1)

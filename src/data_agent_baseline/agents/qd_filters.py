@@ -1100,6 +1100,17 @@ class FilterProcessingMixin:
             col, val, keyword = m.group(1), m.group(2), m.group(3).lower()
             mappings.append((col, val, keyword))
 
+        # Also parse descriptive patterns:
+        # "column: ... keyword ('value') or keyword2 ('value2')"
+        # e.g. "label: Indicates whether the molecule is carcinogenic ('+') or non-carcinogenic ('-')"
+        for m in re.finditer(
+            r"- (\w+):\s+[^-\n]*?(\w+)\s*\(['\"]([^'\"]+)['\"]\)",
+            anchor_text,
+        ):
+            col, keyword, val = m.group(1), m.group(2).lower(), m.group(3)
+            if keyword not in ("e", "i", "a", "is", "the", "to", "of"):
+                mappings.append((col, val, keyword))
+
         if not mappings:
             return filter_nodes
 

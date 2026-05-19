@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any  # noqa: F401
 
 from data_agent_baseline.pipeline.kg_builder import KnowledgeGraph
 
@@ -228,7 +228,7 @@ class DiagnosticsMixin:
                             except Exception:
                                 pass
                     else:
-                        diagnostics.append(f"  FIX: This filter excludes all rows. Remove it or use a different column.")
+                        diagnostics.append("  FIX: This filter excludes all rows. Remove it or use a different column.")
         finally:
             conn.close()
 
@@ -356,7 +356,7 @@ class DiagnosticsMixin:
             )
             if not m:
                 continue
-            term, table, col, matches_str = m.group(1), m.group(2), m.group(3), m.group(4)
+            _, table, col, matches_str = m.group(1), m.group(2), m.group(3), m.group(4)
             # Extract the first match value
             match_vals = re.findall(r"'([^']+)'", matches_str)
             if not match_vals:
@@ -391,31 +391,67 @@ class DiagnosticsMixin:
         db_path: Path,
         kg: KnowledgeGraph,
         knowledge_text: str,
+        grounding_context: str = "",
     ) -> str:
         """Infer normal/abnormal thresholds from data distribution when not in knowledge."""
         q_lower = question.lower()
-        needs_threshold = any(w in q_lower for w in ("normal", "abnormal", "elevated", "low level", "high level"))
+        needs_threshold = any(w in q_lower for w in (
+            "normal", "abnormal", "elevated", "low level", "high level",
+            "healthy", "unhealthy", "within range", "out of range",
+        ))
         if not needs_threshold:
             return ""
 
-        # Check if knowledge already defines thresholds
-        if knowledge_text:
-            k_lower = knowledge_text.lower()
-            # Find which field the question refers to
-            threshold_fields: list[str] = []
-            for word in re.findall(r'\b[a-z]{2,}\b', q_lower):
-                if word in ("normal", "abnormal", "level", "levels", "have", "their", "them"):
-                    continue
-                if word in k_lower:
-                    # Check if threshold is already defined
-                    idx = k_lower.find(word)
-                    context = knowledge_text[max(0, idx-50):idx+200]
-                    if any(t in context.lower() for t in ("range", "above", "below", "between", "normal")):
-                        return ""  # Already defined
-                    threshold_fields.append(word)
-
         if not db_path or not db_path.exists():
             return ""
+
+        # Extract which fields the question references for threshold inference
+        # e.g. "normal level of white blood cells" → WBC
+        # e.g. "abnormal fibrinogen level" → FG/fibrinogen
+        threshold_concepts: list[str] = []
+        # Words that describe the threshold state (not the field itself)
+        state_words = {
+            "normal", "abnormal", "elevated", "low", "high", "level", "levels",
+            "have", "their", "them", "who", "how", "many", "patients", "male",
+            "female", "among", "the", "with", "and", "are", "what", "which",
+            "healthy", "unhealthy", "within", "out", "range", "blood",
+        }
+        # Extract candidate field names from question
+        q_words = re.findall(r'\b[a-z]{2,}\b', q_lower)
+        for word in q_words:
+            if word not in state_words and len(word) >= 2:
+                threshold_concepts.append(word)
+
+        # Check if knowledge defines thresholds for ALL referenced fields
+        knowledge_covers_all = True
+        if knowledge_text:
+            k_lower = knowledge_text.lower()
+            for concept in threshold_concepts:
+                if concept in k_lower:
+                    idx = k_lower.find(concept)
+                    context = knowledge_text[max(0, idx - 50):idx + 200]
+                    if any(t in context.lower() for t in ("range", "above", "below", "between", "normal", "abnormal")):
+                        continue
+                knowledge_covers_all = False
+        else:
+            knowledge_covers_all = False
+
+        if knowledge_covers_all and knowledge_text:
+            return ""
+
+        # For threshold questions, include ALL numeric columns from tables that
+        # are likely relevant (the LLM needs the full data landscape to pick thresholds).
+        # This is more robust than trying to abbreviation-match WBC/FG/etc.
+
+        # Extract columns that already have deterministic conditions in the grounding
+        # (e.g., "Laboratory"."FG": IS NOT NULL) — skip these from threshold stats
+        resolved_cols: set[str] = set()
+        if grounding_context:
+            for m in re.finditer(
+                r'"([^"]+)"\."([^"]+)":\s*(?:IS NOT NULL|>=|<=|=|BETWEEN)',
+                grounding_context,
+            ):
+                resolved_cols.add(f"{m.group(1)}.{m.group(2)}".lower())
 
         conn = sqlite3.connect(str(db_path))
         inferences: list[str] = []
@@ -427,13 +463,16 @@ class DiagnosticsMixin:
                     col_type = col_info[2].lower()
                     col_lower = col.lower()
 
-                    # Check if this column is referenced by the question
-                    if not any(w in col_lower for w in re.findall(r'\b[a-z]{3,}\b', q_lower)):
+                    # Skip ID/key columns
+                    if col_lower in ("id", "_id") or col_lower.endswith("_id") or col_lower.startswith("link_to"):
+                        continue
+
+                    # Skip columns already resolved in grounding conditions
+                    if f"{table.name}.{col}".lower() in resolved_cols:
                         continue
 
                     # Only for numeric columns
                     if col_type not in ("real", "integer", "numeric", "float", "double", "int"):
-                        # Check if values are actually numeric
                         try:
                             test = conn.execute(
                                 f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
@@ -452,11 +491,30 @@ class DiagnosticsMixin:
                             f'COUNT(*) '
                             f'FROM "{table.name}" WHERE "{col}" IS NOT NULL'
                         ).fetchone()
-                        if stats and stats[3] > 0:
-                            inferences.append(
-                                f"  {table.name}.{col}: min={stats[0]}, max={stats[1]}, "
-                                f"avg={stats[2]:.2f}, count={stats[3]}"
-                            )
+                        if not stats or stats[3] == 0:
+                            continue
+
+                        # Compute percentiles for threshold inference
+                        total = stats[3]
+                        p25_row = conn.execute(
+                            f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
+                            f'WHERE "{col}" IS NOT NULL '
+                            f'ORDER BY CAST("{col}" AS REAL) '
+                            f'LIMIT 1 OFFSET {int(total * 0.25)}'
+                        ).fetchone()
+                        p75_row = conn.execute(
+                            f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
+                            f'WHERE "{col}" IS NOT NULL '
+                            f'ORDER BY CAST("{col}" AS REAL) '
+                            f'LIMIT 1 OFFSET {int(total * 0.75)}'
+                        ).fetchone()
+                        p25 = p25_row[0] if p25_row else stats[0]
+                        p75 = p75_row[0] if p75_row else stats[1]
+
+                        inferences.append(
+                            f"  {table.name}.{col}: min={stats[0]}, max={stats[1]}, "
+                            f"avg={stats[2]:.2f}, P25={p25}, P75={p75}, count={stats[3]}"
+                        )
                     except Exception:
                         continue
         finally:
@@ -464,8 +522,77 @@ class DiagnosticsMixin:
 
         if inferences:
             return (
-                "THRESHOLD CONTEXT (data distribution — use with DOMAIN KNOWLEDGE to determine normal ranges):\n"
-                + "\n".join(inferences[:8])
+                "THRESHOLD CONTEXT (data distribution for normal/abnormal inference):\n"
+                "Use these statistics to determine thresholds. "
+                "Values outside the P25-P75 interquartile range are likely abnormal. "
+                "If domain knowledge defines specific ranges, prefer those.\n"
+                + "\n".join(inferences[:30])
+            )
+        return ""
+
+    def _check_concept_coverage(
+        self, sql: str, grounding_context: str, question: str,
+    ) -> str:
+        """Check that all filter conditions from grounding are reflected in the generated SQL.
+
+        Returns a description of missing concepts, or empty string if all covered.
+        """
+        if not sql or not grounding_context:
+            return ""
+
+        # Parse CONDITIONS from grounding
+        conditions_section = ""
+        in_conditions = False
+        for line in grounding_context.split("\n"):
+            if line.startswith("CONDITIONS:"):
+                in_conditions = True
+                continue
+            elif in_conditions:
+                if line and not line.startswith(" ") and not line.startswith("\t") and not line.startswith('"'):
+                    break
+                conditions_section += line + "\n"
+
+        if not conditions_section:
+            return ""
+
+        # Extract each condition: "table"."column": operator value
+        expected_filters: list[tuple[str, str, str]] = []
+        for m in re.finditer(
+            r'"(\w+)"\."(\w+)":\s*(=|>=|<=|>|<|LIKE|IS NOT NULL)\s*(.*)',
+            conditions_section,
+        ):
+            table, col, _, val = m.group(1), m.group(2), m.group(3), m.group(4).strip()
+            val = re.sub(r'\s+COLLATE\s+NOCASE\s*$', '', val, flags=re.IGNORECASE).strip().strip("'\"")
+            expected_filters.append((table, col, val))
+
+        if not expected_filters:
+            return ""
+
+        # Check which conditions are missing from the SQL
+        sql_upper = sql.upper()
+        missing: list[str] = []
+        for table, col, val in expected_filters:
+            # Check if the column appears in the SQL (case-insensitive)
+            col_present = (
+                f'"{col}"' in sql
+                or f'.{col}' in sql.replace('"', '')
+                or col.upper() in sql_upper
+            )
+            if col_present:
+                continue
+            # Check if the value appears (for text values)
+            if val and len(val) >= 2:
+                val_present = val in sql or val.lower() in sql.lower()
+                if val_present:
+                    continue
+            # This condition is entirely missing from the SQL
+            missing.append(f'"{table}"."{col}" {val} is not filtered in the SQL')
+
+        if missing:
+            return (
+                "The SQL is missing these required filters from the grounding:\n"
+                + "\n".join(f"  - {m}" for m in missing)
+                + "\nAdd these conditions to the WHERE clause."
             )
         return ""
 

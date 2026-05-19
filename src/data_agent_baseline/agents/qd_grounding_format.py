@@ -223,13 +223,13 @@ def _build_analytics_brief(
                 grain_desc = "1 row = 1 association"
         elif role == "fact":
             if ts.temporal_columns:
-                grain_desc = f"1 row = 1 transaction/event"
+                grain_desc = "1 row = 1 transaction/event"
             else:
                 grain_desc = "1 row = 1 record"
         elif role == "dimension":
             grain_desc = f"1 row = 1 entity ({ts.row_count} total)"
         elif role == "snapshot":
-            grain_desc = f"1 row = 1 periodic snapshot"
+            grain_desc = "1 row = 1 periodic snapshot"
         else:
             grain_desc = f"{ts.row_count} rows"
         lines.append(f'  "{tname}" [{role}]: {grain_desc}')
@@ -278,7 +278,15 @@ def _build_analytics_brief(
     implications: list[str] = []
 
     if comp_type == "count":
-        if eoi and eoi.lower() != out_table.lower():
+        has_having = any(
+            n.column.startswith("_expr:") for n in (path.filter_nodes or [])
+        )
+        if has_having and one_table:
+            implications.append(
+                f'COUNT what: number of "{one_table}" groups that satisfy the HAVING condition. '
+                f'Pattern: SELECT COUNT(*) FROM (SELECT ... GROUP BY "{one_table}" ... HAVING ...)'
+            )
+        elif eoi and eoi.lower() != out_table.lower():
             eoi_ts = kg.get_table(eoi)
             if eoi_ts:
                 implications.append(
@@ -291,7 +299,28 @@ def _build_analytics_brief(
                 f'Counting "{out_table}" rows after JOIN gives the wrong number.'
             )
         elif many_table == out_table:
-            implications.append(f'COUNT what: rows in "{out_table}" matching the filter conditions.')
+            # If the one-side (dimension) table exists and has fewer rows,
+            # the question likely asks about distinct entities, not raw rows.
+            one_ts = kg.get_table(one_table) if one_table else None
+            if one_ts and one_ts.role == "dimension" and one_table != out_table:
+                join_col = ""
+                for edge in path.edges:
+                    if edge.src_table == out_table and edge.dst_table == one_table:
+                        join_col = edge.src_column
+                        break
+                    elif edge.dst_table == out_table and edge.src_table == one_table:
+                        join_col = edge.dst_column
+                        break
+                if join_col:
+                    implications.append(
+                        f'COUNT what: COUNT(DISTINCT "{out_table}"."{join_col}") — '
+                        f'each "{one_table}" entity has multiple "{out_table}" rows. '
+                        f'The question asks about entities, not rows.'
+                    )
+                else:
+                    implications.append(f'COUNT what: rows in "{out_table}" matching the filter conditions.')
+            else:
+                implications.append(f'COUNT what: rows in "{out_table}" matching the filter conditions.')
 
     elif comp_type in ("sum", "avg"):
         if out_ts and out_ts.measure_agg_level.get(out_col) == "pre_aggregated":
@@ -318,14 +347,24 @@ def _build_analytics_brief(
                 f'Use CASE WHEN or filtered subquery, NOT separate JOINs.'
             )
 
-    elif comp_type == "simple_lookup" and many_table:
-        # DISTINCT hint
+    elif comp_type == "simple_lookup" and len(path.edges or []) > 0:
+        # DISTINCT hint: fact/transaction tables have multiple rows per entity.
+        # Filtering through them produces duplicate output rows from dimension tables.
         filter_tables = {n.table for n in (path.filter_nodes or [])}
-        if many_table in filter_tables and out_table != many_table:
-            implications.append(
-                f'DUPLICATES: filtering through "{many_table}" (many-side) may produce duplicate '
-                f'"{out_table}" rows. Use SELECT DISTINCT.'
-            )
+        out_tables = {n.table for n in (path.output_nodes or [])}
+        for tbl_name in filter_tables:
+            ts = kg.get_table(tbl_name) if kg else None
+            if not ts:
+                continue
+            if ts.role in ("fact", "bridge", "snapshot") or ts.row_count > 500:
+                other_out = out_tables - {tbl_name}
+                if other_out:
+                    implications.append(
+                        f'DUPLICATES: "{tbl_name}" ({ts.role}, {ts.row_count} rows) has multiple '
+                        f'rows per join key. SELECT DISTINCT only the OUTPUT COLUMNS listed below — '
+                        f'do NOT include filter/join columns in SELECT or duplicates will persist.'
+                    )
+                    break
 
     if implications:
         lines.append("  IMPLICATIONS:")
@@ -369,9 +408,18 @@ class GroundingFormatMixin:
 
         # Pass derived_logic to SQL LLM — it describes the computation in plain language
         # and helps the SQL LLM understand the intent even when comp_type is imprecise.
+        # Suppress if it references columns contradicting OUTPUT COLUMNS (picker hallucination).
         derived_logic = goal.get("derived_logic", "")
-        if derived_logic:
-            parts.append(f"COMPUTATION: {derived_logic}")
+        if derived_logic and path.output_nodes:
+            _out_tables = {n.table.lower() for n in path.output_nodes}
+            _mentioned_cols = re.findall(r'(\w+)\.(\w+)', derived_logic)
+            _contradicts = any(
+                t.lower() not in _out_tables and t.lower() not in ("the", "e.g", "i.e")
+                for t, c in _mentioned_cols
+                if kg and kg.get_table(t)
+            )
+            if not _contradicts:
+                parts.append(f"COMPUTATION: {derived_logic}")
 
         # Analytics brief — teaches the SQL LLM what each table/join means analytically
         if path.output_nodes and kg and comp_type != "derived":
@@ -479,19 +527,38 @@ class GroundingFormatMixin:
         if comp_type in ("ratio", "percentage") and path.filter_nodes and path.edges:
             filter_tables = {n.table for n in path.filter_nodes if not n.column.startswith("_expr:")}
             if len(filter_tables) >= 2:
-                # Check if filter tables are connected by a direct FK edge
-                fk_connected = False
-                if kg and kg.graph:
-                    for edge in kg.graph.fk_edges:
-                        src_col = kg.graph.columns.get(edge.src)
-                        dst_col = kg.graph.columns.get(edge.dst)
-                        if src_col and dst_col:
-                            if {src_col.table_id, dst_col.table_id} <= filter_tables:
-                                fk_connected = True
-                                break
-                if not fk_connected:
-                    # Truly independent populations — no FK relationship
-                    is_independent_ratio = True
+                # Independent ratio = both tables have filters on the SAME entity value
+                # (e.g. user_id=24 on posts AND user_id=24 on votes → separate counts).
+                # Standard percentage = one table defines population, other adds subset condition
+                # reachable via FK (e.g. height filter on superhero, name filter on publisher).
+                filter_col_set = {f"{n.table}.{n.column}" for n in path.filter_nodes if not n.column.startswith("_expr:")}
+                # Collect filter values per table
+                table_filter_vals: dict[str, set[str]] = {}
+                for n in path.filter_nodes:
+                    if not n.column.startswith("_expr:") and n.operator == "=":
+                        table_filter_vals.setdefault(n.table, set()).add(str(n.value))
+                # If both tables filter on the same equality value → likely independent counts
+                shared_vals = set()
+                table_list = list(table_filter_vals.keys())
+                if len(table_list) >= 2:
+                    shared_vals = table_filter_vals[table_list[0]]
+                    for tl in table_list[1:]:
+                        shared_vals = shared_vals & table_filter_vals[tl]
+                if shared_vals:
+                    # Same value filtered on both tables — check if FK goes through filter cols
+                    fk_connected = False
+                    if kg and kg.graph:
+                        for edge in kg.graph.fk_edges:
+                            src_col = kg.graph.columns.get(edge.src)
+                            dst_col = kg.graph.columns.get(edge.dst)
+                            if src_col and dst_col:
+                                if (src_col.table_id != dst_col.table_id
+                                        and {src_col.table_id, dst_col.table_id} <= filter_tables):
+                                    if edge.src in filter_col_set or edge.dst in filter_col_set:
+                                        fk_connected = True
+                                        break
+                    if not fk_connected:
+                        is_independent_ratio = True
                 if is_independent_ratio:
                     # Group filters by table
                     table_filters: dict[str, list[QueryNode]] = {}
@@ -528,6 +595,8 @@ class GroundingFormatMixin:
         # When ALL output columns are from one table and a filter uses IN (SELECT ... FROM other_table),
         # the JOIN to that other table is redundant and harmful for AVG/SUM (duplicates rows).
         suppress_join = False
+        having_skeleton = ""
+        having_skeleton_fk = ""
         if (
             comp_type in ("avg", "sum", "count")
             and path.edges
@@ -554,6 +623,89 @@ class GroundingFormatMixin:
                             suppress_join = True
                             break
 
+                # --- HAVING on many-side → subquery skeleton ---
+                # When answer_shape=single_value, outputs from ONE table, and HAVING
+                # references a MANY-side table, the correct pattern is:
+                #   SELECT AGG(col) FROM entity WHERE pk IN (SELECT fk FROM many GROUP BY fk HAVING ...)
+                if not suppress_join:
+                    _shape_val = ""
+                    if user_intent:
+                        _sm = re.search(r'Answer shape:\s*(\w+)', user_intent)
+                        if _sm:
+                            _shape_val = _sm.group(1).lower()
+                    if _shape_val == "single_value":
+                        for fnode in path.filter_nodes:
+                            if not fnode.column.startswith("_expr:"):
+                                continue
+                            expr_sql = fnode.column[len("_expr:"):]
+                            if not re.match(r'(COUNT|SUM|AVG)\s*\(', expr_sql, re.IGNORECASE):
+                                continue
+                            having_table = fnode.table
+                            if having_table == entity_table:
+                                continue
+                            entity_pk = ""
+                            many_fk = ""
+                            for e in path.edges:
+                                if e.src_table == entity_table and e.dst_table == having_table:
+                                    entity_pk = e.src_column
+                                    many_fk = e.dst_column
+                                    break
+                                elif e.dst_table == entity_table and e.src_table == having_table:
+                                    entity_pk = e.dst_column
+                                    many_fk = e.src_column
+                                    break
+                            if not entity_pk or not many_fk:
+                                continue
+                            # Collect WHERE filters for subquery (many-side) and outer (entity-side)
+                            # Skip filters on the FK column itself — they're spurious join-key filters
+                            inner_wheres: list[str] = []
+                            outer_wheres: list[str] = []
+                            for fn in path.filter_nodes:
+                                if fn.column.startswith("_expr:"):
+                                    continue
+                                if fn.column == many_fk:
+                                    continue
+                                if fn.table == having_table:
+                                    if fn.operator.upper() == "LIKE":
+                                        inner_wheres.append(f'"{fn.column}" LIKE \'{fn.value}\'')
+                                    elif fn.operator.upper() == "IS NOT NULL":
+                                        inner_wheres.append(f'"{fn.column}" IS NOT NULL')
+                                    else:
+                                        inner_wheres.append(f'"{fn.column}" {fn.operator} \'{fn.value}\'')
+                                elif fn.table == entity_table:
+                                    if fn.operator.upper() == "LIKE":
+                                        outer_wheres.append(f'"{fn.column}" LIKE \'{fn.value}\'')
+                                    elif fn.operator.upper() == "IS NOT NULL":
+                                        outer_wheres.append(f'"{fn.column}" IS NOT NULL')
+                                    else:
+                                        outer_wheres.append(f'"{fn.column}" {fn.operator} \'{fn.value}\'')
+                            if comp_type == "count":
+                                select_expr = "COUNT(*)"
+                            else:
+                                agg_parts = []
+                                agg_func = "AVG" if comp_type == "avg" else "SUM"
+                                for onode in path.output_nodes:
+                                    agg_parts.append(f'{agg_func}("{onode.column}")')
+                                select_expr = ", ".join(agg_parts)
+                            inner_where_sql = f"\n    WHERE {' AND '.join(inner_wheres)}" if inner_wheres else ""
+                            outer_conditions = [
+                                f'"{entity_pk}" IN (\n'
+                                f'    SELECT "{many_fk}" FROM "{having_table}"{inner_where_sql}\n'
+                                f'    GROUP BY "{many_fk}"\n'
+                                f'    HAVING {expr_sql} {fnode.operator} {fnode.value}\n'
+                                f'  )'
+                            ] + outer_wheres
+                            where_clause = " AND ".join(outer_conditions)
+                            having_skeleton = (
+                                f'SQL SKELETON (MANDATORY — use this exact pattern):\n'
+                                f'  SELECT {select_expr}\n'
+                                f'  FROM "{entity_table}"\n'
+                                f'  WHERE {where_clause}'
+                            )
+                            having_skeleton_fk = many_fk
+                            suppress_join = True
+                            break
+
         # Join structure
         if path.edges and not is_independent_ratio and not suppress_join:
             jp_lines = []
@@ -568,10 +720,15 @@ class GroundingFormatMixin:
                 )
             parts.append("JOINS:\n" + "\n".join(jp_lines))
         elif suppress_join:
-            parts.append(
-                f"STRUCTURE: All output columns are from \"{entity_table}\". "
-                f"The subquery filter already covers the other table — no JOIN needed."
-            )
+            if having_skeleton:
+                parts.append(having_skeleton)
+                # Remove COMPUTATION — the skeleton IS the authoritative plan
+                parts = [p for p in parts if not p.startswith("COMPUTATION:")]
+            else:
+                parts.append(
+                    f"STRUCTURE: All output columns are from \"{entity_table}\". "
+                    f"The subquery filter already covers the other table — no JOIN needed."
+                )
 
         # Filter values (for independent ratios, already embedded in the formula)
         # For percentage/ratio: detect single-table or multi-table (FK-connected) patterns
@@ -581,6 +738,7 @@ class GroundingFormatMixin:
             and len(filter_tables_set) == 1
             and path.output_nodes
             and path.filter_nodes[0].table == path.output_nodes[0].table
+            and not path.edges
         )
         # Multi-table percentage: FK-connected tables, one filter is population (WHERE),
         # the other is subset (CASE WHEN). Fires when independent ratio was suppressed.
@@ -611,7 +769,6 @@ class GroundingFormatMixin:
         is_multi_table_pct = (
             comp_type in ("percentage", "ratio") and path.filter_nodes and not is_independent_ratio
             and not is_single_table_ratio
-            and len(filter_tables_set) >= 2
             and path.edges
             and not _output_is_numeric_measure
         )
@@ -779,7 +936,11 @@ class GroundingFormatMixin:
             else:
                 fv_lines: list[str] = []
                 for node in path.filter_nodes:
+                    if having_skeleton_fk and node.column == having_skeleton_fk:
+                        continue
                     if node.column.startswith("_expr:"):
+                        if having_skeleton:
+                            continue
                         expr_sql = node.column[len("_expr:"):]
                         if re.match(r'(COUNT|SUM|AVG|MIN|MAX)\s*\(', expr_sql, re.IGNORECASE):
                             fv_lines.append(f'  HAVING: {expr_sql} {node.operator} {node.value} (use GROUP BY + HAVING)')
@@ -980,6 +1141,8 @@ class GroundingFormatMixin:
             try:
                 conn = sqlite3.connect(str(db_path), timeout=5)
                 for f in path.filter_nodes:
+                    if having_skeleton_fk and f.column == having_skeleton_fk:
+                        continue
                     key = f"{f.table}.{f.column}"
                     if key in seen_cols or f.operator in ("=", "IS NOT NULL", "LIKE"):
                         continue

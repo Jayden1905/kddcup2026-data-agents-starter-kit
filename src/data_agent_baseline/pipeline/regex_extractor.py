@@ -289,6 +289,15 @@ def _discover_id_pattern(text: str, sample_ids: list[str] | None = None, entity_
             )
             return pat
 
+    # Structured intro patterns (e.g. "registered under the identifier 7")
+    # Check before statistical discovery since they handle multi-word intros
+    # and are more precise than single-word frequency.
+    for intro in _ID_INTRO_PATTERNS:
+        pat = re.compile(intro + r'(\d+)', re.IGNORECASE)
+        matches = pat.findall(text[:10000])
+        if len(matches) >= 5:
+            return pat
+
     # Statistical word-number discovery: find words that most frequently precede
     # numbers in the document. If a small set of words accounts for many number
     # introductions, those words are likely record-ID introducers.
@@ -345,13 +354,6 @@ def _discover_id_pattern(text: str, sample_ids: list[str] | None = None, entity_
         best_prefix, count = prefix_counts_upper.most_common(1)[0]
         if count >= 5:
             pat = re.compile(rf'\b({re.escape(best_prefix)}\d+)\b')
-            return pat
-
-    # Try each intro pattern for numeric IDs
-    for intro in _ID_INTRO_PATTERNS:
-        pat = re.compile(intro + r'(\d+)', re.IGNORECASE)
-        matches = pat.findall(text[:10000])
-        if len(matches) >= 5:
             return pat
 
     # Broader word-prefix: any word + large numbers appearing frequently
@@ -890,12 +892,18 @@ def _match_known_values(
                 para_text = para_index.get(rid, "")
                 if not para_text:
                     continue
+                # Find all matching values and pick the one with most occurrences
+                best_val = None
+                best_count = 0
                 for val in all_vals:
                     if len(val) < 3:
                         continue
-                    if val in para_text:
-                        records[rid][field] = val
-                        break
+                    cnt = para_text.count(val)
+                    if cnt > best_count:
+                        best_count = cnt
+                        best_val = val
+                if best_val:
+                    records[rid][field] = best_val
     finally:
         conn.close()
 
@@ -2322,6 +2330,65 @@ def _normalize_dates_in_records(records: list[dict[str, Any]], columns: list[str
                 r[col] = _normalize_date(v)
 
 
+def _dedup_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove duplicate records: same ID or same entity name with different IDs.
+
+    When two records share the same name-like field value but have different _id,
+    keep the one with more populated fields (the more complete record).
+    """
+    if len(records) <= 1:
+        return records
+
+    # Find the name column: a text field (not _id, not link_to_*) present in most records
+    field_counts: dict[str, int] = {}
+    for r in records:
+        for k, v in r.items():
+            if k == "_id" or k.startswith("link_to_"):
+                continue
+            if isinstance(v, str) and v:
+                field_counts[k] = field_counts.get(k, 0) + 1
+    if not field_counts:
+        return records
+
+    # Name column = text field with highest coverage that has mostly unique values
+    best_name_col = None
+    for col, cnt in sorted(field_counts.items(), key=lambda x: -x[1]):
+        if cnt < len(records) * 0.5:
+            continue
+        vals = [r[col] for r in records if r.get(col)]
+        if len(set(vals)) >= len(vals) * 0.8:
+            best_name_col = col
+            break
+    if not best_name_col:
+        return records
+
+    # Group by name value and remove duplicates
+    name_groups: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        name = r.get(best_name_col)
+        if name:
+            name_groups.setdefault(str(name), []).append(r)
+
+    ids_to_drop: set[str] = set()
+    for name, group in name_groups.items():
+        if len(group) <= 1:
+            continue
+        # Multiple records with same name: keep the one with most non-null fields
+        scored = sorted(
+            group,
+            key=lambda r: sum(1 for v in r.values() if v is not None),
+            reverse=True,
+        )
+        for loser in scored[1:]:
+            lid = str(loser.get("_id", ""))
+            if lid:
+                ids_to_drop.add(lid)
+
+    if not ids_to_drop:
+        return records
+    return [r for r in records if str(r.get("_id", "")) not in ids_to_drop]
+
+
 def _write_new_table(
     db_path: Path,
     table_name: str,
@@ -2331,6 +2398,8 @@ def _write_new_table(
     """Create a new table and write records."""
     if not records:
         return 0
+
+    records = _dedup_records(records)
 
     col_counts: dict[str, int] = {}
     for r in records:

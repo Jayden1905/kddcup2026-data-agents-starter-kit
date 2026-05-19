@@ -333,6 +333,17 @@ class SemanticGroundingMixin:
         if validated["join_paths"]:
             grounding["join_paths"] = validated["join_paths"]
 
+        # Detect COUNT(DISTINCT) need: when a table has many rows per entity
+        if (
+            db_path
+            and db_path.exists()
+            and kg
+            and selected_tables
+            and grounding.get("computation_type", "").lower()
+            in ("count", "ratio", "percentage")
+        ):
+            self._inject_distinct_hint(grounding, db_path, selected_tables, kg)
+
         # Merge filter overrides for LIKE patterns
         if validated["filter_overrides"]:
             existing_overrides = grounding.get("filter_overrides", {})
@@ -356,6 +367,53 @@ class SemanticGroundingMixin:
             grounding = self._validate_known_values_against_db(db_path, grounding, validated)
 
         return grounding
+
+    def _inject_distinct_hint(
+        self,
+        grounding: dict[str, Any],
+        db_path: Path,
+        selected_tables: list[str],
+        kg: KnowledgeGraph,
+    ) -> None:
+        """When counting entities via a many-rows-per-entity table, inject COUNT(DISTINCT) guidance."""
+        tables_lower = {t.lower(): t for t in selected_tables}
+        conn = sqlite3.connect(str(db_path))
+        try:
+            for src_table, fk in kg.all_foreign_keys():
+                if src_table.lower() not in tables_lower:
+                    continue
+                if fk.ref_table.lower() not in tables_lower:
+                    continue
+                if fk.column.lower() != fk.ref_column.lower():
+                    continue
+                src_schema = kg.get_table(src_table)
+                if not src_schema or src_schema.row_count < 10:
+                    continue
+                try:
+                    distinct = conn.execute(
+                        f'SELECT COUNT(DISTINCT "{fk.column}") FROM "{src_table}"'
+                    ).fetchone()[0]
+                except Exception:
+                    continue
+                if distinct < 1:
+                    continue
+                rows_per_entity = src_schema.row_count / distinct
+                if rows_per_entity > 10:
+                    overrides = grounding.get("_semantic_overrides", [])
+                    hint = (
+                        f'ENTITY COUNTING: Table "{src_table}" has {src_schema.row_count} rows but only '
+                        f'{distinct} distinct "{fk.column}" values ({rows_per_entity:.0f} rows per entity). '
+                        f'If the question counts "{fk.ref_table}" entities (how many {fk.ref_table}s), '
+                        f'use COUNT(DISTINCT "{src_table}"."{fk.column}") — NOT COUNT(*). '
+                        f'But if it counts "{src_table}" rows themselves, use COUNT(*).'
+                    )
+                    if not any("COUNT(DISTINCT" in o for o in overrides):
+                        overrides.append(hint)
+                        grounding["_semantic_overrides"] = overrides
+                        self._log("distinct_hint", hint)
+                    return
+        finally:
+            conn.close()
 
     def _validate_known_values_against_db(
         self,
