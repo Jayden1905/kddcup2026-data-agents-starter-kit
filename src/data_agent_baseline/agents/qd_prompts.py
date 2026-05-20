@@ -64,15 +64,21 @@ def _build_sql_prompt(
     gaps: str = "",
     grounding_context: str = "",
 ) -> str:
-    parts = [f"QUESTION: {question}\n\nWrite a SQLite query to answer this question."]
+    parts = [f"QUESTION: {question}"]
+    parts.append("\nGOAL: Write ONE SQLite query whose result IS the final answer table.")
+    parts.append("The output columns and rows must directly answer the question — no extra columns, no intermediate values.")
 
     if grounding_context:
-        parts.append(f"\n{grounding_context}")
+        parts.append(f"\nPLAN:\n{grounding_context}")
+
+    # Include DB schema when grounding doesn't already embed it (prevents table name hallucination)
+    if kg_context and "TABLES:" not in grounding_context:
+        parts.append(f"\nDATABASE SCHEMA (use ONLY these table/column names):\n{kg_context}")
 
     if gaps:
         parts.append(f"\nPREVIOUS ATTEMPT FAILED:\n{gaps}\nFix the error.")
 
-    parts.append('\nEscape apostrophes with \'\'. Use double-quotes for identifiers. CAST(x AS REAL) for division.')
+    parts.append("\nSQL RULES: Escape apostrophes with ''. Use double-quotes for identifiers. CAST(x AS REAL) for division.")
     parts.append('\nReturn ONLY: {"sql": "SELECT ..."}')
 
     return "\n".join(parts)
@@ -103,69 +109,61 @@ DATABASE SCHEMA:
 {sample_section}
 {anchor_section}
 {previous_attempt}
-Decompose the question into a structured plan.
+GOAL: Produce a structured plan that maps the question to exact tables, columns, and operations.
+The final answer will be a CSV table. Think about what that table looks like: how many columns, what each column contains, and how many rows.
 
-FIRST, break down the question phrase by phrase:
-- For EACH noun/phrase the user asks for, identify which SPECIFIC table.column it maps to.
-- "type of X" → does a column literally named "type" exist? In which table? Is it a label on the entity or a GROUP BY dimension?
-- "total value" / "total cost" → SUM of which column?
-- "for event X" → filter condition on which table?
-- Distinguish lookup vs aggregation: "Identify the type" = SELECT type (lookup). "for each type" / "by type" = GROUP BY.
+STEP 1 — UNDERSTAND THE ANSWER SHAPE
+Imagine the final answer printed on paper:
+- A single number? → computation_type = count/sum/avg/min_max/ratio/percentage
+- A single name/value? → computation_type = simple_lookup
+- A list of items? → computation_type = count_distinct or simple_lookup (multiple rows)
+- A table with groups? → computation_type = sum/avg/count with GROUP BY
 
-Return ONLY a JSON object:
+STEP 2 — SEPARATE OUTPUT FROM FILTER
+Every question has:
+- OUTPUT: what the user wants to SEE (the columns in the answer)
+- FILTER: what narrows WHICH rows to look at (WHERE conditions)
+The filtered entity is NOT always the returned entity.
+
+STEP 3 — MAP PHRASES TO COLUMNS
+For each noun/phrase, find the SPECIFIC table.column. Use SAMPLE VALUES to verify — the column whose actual values match the question wins.
+
+Return ONLY JSON:
 {{
-  "what_user_wants": "restate EXACTLY what output the user expects — only columns explicitly mentioned",
-  "phrase_mapping": {{"quoted phrase from question": "table.column it maps to — with reasoning if ambiguous"}},
+  "what_user_wants": "restate EXACTLY what output the user expects",
+  "phrase_mapping": {{"quoted phrase": "table.column"}},
   "expected_output": {{"columns": "number", "description": "brief"}},
-  "computation_type": "one of: simple_lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | comparison | multi_step",
-  "formula": "computation LOGIC only — no literal filter values. e.g. 'event with lowest SUM(cost)', 'AVG(Consumption) / 12'. Filter values go in known_values, not here.",
+  "computation_type": "simple_lookup | count | count_distinct | sum | avg | ratio | percentage | min_max | comparison | multi_step",
+  "formula": "computation logic only (no filter values). e.g. 'AVG(Consumption) / 12'",
   "computation_steps": ["step1", "step2"],
-  "data_requirements": ["table.column — ALL columns relevant to question, joins, filters, aggregation"],
-  "data_format_notes": ["only note actual column types like REAL/TEXT/DATE — never suggest transformations"],
+  "data_requirements": ["table.column for ALL columns needed"],
+  "data_format_notes": ["only actual column types — never suggest transformations"],
   "reasoning": "brief HOW to get the answer",
   "domain_rules": ["constraints from DOMAIN KNOWLEDGE"],
   "known_values": {{"table.column": ["verified filter values"]}}
 }}
 
-RULES:
-- what_user_wants drives everything. Do NOT invent columns the question didn't ask for.
-- COLUMN SEMANTICS: When choosing between columns, check SAMPLE VALUES in the schema. The column whose actual data values match what the question asks for wins. Column hints are suggestions — sample values are ground truth.
-- NO ASSUMPTIONS: Do NOT add data_format_notes or domain_rules that assume conversion/transformation unless DOMAIN KNOWLEDGE explicitly states it. If a REFERENCE SQL is provided, follow its approach exactly (e.g. if it uses ORDER BY col ASC, do NOT add "must convert to seconds").
-- NO DATA MANIPULATION: Never transform, concatenate, split, or convert column values. Return data exactly as it exists in the database.
-- FORMULA AUTHORITY: If DOMAIN KNOWLEDGE defines a formula, copy it VERBATIM into "formula" field. Do NOT reason about whether any part is redundant — every operation is intentional.
-- USE CASE AUTHORITY: If DOMAIN KNOWLEDGE has a matching USE CASE or REFERENCE SQL, copy its logic EXACTLY.
-- EXACT LEVEL MATCHING: Named levels ("high=1", "medium=2") → use ONLY the level matching the question's exact wording. No combining unless "X or above".
-- For known_values: include TABLE name. Reason about what DB value(s) the question refers to — consider format differences and precision level. NEVER use the same literal value for multiple columns — each concept maps to exactly ONE column.
-- Check SAMPLE DATA to decide WHICH TABLE to filter (same column name may differ across tables).
-- join_paths will be computed automatically — just list ALL tables.columns needed in data_requirements.
-- For data_requirements: be INCLUSIVE — list every column that could help.
-- POPULATION vs METRIC: "In X, what is Y?" → X = WHERE filter, Y = what you compute on that set.
-- COMPUTATION TYPE RULES:
-  - "how many times X compared to Y" / "how many times more" = ratio (X/Y division)
-  - "what percentage" / "what proportion" = percentage (X * 100 / Y)
-  - "how many distinct/unique" = count_distinct
-  - "how many" (simple) = count
-  - "average/mean" = avg
-  - "total/sum" = sum
-  - "highest/lowest/best/worst" = min_max
-  - "how much faster/slower/more/less" = comparison (compute difference or ratio)
-- PER-UNIT EXPRESSIONS: "X per unit/per item/per piece" means X divided by quantity column (e.g., Price/Amount). Put the computed expression in filter_conditions as a formula: {{"column": "table.Price/table.Amount", "operator": ">", "value": "29"}}.
-- RATIO: "How many times X more than Y" = X/Y (division, not subtraction).
-- AGGREGATION GRAIN: AVG of entity attribute → query entity table with subquery filter. Don't join to detail tables (duplicates).
-- OUTPUT: "X and Y?" = TWO columns. Each requested value = one column.
-- GRAIN CONSISTENCY: All requested outputs must be at the same level of detail. If the question does NOT say "for each", "per", "by", or "breakdown", assume all outputs are at the SAME grain (no GROUP BY on any of them). Only GROUP BY when the question explicitly asks for a per-group result.
-- TEMPORAL: "last/most recent" = ORDER BY DESC LIMIT 1.
-- MONTHLY vs YEARLY: If DOMAIN KNOWLEDGE defines a formula with /12, ALWAYS include /12. Do NOT skip it based on data granularity.
-- HAVING: "where the average exceeds N" = GROUP BY + HAVING, not per-row WHERE. EXCEPTION: if DATA STORAGE NOTES say a column already stores a pre-row aggregate, use WHERE directly — do NOT wrap in AVG().
-- SUPERLATIVES: "lowest/highest" → rows = "all-matching". Use WHERE col = (SELECT MIN/MAX...). NEVER LIMIT 1.
-- SUBJECT vs CRITERION: The question's SUBJECT is what the user wants returned. The CRITERION (superlative, filter, condition) is how to find it. what_user_wants must describe the SUBJECT's identity, not the criterion value. expected_output must include the SUBJECT's identifier column.
-- CO-LOCATED MEASURES: Filter in detail table → use measure from SAME detail table, not parent summary.
-- COLUMN NAME PRIORITY: If a column name contains a multi-word phrase from the question, it wins over columns that only share a single word. Longest substring match wins.
-- VALUE-BASED DISAMBIGUATION: When multiple columns could map to one phrase, check their SAMPLE VALUES. The column whose values answer the question wins over the column whose name merely contains a keyword.
-- PARTIAL MATCH: "X-related" / "from X" with proper noun → LIKE '%X%'. Exact match only for "named X" / "is X".
-- SAME-NAME COLUMNS: When multiple tables have the SAME column name, read the question language to decide which table to SELECT from. "the patient's X" → Patient.X. "the exam's X" → Exam.X. The subject/possessive in the question is authoritative.
-- PHRASE MAPPING: "the type of X" / "identify the type" = SELECT the literal `type` column of the entity being asked about. This is a LOOKUP, not a GROUP BY. Only use GROUP BY if the question says "for each type" / "by type" / "per type" / "breakdown".
-- FULL SENTENCE PARSING: Map columns from the COMPLETE sentence structure, not partial phrases. Parse the full question as a whole before extracting column mappings.
+CRITICAL RULES (answer shape):
+- what_user_wants drives everything. Do NOT add columns the question didn't ask for.
+- "X and Y?" = TWO separate columns. Each requested value = one column.
+- Only GROUP BY when question says "for each"/"per"/"by"/"breakdown". Otherwise single grain.
+- "lowest/highest" = all matching rows (WHERE col = SELECT MIN/MAX...), not LIMIT 1.
+- SUBJECT vs CRITERION: return the SUBJECT (what is asked about), filter by the CRITERION.
+
+CRITICAL RULES (computation):
+- "how many" = count. "how many distinct" = count_distinct.
+- "average" = AVG. "total" = SUM. "what percentage" = X * 100 / Y.
+- "how many times more" = ratio (division, not subtraction).
+- AVG of entity attribute → query entity table with subquery. Don't join to detail tables.
+- If DOMAIN KNOWLEDGE defines a formula, copy it VERBATIM.
+
+CRITICAL RULES (column selection):
+- Check SAMPLE VALUES to choose between columns with similar names.
+- When multiple tables have the same column name, the possessive in the question decides: "patient's X" → Patient.X.
+- Longest column-name substring match wins.
+- "the type of X" = lookup (SELECT type). "for each type" = GROUP BY.
+- DOMAIN KNOWLEDGE overrides when it explicitly defines a term.
+- For known_values: use exact format from sample values. One concept → one column only.
 """.strip()
 
 def _trim_schema_by_relevance(kg_context: str, question: str, budget: int, anchor_text: str = "") -> str:

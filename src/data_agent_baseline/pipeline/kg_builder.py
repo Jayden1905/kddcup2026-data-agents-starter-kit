@@ -280,6 +280,136 @@ class KnowledgeGraph:
 
 
 # ---------------------------------------------------------------------------
+# KGQueryService: on-demand querying (replaces full dump approach)
+# ---------------------------------------------------------------------------
+
+
+class KGQueryService:
+    """On-demand KG querying: produces minimal, targeted schema strings.
+
+    Replaces format_kg_for_llm() dump with focused queries that return
+    only what a specific prompt needs.
+    """
+
+    def __init__(self, kg: KnowledgeGraph):
+        self.kg = kg
+        self._full_cache: str | None = None
+
+    def full_dump(self) -> str:
+        """Same as format_kg_for_llm. Use only as fallback."""
+        if self._full_cache is None:
+            self._full_cache = format_kg_for_llm(self.kg)
+        return self._full_cache
+
+    def table_overview(self) -> str:
+        """Lightweight: table names, roles, row counts, column names only."""
+        lines = []
+        for t in self.kg.tables:
+            role_tag = f" [{t.role}]" if t.role else ""
+            col_names = ", ".join(c.name for c in t.columns)
+            lines.append(f"{t.name}{role_tag} ({t.row_count} rows): {col_names}")
+        fks = self.kg.all_foreign_keys()[:10]
+        if fks:
+            lines.append("JOINS:")
+            for src, fk in fks:
+                lines.append(f"  {src}.{fk.column} -> {fk.ref_table}.{fk.ref_column}")
+        return "\n".join(lines)
+
+    def schema_for_tables(
+        self, table_names: list[str], include_samples: bool = True, max_sample: int = 5
+    ) -> str:
+        """Full detail for specific tables only."""
+        lines: list[str] = []
+        tnames_lower = {n.lower() for n in table_names}
+        for tname in table_names:
+            ts = self.kg.get_table(tname)
+            if not ts:
+                continue
+            pk_str = ", ".join(ts.primary_keys) if ts.primary_keys else "(none)"
+            lines.append(f"TABLE: {tname} ({ts.row_count} rows, PK: {pk_str})")
+            for col in ts.columns:
+                nullable = "" if col.is_nullable else " NOT NULL"
+                pk_mark = " [PK]" if col.is_pk else ""
+                stats_str = ""
+                if col.name in ts.col_stats:
+                    st = ts.col_stats[col.name]
+                    parts = []
+                    if "distinct" in st:
+                        parts.append(f"{st['distinct']} unique")
+                    if "min" in st and "max" in st:
+                        parts.append(f"range [{st['min']}..{st['max']}]")
+                    if parts:
+                        stats_str = f"  ({', '.join(parts)})"
+                sample = ""
+                if include_samples and col.name in ts.sample_values:
+                    vals = ts.sample_values[col.name][:max_sample]
+                    sample = f"  e.g. {vals}"
+                desc_str = f"  -- {col.description}" if col.description else ""
+                lines.append(
+                    f"  - {col.name} ({col.sql_type}{nullable}){pk_mark}{desc_str}{stats_str}{sample}"
+                )
+            for fk in ts.foreign_keys:
+                lines.append(f"  FK: {fk.column} -> {fk.ref_table}.{fk.ref_column}")
+            lines.append("")
+        # Inferred FKs between the selected tables
+        for src, fk in self.kg.inferred_fks:
+            if src.lower() in tnames_lower and fk.ref_table.lower() in tnames_lower:
+                lines.append(f"  INFERRED FK: {src}.{fk.column} -> {fk.ref_table}.{fk.ref_column}")
+        return "\n".join(lines)
+
+    def join_paths_between(self, table_names: list[str]) -> str:
+        """FK paths connecting the given tables."""
+        tnames_lower = {n.lower() for n in table_names}
+        lines: list[str] = []
+        all_fks = self.kg.all_foreign_keys()
+        for src, fk in all_fks:
+            if src.lower() in tnames_lower or fk.ref_table.lower() in tnames_lower:
+                lines.append(
+                    f"JOIN {fk.ref_table} ON {src}.{fk.column} = {fk.ref_table}.{fk.ref_column}"
+                )
+        return "\n".join(lines)
+
+    def focused_context(self, question: str, selected_tables: list[str] | None = None) -> str:
+        """Produces a focused schema string for a specific question.
+
+        If selected_tables is given, provides full detail for those tables
+        plus a lightweight overview of others. Otherwise falls back to table_overview.
+        """
+        if not selected_tables:
+            return self.table_overview()
+        parts = [self.schema_for_tables(selected_tables)]
+        # Add join paths
+        joins = self.join_paths_between(selected_tables)
+        if joins:
+            parts.append(f"\n=== JOIN PATHS ===\n{joins}")
+        # Add brief overview of other tables
+        other_tables = [t.name for t in self.kg.tables if t.name not in selected_tables]
+        if other_tables:
+            other_lines = []
+            for tname in other_tables:
+                ts = self.kg.get_table(tname)
+                if ts:
+                    col_names = ", ".join(c.name for c in ts.columns[:8])
+                    if len(ts.columns) > 8:
+                        col_names += f" ... (+{len(ts.columns)-8})"
+                    other_lines.append(f"  {tname} ({ts.row_count} rows): {col_names}")
+            if other_lines:
+                parts.append("\n=== OTHER TABLES ===\n" + "\n".join(other_lines))
+        return "\n".join(parts)
+
+    @staticmethod
+    def tables_from_sql(sql: str) -> list[str]:
+        """Extract table names from SQL FROM/JOIN clauses."""
+        import re
+        tables: list[str] = []
+        for match in re.finditer(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)', sql, re.IGNORECASE):
+            tname = match.group(1)
+            if tname.upper() not in ("SELECT", "WHERE", "ON", "AND", "OR", "NULL"):
+                tables.append(tname)
+        return list(dict.fromkeys(tables))
+
+
+# ---------------------------------------------------------------------------
 # Construction: build_kg_from_sqlite
 # ---------------------------------------------------------------------------
 

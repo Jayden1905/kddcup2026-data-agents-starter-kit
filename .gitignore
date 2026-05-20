@@ -39,3 +39,6 @@ configs/*
 .ipynb_checkpoints/
 *.tar.gz
 DOCKER.md
+
+graphify-out/
+

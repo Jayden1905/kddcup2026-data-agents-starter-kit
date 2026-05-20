@@ -450,10 +450,16 @@ class GroundingFormatMixin:
                 role = table_schema.role or "table"
                 row_count = table_schema.row_count or "?"
                 grain = f" | grain: {table_schema.grain_columns}" if table_schema.grain_columns else ""
-                cols = ", ".join(
-                    f'"{c.name}" ({c.sql_type})'
-                    for c in table_schema.columns
-                )
+                col_parts: list[str] = []
+                for c in table_schema.columns:
+                    col_desc = f'"{c.name}" ({c.sql_type})'
+                    # Annotate heavily-NULL columns so SQL LLM avoids them
+                    if hasattr(table_schema, 'col_stats') and c.name in table_schema.col_stats:
+                        nr = table_schema.col_stats[c.name].get("null_ratio", 0)
+                        if nr and nr >= 0.5:
+                            col_desc += f' [NULL {nr*100:.0f}%]'
+                    col_parts.append(col_desc)
+                cols = ", ".join(col_parts)
                 table_lines.append(f'  "{tname}" ({role}, {row_count} rows{grain}): [{cols}]')
             if table_lines:
                 parts.append("TABLES:\n" + "\n".join(table_lines))
@@ -595,6 +601,76 @@ class GroundingFormatMixin:
                             f"  SELECT {formula}"
                         )
 
+        # --- Cross-table ratio from COMPUTATION text ---
+        # When derived_logic describes counting/summing from two DIFFERENT tables and the
+        # independent ratio detection didn't fire (e.g. filter only on one table), detect from
+        # the text pattern and emit a mandatory subquery directive.
+        if not is_independent_ratio and comp_type in ("ratio", "percentage") and derived_logic and path.tables_in_path:
+            # Look for pattern: "count ... in 'tableA' ... count ... in 'tableB'"
+            count_refs = re.findall(
+                r"count[^']*'(\w+)'", derived_logic, re.IGNORECASE
+            )
+            if not count_refs:
+                # Also try unquoted: "count ... rows in the tableA table"
+                count_refs = re.findall(
+                    r"count[^a-z]*(?:the\s+)?(?:total\s+)?(?:number\s+of\s+)?rows\s+in\s+(?:the\s+)?['\"]?(\w+)['\"]?",
+                    derived_logic, re.IGNORECASE,
+                )
+            path_tables_lower = {t.lower() for t in path.tables_in_path}
+            matched_tables = [t for t in count_refs if t.lower() in path_tables_lower]
+            unique_tables = list(dict.fromkeys(matched_tables))
+            if len(unique_tables) >= 2:
+                # Build the subquery pattern from filter_nodes + column matching
+                tbl_a, tbl_b = unique_tables[0], unique_tables[1]
+                # Find the filter value (same entity filtered on both tables)
+                filter_val = ""
+                filter_col_a = ""
+                for n in (path.filter_nodes or []):
+                    if not n.column.startswith("_expr:") and n.operator == "=":
+                        filter_val = str(n.value)
+                        filter_col_a = f'"{n.table}"."{n.column}"'
+                        break
+                # Find matching column in the other table (same value or similar name)
+                filter_col_b = ""
+                if filter_val and db_path and db_path.exists():
+                    try:
+                        _rc = sqlite3.connect(str(db_path), timeout=5)
+                        other_tbl = tbl_b if path.filter_nodes and path.filter_nodes[0].table.lower() == tbl_a.lower() else tbl_a
+                        cols_info = _rc.execute(f'PRAGMA table_info("{other_tbl}")').fetchall()
+                        for ci in cols_info:
+                            if ci[2].upper() in ("INTEGER", "INT", "REAL", "NUMERIC"):
+                                try:
+                                    hit = _rc.execute(
+                                        f'SELECT 1 FROM "{other_tbl}" WHERE "{ci[1]}" = ? LIMIT 1',
+                                        (filter_val,)
+                                    ).fetchone()
+                                    if hit:
+                                        filter_col_b = f'"{other_tbl}"."{ci[1]}"'
+                                        break
+                                except Exception:
+                                    pass
+                        _rc.close()
+                    except Exception:
+                        pass
+                # Emit directive
+                if filter_col_b:
+                    parts.append(
+                        f"CROSS-TABLE RATIO (MANDATORY — do NOT use JOIN):\n"
+                        f"  The numerator and denominator count rows from DIFFERENT tables.\n"
+                        f"  Use two independent scalar subqueries:\n"
+                        f"  SELECT CAST((SELECT COUNT(*) FROM \"{tbl_a}\" WHERE {filter_col_a} = '{filter_val}') AS REAL)\n"
+                        f"       / (SELECT COUNT(*) FROM \"{tbl_b}\" WHERE {filter_col_b} = '{filter_val}')"
+                    )
+                    is_independent_ratio = True
+                elif filter_val:
+                    parts.append(
+                        f"CROSS-TABLE RATIO (MANDATORY — do NOT use JOIN):\n"
+                        f"  The numerator and denominator count rows from DIFFERENT tables ({tbl_a}, {tbl_b}).\n"
+                        f"  Use two independent scalar subqueries — one COUNT(*) per table with the entity filter.\n"
+                        f"  Do NOT JOIN the tables — a JOIN produces WRONG counts due to row multiplication."
+                    )
+                    is_independent_ratio = True
+
         # --- Subquery filter makes JOIN redundant detection ---
         # When ALL output columns are from one table and a filter uses IN (SELECT ... FROM other_table),
         # the JOIN to that other table is redundant and harmful for AVG/SUM (duplicates rows).
@@ -733,6 +809,55 @@ class GroundingFormatMixin:
                     f"STRUCTURE: All output columns are from \"{entity_table}\". "
                     f"The subquery filter already covers the other table — no JOIN needed."
                 )
+
+        # --- Bridge table "both-endpoints" detection ---
+        # When a bridge/edge table has 2 FK columns to the same entity table and the filter
+        # uses IN([val1, val2]), it likely means BOTH endpoints must satisfy the condition
+        # (e.g. "bonds with phosphorus AND nitrogen" = one atom is P, other is N).
+        if path.filter_nodes and path.edges and kg and kg.graph:
+            # Find bridge tables: tables with 2+ FK columns pointing to same entity table
+            for fnode in path.filter_nodes:
+                if fnode.column.startswith("_expr:"):
+                    continue
+                if fnode.operator.upper() != "IN" or not isinstance(fnode.value, list):
+                    continue
+                if len(fnode.value) != 2:
+                    continue
+                # fnode is on entity table (e.g. atom.element IN [p, n])
+                # Find bridge tables that have 2 FK columns to this entity table
+                entity_table = fnode.table
+                entity_pk = ""
+                ts = kg.get_table(entity_table)
+                if ts and ts.columns:
+                    entity_pk = ts.columns[0].name
+                bridge_fks: dict[str, list[str]] = {}  # bridge_table → [fk_col1, fk_col2]
+                for edge in kg.graph.fk_edges:
+                    src_col = kg.graph.columns.get(edge.src)
+                    dst_col = kg.graph.columns.get(edge.dst)
+                    if not src_col or not dst_col:
+                        continue
+                    # FK from bridge to entity
+                    if dst_col.table_id == entity_table and src_col.table_id != entity_table:
+                        bridge_fks.setdefault(src_col.table_id, []).append(src_col.name)
+                    elif src_col.table_id == entity_table and dst_col.table_id != entity_table:
+                        bridge_fks.setdefault(dst_col.table_id, []).append(dst_col.name)
+                # Find bridge tables with exactly 2 FK columns to the entity
+                for bridge_table, fk_cols in bridge_fks.items():
+                    if len(fk_cols) >= 2:
+                        val_a, val_b = fnode.value[0], fnode.value[1]
+                        fk_a, fk_b = fk_cols[0], fk_cols[1]
+                        parts.append(
+                            f'BOTH-ENDPOINTS FILTER (MANDATORY):\n'
+                            f'  The question asks for {bridge_table} where BOTH connected '
+                            f'{entity_table} entities match different values.\n'
+                            f'  JOIN "{entity_table}" TWICE — once per FK column:\n'
+                            f'    JOIN "{entity_table}" a1 ON "{bridge_table}"."{fk_a}" = a1."{entity_pk}"\n'
+                            f'    JOIN "{entity_table}" a2 ON "{bridge_table}"."{fk_b}" = a2."{entity_pk}"\n'
+                            f'  Then use AND (not OR):\n'
+                            f'    WHERE (a1."{fnode.column}" = \'{val_a}\' AND a2."{fnode.column}" = \'{val_b}\')\n'
+                            f'       OR (a1."{fnode.column}" = \'{val_b}\' AND a2."{fnode.column}" = \'{val_a}\')'
+                        )
+                        break
 
         # Filter values (for independent ratios, already embedded in the formula)
         # For percentage/ratio: detect single-table or multi-table (FK-connected) patterns

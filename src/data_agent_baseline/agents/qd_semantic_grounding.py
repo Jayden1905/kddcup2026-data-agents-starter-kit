@@ -505,7 +505,19 @@ class SemanticGroundingMixin:
                             self._log("filter_corrected", f"{col_key}: '{val}' → LIKE '%{val_str}%'")
                             continue
 
-                        # Value not found at all — keep it but note
+                        # Value not found — check if any distinct value is a prefix/abbreviation
+                        # of the queried concept (e.g. element "iodine" → stored as "i")
+                        prefix_match = conn.execute(
+                            f'SELECT DISTINCT "{col_name}" FROM "{table_name}" '
+                            f'WHERE "{col_name}" IS NOT NULL AND ? LIKE "{col_name}" || \'%\' '
+                            f'COLLATE NOCASE LIMIT 5',
+                            (val_str,)
+                        ).fetchall()
+                        if prefix_match and len(prefix_match) == 1:
+                            corrected_values.append(str(prefix_match[0][0]))
+                            self._log("filter_verified", f"{col_key}='{val}' → prefix-matched to '{prefix_match[0][0]}'")
+                            continue
+                        # Keep original but note
                         corrected_values.append(val)
                         self._log("filter_verified", f"{col_key}='{val}' NOT found in DB")
                     except Exception:

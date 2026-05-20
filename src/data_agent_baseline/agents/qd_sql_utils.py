@@ -258,6 +258,37 @@ def _apply_null_guard(sql: str) -> str:
     return guarded
 
 
+def _strip_agg_null_filter(sql: str) -> str:
+    """Remove IS NOT NULL filters on columns that are AVG/SUM targets.
+
+    AVG and SUM already skip NULLs. Adding IS NOT NULL on a target column
+    restricts the population for OTHER columns in the same query (wrong).
+    E.g. SELECT AVG(UpVotes), AVG(Age) ... WHERE Age IS NOT NULL
+    incorrectly excludes users without age from the UpVotes average.
+    """
+    upper = sql.upper()
+    if "AVG(" not in upper and "SUM(" not in upper:
+        return sql
+    # Find columns used in AVG()/SUM()
+    agg_cols: set[str] = set()
+    for m in re.finditer(r'(?:AVG|SUM)\s*\(\s*(?:\w+\.)?"?(\w+)"?\s*\)', sql, re.IGNORECASE):
+        agg_cols.add(m.group(1).lower())
+    if not agg_cols:
+        return sql
+    # Remove "AND col IS NOT NULL" for those columns (only when there are multiple agg targets)
+    # Multiple targets = population restriction on one affects the others
+    if len(agg_cols) < 2:
+        return sql
+    result = sql
+    for col in agg_cols:
+        # Match: AND [alias.]"col" IS NOT NULL (with optional table alias/quotes)
+        result = re.sub(
+            rf'\s+AND\s+(?:\w+\.)?"?{col}"?\s+IS\s+NOT\s+NULL\b',
+            '', result, flags=re.IGNORECASE,
+        )
+    return result
+
+
 def _inject_null_check(sql: str, col: str, insert_before: int) -> str:
     """Inject IS NOT NULL AND != '' for col before the given position."""
     if re.search(rf'{re.escape(col)}\s+IS\s+NOT\s+NULL', sql, re.IGNORECASE):

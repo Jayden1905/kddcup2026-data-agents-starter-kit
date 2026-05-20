@@ -406,6 +406,144 @@ RULES: Only reject for CLEAR semantic errors. Do NOT reject for using a differen
                                 f"likely JOIN duplication."
                             )
 
+        # Check 3: min/max computation returning suspiciously many tied results
+        if comp_type == "min_max" and len(rows) > 10:
+            # A superlative question ("lowest/highest") should usually return 1-5 results.
+            # If we get >10 rows tied at the min/max, the column is probably wrong
+            # (e.g., many rows have 0 for a budget column that isn't the right metric).
+            if output_nodes and kg:
+                main_node = output_nodes[0]
+                ts = kg.get_table(main_node.table)
+                if ts and ts.row_count > 0 and len(rows) > ts.row_count * 0.3:
+                    return (
+                        f"min_max query returned {len(rows)} rows ({len(rows)}/{ts.row_count} "
+                        f"= {len(rows)/ts.row_count:.0%} of table) — too many ties. "
+                        f"The metric column is likely wrong. Look for a more specific "
+                        f"cost/amount/value column in a related table."
+                    )
+
+        return ""
+
+    def _detect_vacuous_filter(
+        self, sql: str, data_result: dict[str, Any],
+        db_path: Path | None, kg: KnowledgeGraph | None,
+        grounding_context: str,
+    ) -> str:
+        """Detect filters that don't actually constrain results.
+
+        Returns anomaly description if a filter is vacuous, empty string otherwise.
+        Two checks:
+        1. A numeric comparison that is always satisfied for the entity being queried
+           (e.g. number=0, filter is number < 20 — always true).
+        2. Result count equals total table rows (filter didn't reduce the result set).
+        """
+        if not db_path or not kg or not data_result:
+            return ""
+        rows = data_result.get("rows", [])
+        if not rows:
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+
+            # Extract WHERE conditions from SQL
+            where_match = re.search(r'\bWHERE\b(.+?)(?:\bGROUP\b|\bORDER\b|\bLIMIT\b|\bHAVING\b|$)',
+                                    sql, re.IGNORECASE | re.DOTALL)
+            if not where_match:
+                return ""
+            where_clause = where_match.group(1)
+
+            # Find numeric comparisons: column < N, column > N, column <= N, column >= N
+            num_conds = re.findall(
+                r'(\w+)\.(\w+)\s*([<>]=?)\s*(\d+(?:\.\d+)?)',
+                where_clause, re.IGNORECASE,
+            )
+            # Resolve table aliases from SQL
+            alias_map: dict[str, str] = {}
+            for m in re.finditer(
+                r'\b(?:FROM|JOIN)\s+"?(\w+)"?\s+(?:AS\s+)?(\w+)\b',
+                sql, re.IGNORECASE,
+            ):
+                alias_map[m.group(2).lower()] = m.group(1)
+
+            for alias_or_tbl, col, op, val_str in num_conds:
+                tbl = alias_map.get(alias_or_tbl.lower(), alias_or_tbl)
+                threshold = float(val_str)
+
+                # Check if this filter is an entity-level attribute (not per-row varying)
+                # by testing: does the entity have only one distinct value for this column?
+                # Find what the entity filter is (e.g. WHERE name = 'X' AND col < 20)
+                entity_filters = re.findall(
+                    r"(\w+)\.(\w+)\s*=\s*'([^']+)'",
+                    where_clause, re.IGNORECASE,
+                )
+                if not entity_filters:
+                    continue
+
+                # Build a query to check the actual value of the filtered column for this entity
+                for e_alias, e_col, e_val in entity_filters:
+                    e_tbl = alias_map.get(e_alias.lower(), e_alias)
+                    if e_tbl.lower() == tbl.lower():
+                        # Same table — check if the value is always satisfying the condition
+                        try:
+                            check_sql = (
+                                f'SELECT DISTINCT "{col}" FROM "{tbl}" '
+                                f'WHERE "{e_col}" = ? COLLATE NOCASE'
+                            )
+                            distinct_vals = conn.execute(check_sql, (e_val,)).fetchall()
+                            if len(distinct_vals) == 1 and distinct_vals[0][0] is not None:
+                                actual = float(distinct_vals[0][0])
+                                satisfied = (
+                                    (op == "<" and actual < threshold)
+                                    or (op == "<=" and actual <= threshold)
+                                    or (op == ">" and actual > threshold)
+                                    or (op == ">=" and actual >= threshold)
+                                )
+                                if satisfied:
+                                    return (
+                                        f"Filter {tbl}.{col} {op} {val_str} is vacuous — "
+                                        f"entity '{e_val}' always has {col}={actual}, which always "
+                                        f"satisfies the condition. The question likely refers to a "
+                                        f"different column. Check if a related table has a numeric "
+                                        f"column that actually varies per row."
+                                    )
+                        except (sqlite3.Error, ValueError, TypeError):
+                            continue
+
+            # Check 2: Result returns nearly all rows from the main output table
+            # (indicates the filter didn't actually constrain anything)
+            from_match = re.search(r'\bFROM\s+"?(\w+)"?', sql, re.IGNORECASE)
+            if from_match and len(rows) > 3:
+                main_table = from_match.group(1)
+                ts = kg.get_table(main_table)
+                if not ts:
+                    for t in kg.tables:
+                        if t.name.lower() == main_table.lower():
+                            ts = t
+                            break
+                if ts and ts.row_count > 0:
+                    # If result count is >= 80% of table rows and question has filtering language
+                    ratio = len(rows) / ts.row_count
+                    if ratio >= 0.8 and "DISTINCT" in sql.upper():
+                        # Check if the grounding expected fewer rows
+                        has_filter_hint = bool(re.search(
+                            r'(?:less than|greater than|more than|fewer than|under|over|below|above|between)',
+                            grounding_context.lower() if grounding_context else "",
+                        ))
+                        if has_filter_hint:
+                            return (
+                                f"Result has {len(rows)} rows out of {ts.row_count} total in "
+                                f"'{main_table}' ({ratio:.0%}) — the filter appears ineffective. "
+                                f"Check whether the filtering column is correct."
+                            )
+
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn:
+                conn.close()
+
         return ""
 
     def _log(self, action: str, detail: str) -> None:

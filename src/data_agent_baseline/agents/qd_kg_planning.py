@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from data_agent_baseline.agents.model import ModelMessage
-from data_agent_baseline.pipeline.kg_builder import KnowledgeGraph
+from data_agent_baseline.pipeline.kg_builder import KGQueryService, KnowledgeGraph
 from data_agent_baseline.pipeline.kg_path_planner import (
     QueryNode,
     QueryPath,
@@ -32,6 +32,7 @@ class KGPlanningMixin:
         knowledge_text: str,
         db_path: Path | None = None,
         kg: KnowledgeGraph | None = None,
+        kg_query: KGQueryService | None = None,
     ) -> str:
         """LLM picks nodes from property graph → validate → format as grounding for SQL LLM."""
         if not db_path or not kg:
@@ -39,7 +40,9 @@ class KGPlanningMixin:
 
         # --- Step 1: User intent (primary) + domain anchors (supporting context) ---
         anchor_text = self._extract_domain_anchors(question, knowledge_text, db_path=db_path)
-        user_intent = self._detect_user_intent_only(question, kg_context=kg_context, anchor_text=anchor_text)
+        # Use lightweight table overview for intent detection (only needs table/column awareness)
+        intent_schema = kg_query.table_overview() if kg_query else kg_context
+        user_intent = self._detect_user_intent_only(question, kg_context=intent_schema, anchor_text=anchor_text)
 
         # Deterministic answer_shape correction based on question keywords
         _q_lower = question.lower()
@@ -101,8 +104,14 @@ class KGPlanningMixin:
         picked = self._pick_graph_nodes(question, kg, anchor_text, user_intent)
         self._log("pick_nodes_time", f"{time.monotonic() - _t_pick:.1f}s")
         if not picked:
-            self._log("kg_path", "Node picking failed, falling back")
-            return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+            # LLM pick failed — try deterministic graph query before full fallback
+            det_picked = self._deterministic_kg_query(question, kg, user_intent, db_path=db_path)
+            if det_picked:
+                self._log("kg_det_pick", json.dumps(det_picked, default=str))
+                picked = det_picked
+            else:
+                self._log("kg_path", "Node picking failed, falling back")
+                return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
 
         if _det_comp_type:
             picked["computation_type"] = _det_comp_type
@@ -110,12 +119,42 @@ class KGPlanningMixin:
         self._log("kg_picked", json.dumps(picked, default=str))
 
         # Validate picks against actual schema
-        output_nodes, filter_nodes, errors = self._validate_picked_nodes(picked, kg, db_path)
+        output_nodes, filter_nodes, errors = self._validate_picked_nodes(picked, kg, db_path, question)
         if errors:
             self._log("kg_validation_errors", "; ".join(errors))
         if not output_nodes:
-            self._log("kg_path", "No valid output nodes after validation, falling back")
-            return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
+            # For aggregate operations (count/avg/sum), we can infer the output from the
+            # computation type + filter tables — no need to fall back entirely.
+            _comp_type = picked.get("computation_type", "")
+            if _comp_type in ("count", "avg", "sum", "count_distinct") and filter_nodes:
+                # Find a table connected to the filter table to count/aggregate
+                filter_table = filter_nodes[0].table
+                # Look for tables that have FK to filter_table (the "many" side)
+                if kg and kg.graph:
+                    for edge in kg.graph.fk_edges:
+                        src_col = kg.graph.columns.get(edge.src)
+                        dst_col = kg.graph.columns.get(edge.dst)
+                        if src_col and dst_col:
+                            if dst_col.table_id == filter_table and src_col.table_id != filter_table:
+                                # src table references filter table — use src's PK as count target
+                                many_table = src_col.table_id
+                                ts = kg.get_table(many_table)
+                                if ts and ts.columns:
+                                    output_nodes.append(QueryNode(
+                                        table=many_table, column=ts.columns[0].name, role="output",
+                                    ))
+                                    break
+                            elif src_col.table_id == filter_table and dst_col.table_id != filter_table:
+                                many_table = dst_col.table_id
+                                ts = kg.get_table(many_table)
+                                if ts and ts.columns:
+                                    output_nodes.append(QueryNode(
+                                        table=many_table, column=ts.columns[0].name, role="output",
+                                    ))
+                                    break
+            if not output_nodes:
+                self._log("kg_path", "No valid output nodes after validation, falling back")
+                return self._call_semantic_grounding(question, kg_context, sample_data, knowledge_text, db_path, kg)
 
         # Remove spurious filters where value matches a table name that the filter is ON
         # (entity self-reference: "members" interpreted as position='Member' on the member table)
@@ -190,6 +229,31 @@ class KGPlanningMixin:
                         if pn_suffix in _resolved_suffixes:
                             _resolved_output.append(pn)
                             _resolved_ids.add(pn_id)
+                # Apply NULL-column FK replacement to resolved output too
+                if db_path and db_path.exists() and kg:
+                    _null_replacements: dict[int, QueryNode] = {}
+                    try:
+                        _nc = sqlite3.connect(str(db_path), timeout=5)
+                        for _ri, _rn in enumerate(_resolved_output):
+                            _total = _nc.execute(f'SELECT COUNT(*) FROM "{_rn.table}"').fetchone()[0]
+                            if not _total:
+                                continue
+                            _nulls = _nc.execute(
+                                f'SELECT COUNT(*) FROM "{_rn.table}" WHERE "{_rn.column}" IS NULL'
+                            ).fetchone()[0]
+                            if _nulls / _total < 0.9:
+                                continue
+                            # Check if the validated output has a replacement for this column
+                            for _vn in output_nodes:
+                                if _vn.table.lower() != _rn.table.lower() or _vn.column.lower() != _rn.column.lower():
+                                    _null_replacements[_ri] = _vn
+                                    break
+                        _nc.close()
+                    except Exception:
+                        pass
+                    for _ri, _repl in _null_replacements.items():
+                        _resolved_output[_ri] = _repl
+
                 output_nodes = _resolved_output
                 _cols_overridden = True
 
@@ -197,7 +261,7 @@ class KGPlanningMixin:
         filter_col_ids = {f"{n.table}.{n.column}".lower() for n in filter_nodes if not n.column.startswith("_expr:")}
         output_nodes = [n for n in output_nodes if f"{n.table}.{n.column}".lower() not in filter_col_ids]
         if not output_nodes:
-            output_nodes, _, _ = self._validate_picked_nodes(picked, kg, db_path)
+            output_nodes, _, _ = self._validate_picked_nodes(picked, kg, db_path, question)
 
         # Disambiguate output: prefer entity-of-interest table (only when single entity)
         _entity_pref_match = re.search(r'Entity of interest:\s*(.+?)(?:\s*\(|$)', user_intent) if user_intent else None
@@ -548,7 +612,19 @@ class KGPlanningMixin:
             user_intent, filter_nodes, order_nodes, output_nodes, picked, kg, db_path,
         )
 
+        # For superlative questions (rank/min_max), the ORDER BY column is the criterion,
+        # not an output. Remove it from output_nodes to avoid extra columns in the answer.
+        _intent_op = ""
+        if user_intent:
+            _op_match = re.search(r'Operation:\s*(\w+)', user_intent)
+            if _op_match:
+                _intent_op = _op_match.group(1).lower()
         _comp_type_for_resolve = picked.get("computation_type", "simple_lookup")
+        if _intent_op in ("rank", "min_max") and order_nodes and len(output_nodes) > 1:
+            order_cols = {(n.table.lower(), n.column.lower()) for n in order_nodes}
+            _trimmed = [n for n in output_nodes if (n.table.lower(), n.column.lower()) not in order_cols]
+            if _trimmed:
+                output_nodes = _trimmed
         if _comp_type_for_resolve not in ("avg", "count", "count_distinct", "sum", "ratio", "percentage"):
             output_nodes = self._resolve_fk_output_columns(output_nodes, kg, db_path)
 
@@ -714,18 +790,31 @@ class KGPlanningMixin:
 
         # Fix comp_type vs answer shape conflict: "count" + "list" shape means
         # "produce a grouped list", not "aggregate into one number"
+        # Exception: if filters target a single entity (= on ID column), keep the aggregation
         _shape_match = re.search(r'Answer shape:\s*(\w+)', user_intent or "")
         _grain_match = re.search(r'Grain:\s*(.+)', user_intent or "")
         if _shape_match and _shape_match.group(1).lower() == "list":
             _ct = picked.get("computation_type", "")
             if _ct in ("count", "sum", "avg"):
-                picked["computation_type"] = "grouped_list"
+                _has_single_entity_filter = False
+                for fc in picked.get("filter_conditions", []):
+                    col_name = fc.get("column", "").lower()
+                    if fc.get("operator") == "=" and ("_id" in col_name or col_name.endswith("id")):
+                        _has_single_entity_filter = True
+                        break
+                if not _has_single_entity_filter:
+                    picked["computation_type"] = "grouped_list"
 
         grounding = self._format_kg_plan_as_grounding(path, None, picked, "", kg=kg, db_path=db_path, user_intent=user_intent)
 
         # Inject rules engine directives into grounding
+        # Suppress RATIO PATTERN when grounding already has an independent/cross-table ratio directive
         if engine_out.sql_directives:
-            grounding += "\n" + "\n".join(engine_out.sql_directives)
+            directives = engine_out.sql_directives
+            if "CROSS-TABLE RATIO" in grounding or "INDEPENDENT RATIO" in grounding:
+                directives = [d for d in directives if "RATIO PATTERN" not in d]
+            if directives:
+                grounding += "\n" + "\n".join(directives)
 
         # --- Step 5b: Positional (Nth) with PREFIX_N ID pattern → numeric ordering ---
         ordinal_match = re.search(
@@ -802,6 +891,181 @@ class KGPlanningMixin:
 
         self._log("kg_grounding", grounding)
         return grounding
+
+    def _deterministic_kg_query(
+        self,
+        question: str,
+        kg: KnowledgeGraph,
+        user_intent: str,
+        db_path: Path | None = None,
+    ) -> dict[str, Any] | None:
+        """Deterministic graph traversal: question phrases → DB probe → FK paths → pick.
+
+        Generates all n-grams from the question, probes the actual DB for exact matches,
+        then uses FK edges to verify connectivity. No stopwords, no LLM — the DB is the filter.
+
+        Returns a picked dict (same format as LLM pick) when confident, else None.
+        """
+        g = kg.graph
+        if not g or not db_path or not db_path.exists():
+            return None
+
+        q_lower = question.lower()
+
+        # --- 1. Generate all n-grams from question ---
+        tokens = [w.strip("?.,!\"'()") for w in question.split()]
+        tokens_clean = [t for t in tokens if t and len(t) > 1]
+
+        # --- 2. Probe DB for exact value matches (longest first) ---
+        filters: list[dict[str, str]] = []
+        filter_tables: set[str] = set()
+        matched_spans: set[int] = set()
+
+        # Collect TEXT columns to probe (skip IDs and numeric-only columns)
+        text_cols: list[tuple[str, str]] = []  # (table, column)
+        for table in kg.tables:
+            for col in table.columns:
+                cn = col.name.lower()
+                if cn == "id" or cn.endswith("_id"):
+                    continue
+                if col.sql_type.upper() in ("TEXT", "VARCHAR", "CHAR", "NVARCHAR", ""):
+                    text_cols.append((table.name, col.name))
+
+        if not text_cols:
+            return None
+
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            for width in range(min(5, len(tokens_clean)), 0, -1):
+                for i in range(len(tokens_clean) - width + 1):
+                    span = set(range(i, i + width))
+                    if span & matched_spans:
+                        continue
+                    phrase = " ".join(tokens_clean[i:i + width])
+                    if len(phrase) < 3:
+                        continue
+
+                    # Probe each text column for this exact phrase
+                    for tbl, col in text_cols:
+                        try:
+                            row = conn.execute(
+                                f'SELECT "{col}" FROM "{tbl}" WHERE "{col}" = ? COLLATE NOCASE LIMIT 1',
+                                (phrase,),
+                            ).fetchone()
+                        except Exception:
+                            continue
+                        if row:
+                            actual_value = row[0]
+                            filters.append({"column": f"{tbl}.{col}", "operator": "=", "value": actual_value})
+                            filter_tables.add(tbl)
+                            matched_spans |= span
+                            break  # first table match wins for this phrase
+            conn.close()
+        except Exception:
+            return None
+
+        if not filters:
+            return None
+
+        # --- 3. Identify output table ---
+        output_table = None
+        for tname in (t.name for t in kg.tables):
+            tname_lower = tname.lower()
+            if (tname_lower in q_lower
+                    or tname_lower + "s" in q_lower
+                    or tname_lower + "es" in q_lower
+                    or (tname_lower.endswith("s") and tname_lower[:-1] in q_lower)):
+                if tname not in filter_tables:
+                    output_table = tname
+                    break
+                elif output_table is None:
+                    output_table = tname
+
+        if not output_table:
+            non_filter = [t for t in kg.tables if t.name not in filter_tables]
+            if non_filter:
+                output_table = max(non_filter, key=lambda t: t.row_count or 0).name
+            elif kg.tables:
+                output_table = max(kg.tables, key=lambda t: t.row_count or 0).name
+
+        if not output_table:
+            return None
+
+        # --- 4. Determine output column from computation type ---
+        output_schema = kg.get_table(output_table)
+        if not output_schema:
+            return None
+
+        comp_type = "count"
+        if user_intent:
+            for line in user_intent.split("\n"):
+                if "Operation:" in line:
+                    op = line.split("Operation:")[1].strip().lower()
+                    if op in ("count", "sum", "avg", "min_max", "ratio", "percentage", "count_distinct"):
+                        comp_type = op
+                    break
+
+        select_columns: list[str] = []
+        if comp_type in ("count", "count_distinct"):
+            pk_col = next(
+                (c.name for c in output_schema.columns if c.is_pk or c.name.lower() == "id"),
+                output_schema.columns[0].name if output_schema.columns else None,
+            )
+            if pk_col:
+                select_columns.append(f"{output_table}.{pk_col}")
+        elif comp_type in ("sum", "avg"):
+            for c in output_schema.columns:
+                if c.sql_type.upper() in ("INTEGER", "REAL", "FLOAT", "NUMERIC", "DECIMAL"):
+                    if not c.name.lower().endswith("_id") and c.name.lower() != "id":
+                        select_columns.append(f"{output_table}.{c.name}")
+                        break
+        else:
+            for c in output_schema.columns:
+                cn = c.name.lower()
+                if any(w in cn for w in ("name", "title", "label", "description")):
+                    select_columns.append(f"{output_table}.{c.name}")
+                    break
+            if not select_columns and output_schema.columns:
+                for c in output_schema.columns:
+                    if c.name.lower() != "id" and not c.name.lower().endswith("_id"):
+                        select_columns.append(f"{output_table}.{c.name}")
+                        break
+
+        if not select_columns:
+            return None
+
+        # --- 5. Verify FK connectivity ---
+        reachable: set[str] = {output_table}
+        frontier = [output_table]
+        for _ in range(5):
+            next_frontier = []
+            for tbl in frontier:
+                for edge in g.fk_edges:
+                    src_col = g.columns.get(edge.src)
+                    dst_col = g.columns.get(edge.dst)
+                    if not src_col or not dst_col:
+                        continue
+                    if src_col.table_id == tbl and dst_col.table_id not in reachable:
+                        reachable.add(dst_col.table_id)
+                        next_frontier.append(dst_col.table_id)
+                    elif dst_col.table_id == tbl and src_col.table_id not in reachable:
+                        reachable.add(src_col.table_id)
+                        next_frontier.append(src_col.table_id)
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        if not filter_tables.issubset(reachable):
+            return None
+
+        # --- 6. Build result ---
+        return {
+            "what_user_wants": f"{comp_type} from {output_table} filtered by {', '.join(f['column'] + '=' + f['value'] for f in filters)}",
+            "select_columns": select_columns,
+            "filter_conditions": filters,
+            "order_by": None,
+            "computation_type": comp_type,
+        }
 
     def _pick_graph_nodes(
         self,
@@ -1011,20 +1275,19 @@ SELECTED TABLES (detailed schema):
 {graph_detail[:5000]}
 {concept_section}{ontology_section}{value_section}
 
-YOUR TASK: Pick exact columns to answer the question.
+GOAL: Pick the exact columns that produce the final answer.
+Think: "What does the answer table look like?" The select_columns are what appears IN the answer. The filter_conditions narrow which rows.
 
 RULES:
-- select_columns: columns whose values appear in the final answer.
-- filter_conditions: constraints that narrow rows (WHERE clause).
-- If a qualifier word in the question (e.g., "approved") matches a column name, add it as a filter AND select the metric from that same table.
-- DOMAIN KNOWLEDGE overrides USER INTENT when they conflict. If domain knowledge defines a term (e.g., "type"), use that column — even if the intent interpreted it differently.
-- Validate the intent against the schema: if the intent references a concept (e.g., "expense category") but that column doesn't exist in the referenced table, re-read the QUESTION and DOMAIN KNOWLEDGE to find the correct column.
-- FK columns (marked →): JOIN to the referenced table, select human-readable columns there.
-- For filter values, use EXACT format from "values:" lists or DOMAIN KNOWLEDGE.
+- select_columns = columns whose VALUES appear in the final answer CSV.
+- filter_conditions = WHERE clause constraints (these do NOT appear in output).
+- Use EXACT values from "values:" lists or DOMAIN KNOWLEDGE for filters.
+- FK columns (marked →): JOIN to referenced table for human-readable names.
+- DOMAIN KNOWLEDGE overrides intent when they conflict on column meaning.
 
 Return ONLY JSON:
 {{
-  "what_user_wants": "one sentence restating the expected output",
+  "what_user_wants": "one sentence: what the answer table contains",
   "select_columns": ["Table.Column", ...],
   "filter_conditions": [
     {{"column": "Table.Column", "operator": "= | > | < | >= | <= | LIKE | !=", "value": "..."}}
@@ -1049,6 +1312,7 @@ Return ONLY JSON:
         picked: dict[str, Any],
         kg: KnowledgeGraph,
         db_path: Path | None,
+        question: str = "",
     ) -> tuple[list[QueryNode], list[QueryNode], list[str]]:
         """Validate LLM's picks against the actual graph. Returns (output_nodes, filter_nodes, errors)."""
         errors: list[str] = []
@@ -1060,6 +1324,12 @@ Return ONLY JSON:
         # Validate select_columns
         for col_ref in picked.get("select_columns", []):
             if "." not in col_ref:
+                # Handle bare aggregate expressions like "AVG(bond_count)", "COUNT(*)"
+                agg_bare = re.match(r'(COUNT|SUM|AVG|MIN|MAX)\(([^)]*)\)', col_ref, re.IGNORECASE)
+                if agg_bare:
+                    # This is a computed expression — not an error, just skip as output node.
+                    # The computation_type + filter_nodes provide enough info for SQL generation.
+                    continue
                 errors.append(f"Invalid column ref (no dot): {col_ref}")
                 continue
             table, col = col_ref.split(".", 1)
@@ -1091,6 +1361,139 @@ Return ONLY JSON:
                                 errors.append(f"Column not in graph: {col_ref}")
                     else:
                         errors.append(f"Column not in graph: {col_ref}")
+
+        # Fix 1: Detect SUM/AVG on non-numeric columns — these should be filters, not metrics.
+        # E.g. "total approved expenses" → SUM(expense.cost) WHERE approved='true', NOT SUM(approved)
+        # Only check when there's exactly one output node (the aggregation target).
+        # With multiple nodes, one is likely a GROUP BY column (non-numeric is expected).
+        _comp = picked.get("computation_type", "")
+        if _comp in ("sum", "avg") and len(output_nodes) == 1 and db_path and db_path.exists():
+            _nodes_to_demote: list[int] = []
+            try:
+                _tc_conn = sqlite3.connect(str(db_path), timeout=5)
+                for idx, node in enumerate(output_nodes):
+                    # Try casting a sample to REAL — if all fail, the column isn't numeric
+                    try:
+                        numeric_check = _tc_conn.execute(
+                            f'SELECT COUNT(*), SUM(CASE WHEN TYPEOF(CAST("{node.column}" AS REAL)) '
+                            f'= \'real\' AND CAST("{node.column}" AS REAL) != 0.0 THEN 1 ELSE 0 END) '
+                            f'FROM (SELECT "{node.column}" FROM "{node.table}" '
+                            f'WHERE "{node.column}" IS NOT NULL LIMIT 20)',
+                        ).fetchone()
+                        total, numeric_count = numeric_check or (0, 0)
+                        if total and total > 0 and (numeric_count or 0) / total < 0.5:
+                            _nodes_to_demote.append(idx)
+                            # Get distinct values for the error message
+                            sample = _tc_conn.execute(
+                                f'SELECT DISTINCT "{node.column}" FROM "{node.table}" '
+                                f'WHERE "{node.column}" IS NOT NULL LIMIT 5'
+                            ).fetchall()
+                            vals = [str(r[0]) for r in sample if r[0]]
+                            errors.append(
+                                f'Column "{node.table}.{node.column}" is non-numeric '
+                                f'(sample values: {vals}) — cannot {_comp.upper()} it. '
+                                f'This column should be a WHERE filter, not the aggregation target. '
+                                f'Pick a NUMERIC column from the same table as the metric to {_comp.upper()}.'
+                            )
+                    except Exception:
+                        pass
+                _tc_conn.close()
+            except Exception:
+                pass
+            if _nodes_to_demote:
+                _demoted_tables = [output_nodes[i].table for i in _nodes_to_demote]
+                output_nodes = [n for i, n in enumerate(output_nodes) if i not in _nodes_to_demote]
+                if not output_nodes:
+                    demoted_table = _demoted_tables[0] if _demoted_tables else ""
+                    if not demoted_table and filter_nodes:
+                        demoted_table = filter_nodes[-1].table
+                    if demoted_table:
+                        try:
+                            _tc_conn2 = sqlite3.connect(str(db_path), timeout=5)
+                            col_info2 = _tc_conn2.execute(
+                                f'PRAGMA table_info("{demoted_table}")'
+                            ).fetchall()
+                            for ci in col_info2:
+                                ct = ci[2].upper()
+                                cn = ci[1].lower()
+                                if ct in ("INTEGER", "REAL", "NUMERIC", "FLOAT", "DECIMAL"):
+                                    if not cn.endswith("_id") and cn != "id":
+                                        output_nodes.append(QueryNode(
+                                            table=demoted_table, column=ci[1], role="output",
+                                        ))
+                                        break
+                            _tc_conn2.close()
+                        except Exception:
+                            pass
+
+        # Replace output columns that are ≥90% NULL with FK-resolved alternatives.
+        # E.g. posts.LastEditorDisplayName (99% NULL) → JOIN users ON LastEditorUserId = users.Id → users.DisplayName
+        if output_nodes and db_path and db_path.exists() and kg:
+            _replacements: dict[int, QueryNode] = {}
+            try:
+                _null_conn = sqlite3.connect(str(db_path), timeout=5)
+                for idx, node in enumerate(output_nodes):
+                    total_r = _null_conn.execute(
+                        f'SELECT COUNT(*) FROM "{node.table}"'
+                    ).fetchone()[0]
+                    if not total_r:
+                        continue
+                    null_r = _null_conn.execute(
+                        f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" IS NULL'
+                    ).fetchone()[0]
+                    if null_r / total_r < 0.9:
+                        continue
+                    # Column is ≥90% NULL — look for FK-based alternative
+                    # Find a UserId/EditorId column with similar name that references another table
+                    col_lower = node.column.lower()
+                    # Derive candidate FK column: "LastEditorDisplayName" → "LastEditorUserId"
+                    # or just scan for columns ending in Id/UserId in same table
+                    table_schema = kg.get_table(node.table)
+                    if not table_schema:
+                        continue
+                    fk_candidates = []
+                    for c in table_schema.columns:
+                        cn = c.name.lower()
+                        if cn.endswith("id") and cn != "id":
+                            # Check if column name shares prefix with the NULL column
+                            # e.g. LastEditor in LastEditorDisplayName and LastEditorUserId
+                            prefix = col_lower.replace("displayname", "").replace("name", "")
+                            fk_prefix = cn.replace("userid", "").replace("id", "")
+                            if prefix and fk_prefix and (prefix.startswith(fk_prefix) or fk_prefix.startswith(prefix)):
+                                fk_candidates.append(c.name)
+                    for fk_col in fk_candidates:
+                        # Find the table this FK references
+                        col_id = f"{node.table}.{fk_col}"
+                        if kg.graph and col_id in kg.graph.fk_from:
+                            for edge in kg.graph.fk_from[col_id]:
+                                dst_node = kg.graph.columns.get(edge.dst)
+                                if dst_node:
+                                    ref_table = dst_node.table_id
+                                    ref_schema = kg.get_table(ref_table)
+                                    if ref_schema:
+                                        # Find a display name column in the referenced table
+                                        for rc in ref_schema.columns:
+                                            rcn = rc.name.lower()
+                                            if any(x in rcn for x in ("name", "display", "title", "label")):
+                                                _replacements[idx] = QueryNode(
+                                                    table=ref_table, column=rc.name, role="output",
+                                                )
+                                                break
+                                    if idx in _replacements:
+                                        break
+                        if idx in _replacements:
+                            break
+                _null_conn.close()
+            except Exception:
+                pass
+            if _replacements:
+                for idx, replacement in _replacements.items():
+                    old = output_nodes[idx]
+                    output_nodes[idx] = replacement
+                    errors.append(
+                        f'"{old.table}.{old.column}" is ≥90% NULL — replaced with '
+                        f'"{replacement.table}.{replacement.column}" via FK join.'
+                    )
 
         # Validate filter_conditions
         for cond in picked.get("filter_conditions", []):
@@ -1211,21 +1614,45 @@ Return ONLY JSON:
                     if node in nodes[1:]:
                         dupes_to_remove.add(i)
             else:
-                # Multiple columns have the value — check which is more specific
-                # The column with FEWER matching rows is more likely the correct filter
-                # (e.g., operation='VYBER' is more specific than type='VYBER')
+                # Multiple columns have the value — pick the column whose OTHER
+                # values relate to words in the question. This signals the column
+                # provides the semantic distinction the question is asking about.
+                # E.g. question="cash withdrawals", operation has VYBER/VYBER KARTOU
+                # — "cash" vs "card" is the distinction operation provides.
                 best_node = valid_cols[0]
-                best_count = float("inf")
+                best_score = -1
+                q_words = set(re.findall(r'[a-z]{3,}', question.lower())) if question else set()
                 try:
                     conn2 = sqlite3.connect(str(db_path), timeout=5)
                     for node in valid_cols:
                         try:
-                            cnt = conn2.execute(
-                                f'SELECT COUNT(*) FROM "{node.table}" WHERE "{node.column}" = ? COLLATE NOCASE',
-                                (node.value,)
-                            ).fetchone()[0]
-                            if cnt < best_count:
-                                best_count = cnt
+                            # Get all distinct values in this column
+                            all_vals = conn2.execute(
+                                f'SELECT DISTINCT "{node.column}" FROM "{node.table}" '
+                                f'WHERE "{node.column}" IS NOT NULL LIMIT 20'
+                            ).fetchall()
+                            col_vals = [str(r[0]).lower() for r in all_vals if r[0]]
+
+                            # Score 1: question words that appear in OTHER column values
+                            # (indicates the column's vocabulary matches the question's concepts)
+                            question_overlap = 0
+                            for cv in col_vals:
+                                cv_words = set(re.findall(r'[a-z]{3,}', cv))
+                                question_overlap += len(cv_words & q_words)
+
+                            # Score 2: prefix-siblings (sub-type granularity)
+                            val_lower = str(node.value).lower()
+                            siblings = sum(
+                                1 for cv in col_vals
+                                if cv.startswith(val_lower) and cv != val_lower
+                            )
+
+                            # Score 3: total distinct values (finer categorization)
+                            total_distinct = len(col_vals)
+
+                            score = question_overlap * 100 + siblings * 10 + total_distinct
+                            if score > best_score:
+                                best_score = score
                                 best_node = node
                         except Exception:
                             pass

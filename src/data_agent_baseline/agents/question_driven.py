@@ -27,7 +27,7 @@ from data_agent_baseline.pipeline.kg_builder import (
     build_ontology,
     classify_columns_with_llm,
     discover_joins_with_llm,
-    format_kg_for_llm,
+    KGQueryService,
     profile_schema,
 )
 from data_agent_baseline.tools.knowledge_graph import consolidate_to_sqlite
@@ -52,6 +52,7 @@ from data_agent_baseline.agents.qd_sql_utils import (
     _sanitize_sql,
     _enforce_grounding_filters,
     _apply_null_guard,
+    _strip_agg_null_filter,
 )
 
 logger = logging.getLogger(__name__)
@@ -370,7 +371,8 @@ class QuestionDrivenAgent(
             self._log("kg_step", f"ontology complete: {time.time()-t0:.1f}s")
 
             profile_schema(kg)
-            kg_context = format_kg_for_llm(kg)
+            kg_query = KGQueryService(kg)
+            kg_context = kg_query.full_dump()
             g = kg.graph
             roles_str = ", ".join(f"{t.name}={t.role}" for t in kg.tables if t.role)
             self._log("kg_built", (
@@ -399,7 +401,7 @@ class QuestionDrivenAgent(
             # Step 5: KG path planning — graph-based reasoning to reach the goal
             grounding_context = self._kg_path_plan_grounding(
                 question, kg_context, sample_data, ctx.knowledge_text,
-                db_path=db_path, kg=kg,
+                db_path=db_path, kg=kg, kg_query=kg_query,
             )
 
             # Step 5b: Value Discovery — probe DB for actual filter values
@@ -451,6 +453,7 @@ class QuestionDrivenAgent(
                     break
                 sql = self._call_sql(
                     question,
+                    kg_context=kg_query.table_overview(),
                     grounding_context=grounding_context,
                     gaps=gaps,
                 )
@@ -459,6 +462,7 @@ class QuestionDrivenAgent(
 
                 sql = _sanitize_sql(sql, db_path)
                 sql = _apply_null_guard(sql)
+                sql = _strip_agg_null_filter(sql)
                 sql = _enforce_grounding_filters(sql, grounding_context, db_path)
 
                 # Break if model repeats a previous SQL (no variation = no point retrying)
@@ -486,9 +490,19 @@ class QuestionDrivenAgent(
                     anomaly = self._validate_result_stats(
                         data_result, _l5_comp, _l5_nodes, kg, db_path,
                     )
+                    if not anomaly:
+                        anomaly = self._detect_vacuous_filter(
+                            sql, data_result, db_path, kg, grounding_context,
+                        )
                     if anomaly and attempt < max_sql_attempts - 1:
                         self._log("result_anomaly", anomaly)
-                        gaps = f"RESULT ANOMALY: {anomaly}\nFailed SQL: {sql}"
+                        # Include full schema of all tables so LLM can pick alternative columns
+                        alt_schema = kg_query.table_overview()
+                        gaps = (
+                            f"RESULT ANOMALY: {anomaly}\n"
+                            f"Failed SQL: {sql}\n"
+                            f"AVAILABLE TABLES AND COLUMNS:\n{alt_schema}"
+                        )
                         failed_sqls.append(sql)
                         data_result = None
                         continue
@@ -529,10 +543,17 @@ class QuestionDrivenAgent(
                         diag_sql = fs
                         break
                 diagnosis = self._diagnose_empty_result(db_path, diag_sql) if diag_sql else ""
+                # Focus KG schema on tables mentioned in failed SQLs
+                hyp_tables = []
+                for fs in failed_sqls:
+                    hyp_tables.extend(KGQueryService.tables_from_sql(fs))
+                hyp_kg = kg_query.schema_for_tables(hyp_tables) if hyp_tables else ""
+                if not hyp_kg or len(hyp_kg) < 50:
+                    hyp_kg = kg_query.schema_for_tables([t.name for t in kg.tables])
                 hyp_result, hyp_sql = self._try_multi_hypothesis(
                     question=question,
                     db_path=db_path,
-                    kg_context=kg_context,
+                    kg_context=hyp_kg,
                     sample_data=sample_data,
                     knowledge_text=ctx.knowledge_text,
                     failed_sqls=failed_sqls,
@@ -543,10 +564,12 @@ class QuestionDrivenAgent(
                     self._log("hypothesis_success", f"Hypothesis produced {len(hyp_result['rows'])} rows")
 
 
-            # Shape validation before formatting
+            # Shape validation before formatting — use focused schema from SQL tables
             if data_result and data_result.get("rows"):
+                shape_tables = KGQueryService.tables_from_sql(sql) if sql else []
+                shape_kg = kg_query.schema_for_tables(shape_tables) if shape_tables else kg_query.table_overview()
                 data_result = self._validate_result_shape(
-                    question, data_result, db_path, kg_context,
+                    question, data_result, db_path, shape_kg,
                     sample_data, ctx.knowledge_text,
                     grounding_context=grounding_context,
                     column_hints="",
@@ -1060,7 +1083,7 @@ RULES:
 QUESTION: {question}
 
 SCHEMA:
-{kg_context[:3000]}
+{kg_context}
 
 SAMPLES:
 {sample_data[:500]}
@@ -1160,7 +1183,11 @@ RULES:
 
         # Fix 4: Detect error strings or None/NULL values in result and retry
         first_row_str = " ".join(str(v) for v in rows[0]) if rows else ""
-        has_none_values = any(str(v).lower() in ("none", "null", "") for v in rows[0]) if rows else False
+        # Only flag actual None/NULL, not empty strings (which are legitimate for optional fields)
+        has_none_values = any(
+            v is None or str(v).lower() == "none"
+            for v in rows[0]
+        ) if rows else False
         # Only flag None as suspicious if question asks for names/descriptions (not counts/aggregations)
         name_indicators = ["name", "who", "full name", "surname", "title", "display"]
         none_is_suspicious = has_none_values and any(w in q_lower for w in name_indicators)
@@ -1181,7 +1208,7 @@ The NULL values likely mean: a column name is WRONG (e.g., 'name' doesn't exist 
 Check the DATABASE SCHEMA carefully for the ACTUAL column names and fix the query.
 
 DATABASE SCHEMA:
-{kg_context[:2000]}
+{kg_context}
 
 {grounding_context[:1000]}
 
@@ -1197,7 +1224,7 @@ This is wrong. The result should be a meaningful number or value, not an error.
 Possible issues: division by zero, NULL in computation, wrong column type.
 
 DATABASE SCHEMA:
-{kg_context[:2000]}
+{kg_context}
 
 {grounding_context[:1000]}
 
@@ -1224,6 +1251,9 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
             col.lower().replace("_", " ") in _q_lower_shape
             or col.lower().replace("_", "") in _q_lower_shape.replace(" ", "")
             or col.lower() in _q_lower_shape
+            # Also match base name without _id suffix (e.g. "bond_id" matches "bonds")
+            or (col.lower().endswith("_id") and col.lower()[:-3].rstrip("_") + "s" in _q_lower_shape)
+            or (col.lower().endswith("_id") and col.lower()[:-3].rstrip("_") in _q_lower_shape)
             for col in cols
         )
         if rows and cols and not _output_col_requested:
@@ -1275,7 +1305,7 @@ RAW ID COLUMNS: {id_desc}
 The user expects human-readable names/descriptions, not internal IDs. Add a JOIN to resolve these IDs to their display values.
 
 DATABASE SCHEMA:
-{kg_context[:2000]}
+{kg_context}
 
 Return ONLY: {{"sql": "SELECT ..."}}"""
                 messages = [ModelMessage(role="user", content=fix_prompt)]
@@ -1304,12 +1334,13 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
 QUESTION: {question}
 CURRENT RESULT: {cols[0]} = {rows[0][0]}
 
-The question asks for '{and_pattern.group(1)}' AND '{and_pattern.group(2)}' as SEPARATE values.
+The question asks for '{and_pattern.group(1)}' AND '{and_pattern.group(2)}' as SEPARATE columns.
+The result must still be ONE ROW with TWO columns. Do NOT add GROUP BY — keep the same aggregation logic, just split into separate SELECT expressions.
 
 DATABASE SCHEMA:
-{kg_context[:2000]}
+{kg_context}
 
-Write a corrected SQL that returns TWO columns (one for each value).
+Write a corrected SQL that returns TWO columns in ONE row (one for each value).
 Return ONLY: {{"sql": "SELECT ..."}}"""
             messages = [ModelMessage(role="user", content=fix_prompt)]
             raw = self._model_call_with_retry(messages, thinking=False)
@@ -1318,8 +1349,12 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                 self._log("shape_fix_sql", parsed["sql"])
                 fix_result = self._try_sql(db_path, parsed["sql"])
                 if fix_result and fix_result.get("rows") and len(fix_result.get("columns", [])) >= 2:
-                    self._log("shape_fixed", f"Now has {len(fix_result['columns'])} columns")
-                    return fix_result
+                    # Reject if rewrite exploded row count (e.g. added GROUP BY instead of splitting columns)
+                    if len(fix_result["rows"]) <= max(len(rows) * 2, 5):
+                        self._log("shape_fixed", f"Now has {len(fix_result['columns'])} columns")
+                        return fix_result
+                    else:
+                        self._log("shape_fix_rejected", f"Rewrite produced {len(fix_result['rows'])} rows (was {len(rows)}) — keeping original")
 
         # Check: "how many" question expects a single count but got multiple rows
         count_patterns = [r"how many (?:of them|of these|of those)?\s*(?:are|is|were|was|have|had)\b",
@@ -1338,7 +1373,7 @@ FIRST ROWS: {rows[:3]}
 Rewrite the query to return COUNT(*) — the number of items matching the criteria, not the items themselves.
 
 DATABASE SCHEMA:
-{kg_context[:2000]}
+{kg_context}
 
 {grounding_context[:1000]}
 
@@ -1374,7 +1409,7 @@ FIRST FEW ROWS: {rows[:3]}
 The question likely needs additional filters from its context that were missed. Re-read the question and add the missing WHERE conditions to narrow to exactly 1 row.
 
 DATABASE SCHEMA:
-{kg_context[:1500]}
+{kg_context}
 
 Return ONLY: {{"sql": "SELECT ..."}}"""
             messages = [ModelMessage(role="user", content=fix_prompt)]
