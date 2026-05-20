@@ -393,7 +393,11 @@ class DiagnosticsMixin:
         knowledge_text: str,
         grounding_context: str = "",
     ) -> str:
-        """Infer normal/abnormal thresholds from data distribution when not in knowledge."""
+        """Pre-resolve normal/abnormal thresholds via LLM before SQL generation.
+
+        Makes a dedicated LLM call with data distribution + knowledge text to produce
+        concrete filter values. Returns explicit CONDITIONS the SQL LLM can use directly.
+        """
         q_lower = question.lower()
         needs_threshold = any(w in q_lower for w in (
             "normal", "abnormal", "elevated", "low level", "high level",
@@ -405,130 +409,268 @@ class DiagnosticsMixin:
         if not db_path or not db_path.exists():
             return ""
 
-        # Extract which fields the question references for threshold inference
-        # e.g. "normal level of white blood cells" → WBC
-        # e.g. "abnormal fibrinogen level" → FG/fibrinogen
-        threshold_concepts: list[str] = []
-        # Words that describe the threshold state (not the field itself)
-        state_words = {
-            "normal", "abnormal", "elevated", "low", "high", "level", "levels",
-            "have", "their", "them", "who", "how", "many", "patients", "male",
-            "female", "among", "the", "with", "and", "are", "what", "which",
-            "healthy", "unhealthy", "within", "out", "range", "blood",
-        }
-        # Extract candidate field names from question
-        q_words = re.findall(r'\b[a-z]{2,}\b', q_lower)
-        for word in q_words:
-            if word not in state_words and len(word) >= 2:
-                threshold_concepts.append(word)
+        # Identify columns mentioned in the grounding that need threshold resolution
+        # Look for columns referenced in phrase_mapping or data_requirements
+        target_cols: list[tuple[str, str]] = []
+        if grounding_context:
+            for m in re.finditer(r'"?(\w+)"?\."?(\w+)"?', grounding_context):
+                table_name, col_name = m.group(1), m.group(2)
+                for t in kg.tables:
+                    if t.name == table_name:
+                        for c in t.columns:
+                            if c.name == col_name:
+                                target_cols.append((table_name, col_name))
+                                break
 
-        # Check if knowledge defines thresholds for ALL referenced fields
-        knowledge_covers_all = True
-        if knowledge_text:
-            k_lower = knowledge_text.lower()
-            for concept in threshold_concepts:
-                if concept in k_lower:
-                    idx = k_lower.find(concept)
-                    context = knowledge_text[max(0, idx - 50):idx + 200]
-                    if any(t in context.lower() for t in ("range", "above", "below", "between", "normal", "abnormal")):
-                        continue
-                knowledge_covers_all = False
-        else:
-            knowledge_covers_all = False
+        # Deduplicate
+        target_cols = list(dict.fromkeys(target_cols))
 
-        if knowledge_covers_all and knowledge_text:
-            return ""
-
-        # For threshold questions, include ALL numeric columns from tables that
-        # are likely relevant (the LLM needs the full data landscape to pick thresholds).
-        # This is more robust than trying to abbreviation-match WBC/FG/etc.
-
-        # Extract columns that already have deterministic conditions in the grounding
-        # (e.g., "Laboratory"."FG": IS NOT NULL) — skip these from threshold stats
+        # Collect stats for target columns only
         resolved_cols: set[str] = set()
         if grounding_context:
             for m in re.finditer(
-                r'"([^"]+)"\."([^"]+)":\s*(?:IS NOT NULL|>=|<=|=|BETWEEN)',
+                r'"([^"]+)"\."([^"]+)":\s*(?:>=|<=|BETWEEN)\s*\d',
                 grounding_context,
             ):
                 resolved_cols.add(f"{m.group(1)}.{m.group(2)}".lower())
 
         conn = sqlite3.connect(str(db_path))
-        inferences: list[str] = []
+        col_stats: list[str] = []
         try:
-            for table in kg.tables:
-                cols_info = conn.execute(f'PRAGMA table_info("{table.name}")').fetchall()
-                for col_info in cols_info:
-                    col = col_info[1]
-                    col_type = col_info[2].lower()
-                    col_lower = col.lower()
+            for table_name, col_name in target_cols:
+                if f"{table_name}.{col_name}".lower() in resolved_cols:
+                    continue
+                col_lower = col_name.lower()
+                if col_lower in ("id", "_id") or col_lower.endswith("_id") or col_lower.startswith("link_to"):
+                    continue
 
-                    # Skip ID/key columns
-                    if col_lower in ("id", "_id") or col_lower.endswith("_id") or col_lower.startswith("link_to"):
+                try:
+                    stats = conn.execute(
+                        f'SELECT MIN(CAST("{col_name}" AS REAL)), '
+                        f'MAX(CAST("{col_name}" AS REAL)), '
+                        f'AVG(CAST("{col_name}" AS REAL)), '
+                        f'COUNT(*) '
+                        f'FROM "{table_name}" WHERE "{col_name}" IS NOT NULL'
+                    ).fetchone()
+                    if not stats or stats[3] == 0 or stats[0] == stats[1]:
                         continue
 
-                    # Skip columns already resolved in grounding conditions
-                    if f"{table.name}.{col}".lower() in resolved_cols:
-                        continue
+                    total = stats[3]
+                    p5_row = conn.execute(
+                        f'SELECT CAST("{col_name}" AS REAL) FROM "{table_name}" '
+                        f'WHERE "{col_name}" IS NOT NULL '
+                        f'ORDER BY CAST("{col_name}" AS REAL) '
+                        f'LIMIT 1 OFFSET {max(int(total * 0.05) - 1, 0)}'
+                    ).fetchone()
+                    p95_row = conn.execute(
+                        f'SELECT CAST("{col_name}" AS REAL) FROM "{table_name}" '
+                        f'WHERE "{col_name}" IS NOT NULL '
+                        f'ORDER BY CAST("{col_name}" AS REAL) '
+                        f'LIMIT 1 OFFSET {max(int(total * 0.95) - 1, 0)}'
+                    ).fetchone()
+                    p5 = p5_row[0] if p5_row else stats[0]
+                    p95 = p95_row[0] if p95_row else stats[1]
 
-                    # Only for numeric columns
-                    if col_type not in ("real", "integer", "numeric", "float", "double", "int"):
-                        try:
-                            test = conn.execute(
-                                f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
-                                f'WHERE "{col}" IS NOT NULL LIMIT 1'
-                            ).fetchone()
-                            if test is None:
-                                continue
-                        except Exception:
-                            continue
-
-                    try:
-                        stats = conn.execute(
-                            f'SELECT MIN(CAST("{col}" AS REAL)), '
-                            f'MAX(CAST("{col}" AS REAL)), '
-                            f'AVG(CAST("{col}" AS REAL)), '
-                            f'COUNT(*) '
-                            f'FROM "{table.name}" WHERE "{col}" IS NOT NULL'
-                        ).fetchone()
-                        if not stats or stats[3] == 0:
-                            continue
-
-                        # Compute percentiles for threshold inference
-                        total = stats[3]
-                        p25_row = conn.execute(
-                            f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
-                            f'WHERE "{col}" IS NOT NULL '
-                            f'ORDER BY CAST("{col}" AS REAL) '
-                            f'LIMIT 1 OFFSET {int(total * 0.25)}'
-                        ).fetchone()
-                        p75_row = conn.execute(
-                            f'SELECT CAST("{col}" AS REAL) FROM "{table.name}" '
-                            f'WHERE "{col}" IS NOT NULL '
-                            f'ORDER BY CAST("{col}" AS REAL) '
-                            f'LIMIT 1 OFFSET {int(total * 0.75)}'
-                        ).fetchone()
-                        p25 = p25_row[0] if p25_row else stats[0]
-                        p75 = p75_row[0] if p75_row else stats[1]
-
-                        inferences.append(
-                            f"  {table.name}.{col}: min={stats[0]}, max={stats[1]}, "
-                            f"avg={stats[2]:.2f}, P25={p25}, P75={p75}, count={stats[3]}"
-                        )
-                    except Exception:
-                        continue
+                    col_stats.append(
+                        f"  {table_name}.{col_name}: min={stats[0]}, max={stats[1]}, "
+                        f"avg={stats[2]:.2f}, P5={p5}, P95={p95}, count={total}"
+                    )
+                except Exception:
+                    continue
         finally:
             conn.close()
 
-        if inferences:
-            return (
-                "THRESHOLD CONTEXT (data distribution for normal/abnormal inference):\n"
-                "Use these statistics to determine thresholds. "
-                "Values outside the P25-P75 interquartile range are likely abnormal. "
-                "If domain knowledge defines specific ranges, prefer those.\n"
-                + "\n".join(inferences[:30])
+        if not col_stats:
+            return ""
+
+        # Make LLM call to resolve thresholds
+        from data_agent_baseline.agents.model import ModelMessage
+
+        prompt = (
+            "Given the following question and data columns, determine the concrete numeric "
+            "thresholds that define 'normal' vs 'abnormal' for each relevant column.\n\n"
+            f"QUESTION: {question}\n\n"
+            f"DOMAIN KNOWLEDGE:\n{knowledge_text[:1500] if knowledge_text else 'None provided'}\n\n"
+            f"DATA STATISTICS (showing actual scale of values in the database):\n"
+            + "\n".join(col_stats) + "\n\n"
+            "INSTRUCTIONS:\n"
+            "- Use the DOMAIN KNOWLEDGE above to find threshold definitions.\n"
+            "- If the knowledge does not define a threshold for a column, use your general "
+            "understanding of what the column measures (based on its name and context).\n"
+            "- The statistics show the actual data scale. It is possible that ALL values in "
+            "the data are abnormal (e.g., the dataset only contains sick patients). Do NOT "
+            "adjust your thresholds to force overlap with the data — use the correct domain "
+            "thresholds even if no data falls within the normal range.\n"
+            "- For each column that needs a threshold, output: table.column: low-high "
+            "(meaning normal = BETWEEN low AND high).\n\n"
+            "Respond with ONLY the thresholds, one per line, format:\n"
+            "table.column: low-high\n"
+            "If a column is not relevant to the normal/abnormal question, skip it."
+        )
+
+        # Build a lookup of stats per column for validation
+        stats_lookup: dict[str, tuple[float, float]] = {}
+        for s in col_stats:
+            sm = re.match(r'\s*(\w+)\.(\w+): min=([\d.\-]+), max=([\d.\-]+)', s)
+            if sm:
+                stats_lookup[f"{sm.group(1)}.{sm.group(2)}"] = (
+                    float(sm.group(3)), float(sm.group(4)),
+                )
+
+        raw = self._model_call_with_retry(
+            [ModelMessage(role="user", content=prompt)], thinking=False,
+        )
+        if not raw:
+            return ""
+
+        # Parse and validate thresholds against actual data range
+        parsed: list[tuple[str, str, float, float]] = []
+        invalid: list[str] = []
+        for line in raw.strip().split("\n"):
+            m = re.match(r'(\w+)\.(\w+)\s*:\s*([\d.]+)\s*[-–]\s*([\d.]+)', line.strip())
+            if m:
+                tbl, col = m.group(1), m.group(2)
+                low, high = float(m.group(3)), float(m.group(4))
+                key = f"{tbl}.{col}"
+                if key in stats_lookup:
+                    data_min, data_max = stats_lookup[key]
+                    no_overlap = low > data_max or high < data_min
+                    col_lower = col.lower()
+                    is_normal_col = self._col_in_threshold_context(
+                        col_lower, "normal", q_lower,
+                    )
+                    is_abnormal_col = self._col_in_threshold_context(
+                        col_lower, "abnormal", q_lower,
+                    )
+                    if no_overlap and is_normal_col and not is_abnormal_col:
+                        # Column is filtered for "normal" but no data is in range → wrong unit
+                        invalid.append(
+                            f"{key}: you proposed {low}-{high} but data range is "
+                            f"{data_min}-{data_max}. Your threshold doesn't overlap "
+                            f"with the data. Adjust to fit the data's unit/scale."
+                        )
+                        continue
+                    # For "abnormal" columns, no-overlap is valid (all data is abnormal)
+                parsed.append((tbl, col, low, high))
+
+        # If any thresholds were invalid, retry with correction feedback
+        if invalid and not parsed:
+            correction = (
+                prompt + "\n\nCORRECTION NEEDED — your previous answer was wrong:\n"
+                + "\n".join(invalid) + "\n"
+                "Re-derive the thresholds using the correct unit/scale for this data."
             )
-        return ""
+            raw = self._model_call_with_retry(
+                [ModelMessage(role="user", content=correction)], thinking=False,
+            )
+            if raw:
+                for line in raw.strip().split("\n"):
+                    m = re.match(r'(\w+)\.(\w+)\s*:\s*([\d.]+)\s*[-–]\s*([\d.]+)', line.strip())
+                    if m:
+                        tbl, col = m.group(1), m.group(2)
+                        low, high = float(m.group(3)), float(m.group(4))
+                        parsed.append((tbl, col, low, high))
+
+        # Build conditions from validated thresholds
+        conditions: list[str] = []
+        col_conditions: dict[str, list[str]] = {}  # table -> list of SQL fragments
+        for tbl, col, low, high in parsed:
+            col_lower = col.lower()
+            is_normal = self._col_in_threshold_context(col_lower, "normal", q_lower)
+            is_abnormal = self._col_in_threshold_context(col_lower, "abnormal", q_lower)
+
+            if is_normal and not is_abnormal:
+                conditions.append(
+                    f'  "{tbl}"."{col}": BETWEEN {low} AND {high} (normal range)'
+                )
+                col_conditions.setdefault(tbl, []).append(
+                    f'"{col}" BETWEEN {low} AND {high}'
+                )
+            elif is_abnormal and not is_normal:
+                conditions.append(
+                    f'  "{tbl}"."{col}": < {low} OR > {high} (abnormal = outside normal range)'
+                )
+                col_conditions.setdefault(tbl, []).append(
+                    f'("{col}" < {low} OR "{col}" > {high})'
+                )
+            else:
+                conditions.append(
+                    f'  "{tbl}"."{col}": normal range is {low}-{high}'
+                )
+
+        if not conditions:
+            return ""
+
+        result = "RESOLVED THRESHOLDS (use these exact values in your SQL):\n"
+        result += "\n".join(conditions)
+
+        # Cross-row detection: if 2+ threshold conditions on same multi-row table,
+        # emit subquery pattern since conditions may apply to different rows
+        for tbl, frags in col_conditions.items():
+            if len(frags) < 2:
+                continue
+            # Check if this table has multiple rows per entity
+            for t in kg.tables:
+                if t.name == tbl and t.columns:
+                    pk_col = t.columns[0].name
+                    try:
+                        conn2 = sqlite3.connect(str(db_path))
+                        total = conn2.execute(
+                            f'SELECT COUNT(*) FROM "{tbl}"'
+                        ).fetchone()[0]
+                        distinct = conn2.execute(
+                            f'SELECT COUNT(DISTINCT "{pk_col}") FROM "{tbl}"'
+                        ).fetchone()[0]
+                        conn2.close()
+                        if distinct > 0 and total / distinct > 1.5:
+                            subqs = [
+                                f'"{pk_col}" IN (SELECT "{pk_col}" FROM "{tbl}" WHERE {f})'
+                                for f in frags
+                            ]
+                            result += (
+                                f"\n\nCROSS-ROW PATTERN (MANDATORY — conditions apply to "
+                                f"different rows of the same entity):\n"
+                                f"  SELECT COUNT(DISTINCT \"{tbl}\".\"{pk_col}\") FROM \"{tbl}\"\n"
+                                f"  WHERE " + "\n    AND ".join(subqs)
+                            )
+                    except Exception:
+                        pass
+                    break
+
+        return result
+
+    def _col_in_threshold_context(self, col_lower: str, keyword: str, question: str) -> bool:
+        """Check if a column is associated with a threshold keyword in the question."""
+        # Common abbreviation expansions for matching
+        expansions: dict[str, list[str]] = {
+            "wbc": ["white blood cell", "white blood"],
+            "rbc": ["red blood cell", "red blood"],
+            "hgb": ["hemoglobin"], "hct": ["hematocrit"],
+            "plt": ["platelet"], "fg": ["fibrinogen"],
+            "ldh": ["lactate dehydrogenase"],
+            "alb": ["albumin"], "ua": ["uric acid"],
+            "glu": ["glucose"], "crp": ["c-reactive"],
+        }
+        # Find where the column concept appears in the question
+        col_positions: list[int] = []
+        if col_lower in question:
+            col_positions.append(question.find(col_lower))
+        for expansion in expansions.get(col_lower, []):
+            if expansion in question:
+                col_positions.append(question.find(expansion))
+
+        if not col_positions:
+            return False
+
+        # Check if the keyword is near the column mention
+        keyword_pos = question.find(keyword)
+        if keyword_pos < 0:
+            return False
+
+        for cp in col_positions:
+            if abs(cp - keyword_pos) < 40:
+                return True
+        return False
 
     def _check_concept_coverage(
         self, sql: str, grounding_context: str, question: str,

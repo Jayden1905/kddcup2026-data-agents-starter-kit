@@ -445,9 +445,13 @@ def rule_cross_row_structure(ctx: EngineContext) -> RuleResult | None:
             f'(SELECT "{pk_col}" FROM "{entity_table}" WHERE {where_clause})'
         )
 
+    select_hint = ""
+    if ctx.comp_type == "count":
+        select_hint = f'\n  SELECT COUNT(DISTINCT "{entity_table}"."{pk_col}") FROM "{entity_table}"'
     directive = (
         "CROSS-ROW HINT (MANDATORY — you MUST use this subquery pattern, do NOT put these "
-        "conditions in the outer WHERE directly):\n  WHERE " + "\n    AND ".join(subq_parts)
+        "conditions in the outer WHERE directly):"
+        f"{select_hint}\n  WHERE " + "\n    AND ".join(subq_parts)
     )
 
     return RuleResult(
@@ -1071,36 +1075,6 @@ def rule_count_distinct(ctx: EngineContext) -> RuleResult | None:
 # Knowledge Parsing Helpers + Distribution-Based Range Resolution
 # ---------------------------------------------------------------------------
 
-# Acceleration layer: known medical ranges (used as fast-path before distribution analysis)
-_KNOWN_NORMAL_RANGES: dict[str, tuple[float, float]] = {
-    "wbc": (3.5, 9.0),
-    "rbc": (4.0, 5.5),
-    "hgb": (12.0, 17.5),
-    "hct": (36.0, 50.0),
-    "plt": (150.0, 400.0),
-    "fg": (150.0, 400.0),
-    "got": (0.0, 40.0),
-    "gpt": (0.0, 40.0),
-    "ldh": (0.0, 500.0),
-    "alp": (44.0, 147.0),
-    "tp": (6.0, 8.3),
-    "alb": (3.5, 5.5),
-    "ua": (2.4, 8.0),
-    "un": (7.0, 20.0),
-    "cre": (0.6, 1.2),
-    "t-bil": (0.1, 1.2),
-    "t-cho": (0.0, 250.0),
-    "tg": (0.0, 150.0),
-    "glu": (70.0, 100.0),
-    "crp": (0.0, 0.5),
-    "igg": (700.0, 1600.0),
-    "iga": (70.0, 400.0),
-    "igm": (40.0, 230.0),
-    "c3": (90.0, 180.0),
-    "c4": (10.0, 40.0),
-    "pt": (11.0, 13.5),
-    "aptt": (25.0, 35.0),
-}
 
 
 def _parse_ranges_from_knowledge(text: str, out: dict[str, tuple[float, float]]) -> None:
@@ -1329,10 +1303,11 @@ DATA STATISTICS:
 QUESTION CONTEXT: {ctx.question}
 KNOWLEDGE AVAILABLE: {ctx.knowledge_text[:500] if ctx.knowledge_text else 'None'}
 
-TASK: Determine the normal/healthy/expected range for this column.
-- If you recognize this as a known measurement (lab value, metric, score), use domain knowledge.
-- If unknown, use the distribution: "normal" = where 60-90% of values concentrate (the main cluster).
-- The range must split the data meaningfully: some values inside, some outside.
+TASK: Determine the normal/expected range for this column.
+- Use the KNOWLEDGE text above to identify thresholds defined by the domain.
+- If the knowledge text does not define a threshold, use general domain reasoning about what this column measures.
+- Use the data statistics to understand the unit/scale of the data.
+- It is possible that ALL values are abnormal (e.g., dataset of sick patients). Do NOT force your range to overlap with the data — use the correct domain thresholds.
 
 Respond ONLY with JSON:
 {{"low": <number>, "high": <number>, "confidence": "high|medium|low", "reasoning": "brief"}}
@@ -1356,7 +1331,10 @@ If you cannot determine a meaningful range, respond: {{"low": null, "high": null
         low, high = float(low), float(high)
         if low >= high:
             return None
-        # Validate: the LLM-proposed range must actually split the data
+        # Accept high-confidence answers even if no data falls in range
+        # (possible when all data is abnormal, e.g., dataset of sick patients)
+        if confidence == "high":
+            return (low, high)
         validation = _validate_range_against_data(ctx, table, column, low, high)
         if not validation.get("is_useful"):
             return None
@@ -1375,9 +1353,8 @@ def _resolve_normal_range(
 
     Priority:
     1. Knowledge text (explicit domain documentation)
-    2. Hardcoded accelerator (_KNOWN_NORMAL_RANGES)
-    3. Data distribution analysis (statistical, domain-agnostic)
-    4. LLM inference (given distribution + context)
+    2. LLM inference (given distribution + domain knowledge)
+    3. Data distribution analysis (fallback when no LLM)
 
     Each tier validates against actual data before accepting.
     """
@@ -1390,25 +1367,13 @@ def _resolve_normal_range(
     if col_lower in knowledge_ranges:
         r = knowledge_ranges[col_lower]
         validation = _validate_range_against_data(ctx, table, column, r[0], r[1])
-        if validation.get("is_useful") or validation.get("outside_count", 0) > 0:
+        if validation.get("is_useful") or (
+            validation.get("outside_count", 0) > 0 and validation.get("inside_count", 0) > 0
+        ):
             return r
 
-    # Tier 2: Hardcoded accelerator (fast-path for known domains)
-    if col_lower in _KNOWN_NORMAL_RANGES:
-        r = _KNOWN_NORMAL_RANGES[col_lower]
-        validation = _validate_range_against_data(ctx, table, column, r[0], r[1])
-        if validation.get("is_useful") or validation.get("outside_count", 0) > 0:
-            return r
-
-    # Tier 3: Distribution analysis (domain-agnostic)
+    # Tier 2: LLM inference (given distribution + domain knowledge)
     dist_range = _derive_range_from_distribution(ctx, table, column)
-    if dist_range:
-        validation = _validate_range_against_data(ctx, table, column, *dist_range)
-        if validation.get("is_useful"):
-            # Distribution range is useful on its own — no need for LLM
-            return dist_range
-
-    # Tier 4: LLM inference (given distribution context)
     if model_call:
         stats = ctx.col_stats(table, column)
         if stats:
@@ -1418,10 +1383,11 @@ def _resolve_normal_range(
             if llm_range:
                 return llm_range
 
-    # Fallback: distribution range even if not perfectly "useful"
-    # (some data is better than no data)
+    # Tier 3: Distribution analysis (fallback when no LLM available)
     if dist_range:
-        return dist_range
+        validation = _validate_range_against_data(ctx, table, column, *dist_range)
+        if validation.get("is_useful"):
+            return dist_range
 
     return None
 

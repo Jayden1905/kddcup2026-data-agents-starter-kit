@@ -1570,6 +1570,64 @@ Return ONLY JSON:
                 else:
                     errors.append(f"Filter column not in graph: {col_ref}")
 
+        # Fix: "No.X" / "#X" patterns — if LLM chose a text column but value is numeric,
+        # check if the numeric value exists in an ID column instead.
+        if db_path and db_path.exists() and question:
+            _id_num_match = re.search(r'(?:No\.|#|user\s+)(\d+)', question, re.IGNORECASE)
+            if _id_num_match:
+                _id_num = _id_num_match.group(1)
+                _corrected: list[tuple[int, QueryNode]] = []
+                try:
+                    _id_conn = sqlite3.connect(str(db_path), timeout=5)
+                    for idx, node in enumerate(filter_nodes):
+                        if node.column.startswith("_expr:"):
+                            continue
+                        val_str = str(node.value)
+                        # Only fix if the value contains the numeric ID but isn't purely the number
+                        # (e.g. 'user24' contains '24' but is not just '24')
+                        if _id_num not in val_str and val_str != _id_num:
+                            continue
+                        # Check if current column actually has this value
+                        try:
+                            has_val = _id_conn.execute(
+                                f'SELECT 1 FROM "{node.table}" WHERE "{node.column}" = ? LIMIT 1',
+                                (node.value,)
+                            ).fetchone()
+                        except Exception:
+                            has_val = None
+                        if has_val:
+                            continue  # current filter works fine
+                        # Look for ID columns (Id, UserId, etc.) that contain the numeric value
+                        t_schema = kg.get_table(node.table)
+                        if not t_schema:
+                            continue
+                        for col in t_schema.columns:
+                            cn = col.name.lower()
+                            if cn == "id" or cn.endswith("id") or cn.endswith("_id"):
+                                try:
+                                    has_id = _id_conn.execute(
+                                        f'SELECT 1 FROM "{node.table}" WHERE "{col.name}" = ? LIMIT 1',
+                                        (int(_id_num),)
+                                    ).fetchone()
+                                except Exception:
+                                    has_id = None
+                                if has_id:
+                                    _corrected.append((idx, QueryNode(
+                                        table=node.table, column=col.name,
+                                        role="filter", operator="=", value=int(_id_num),
+                                    )))
+                                    break
+                    _id_conn.close()
+                except Exception:
+                    pass
+                for idx, new_node in _corrected:
+                    old = filter_nodes[idx]
+                    filter_nodes[idx] = new_node
+                    errors.append(
+                        f'Corrected filter: "{old.table}.{old.column}"=\'{old.value}\' → '
+                        f'"{new_node.table}.{new_node.column}"={new_node.value} (numeric ID match)'
+                    )
+
         # Deduplicate: same value used on multiple columns in the same table is nonsensical.
         # Probe DB to find which column actually contains the value, or use LLM to resolve.
         value_to_nodes: dict[tuple[str, str], list[QueryNode]] = {}
@@ -1775,11 +1833,14 @@ Return ONLY JSON:
         _q_mentions_id = bool(re.search(r'\bid\b', question.lower())) or "id" in metric_stems
         _col_null_ratio: dict[str, float] = {}
         col_candidates: list[tuple[str, str, str, set[str]]] = []
+        _q_lower_resolve = question.lower()
         for table in kg.tables:
             for col in table.columns:
                 cn = col.name
                 cn_lower = cn.lower()
-                if "link" in cn_lower or "ref" in cn_lower:
+                if "link" in cn_lower:
+                    continue
+                if "ref" in cn_lower and cn_lower not in _q_lower_resolve and "reference" not in _q_lower_resolve:
                     continue
                 if cn_lower == "id" and not _q_mentions_id:
                     continue

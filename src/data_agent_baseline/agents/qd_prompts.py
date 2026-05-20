@@ -79,6 +79,8 @@ def _build_sql_prompt(
         parts.append(f"\nPREVIOUS ATTEMPT FAILED:\n{gaps}\nFix the error.")
 
     parts.append("\nSQL RULES: Escape apostrophes with ''. Use double-quotes for identifiers. CAST(x AS REAL) for division.")
+    if "CROSS-ROW HINT" in grounding_context:
+        parts.append("CRITICAL: The PLAN contains a CROSS-ROW HINT. You MUST use the subquery WHERE pattern shown there. Do NOT put those conditions in the outer WHERE directly — the entity has multiple rows and conditions apply to DIFFERENT rows.")
     parts.append('\nReturn ONLY: {"sql": "SELECT ..."}')
 
     return "\n".join(parts)

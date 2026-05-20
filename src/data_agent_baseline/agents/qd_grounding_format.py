@@ -815,13 +815,32 @@ class GroundingFormatMixin:
         # uses IN([val1, val2]), it likely means BOTH endpoints must satisfy the condition
         # (e.g. "bonds with phosphorus AND nitrogen" = one atom is P, other is N).
         if path.filter_nodes and path.edges and kg and kg.graph:
+            # Coalesce two "=" filters on same table.column into one virtual IN filter
+            _eq_groups: dict[str, list[QueryNode]] = {}
+            for fn in path.filter_nodes:
+                if fn.column.startswith("_expr:"):
+                    continue
+                if fn.operator == "=":
+                    key = f"{fn.table}.{fn.column}"
+                    _eq_groups.setdefault(key, []).append(fn)
+            _virtual_in_nodes: list[QueryNode] = []
+            for key, nodes in _eq_groups.items():
+                if len(nodes) == 2:
+                    _virtual_in_nodes.append(QueryNode(
+                        table=nodes[0].table,
+                        column=nodes[0].column,
+                        role="filter",
+                        operator="IN",
+                        value=[nodes[0].value, nodes[1].value],
+                    ))
+
             # Find bridge tables: tables with 2+ FK columns pointing to same entity table
-            for fnode in path.filter_nodes:
+            _candidate_filters = _virtual_in_nodes + [
+                fn for fn in path.filter_nodes
+                if fn.operator.upper() == "IN" and isinstance(fn.value, list) and len(fn.value) == 2
+            ]
+            for fnode in _candidate_filters:
                 if fnode.column.startswith("_expr:"):
-                    continue
-                if fnode.operator.upper() != "IN" or not isinstance(fnode.value, list):
-                    continue
-                if len(fnode.value) != 2:
                     continue
                 # fnode is on entity table (e.g. atom.element IN [p, n])
                 # Find bridge tables that have 2 FK columns to this entity table
@@ -841,6 +860,21 @@ class GroundingFormatMixin:
                         bridge_fks.setdefault(src_col.table_id, []).append(src_col.name)
                     elif src_col.table_id == entity_table and dst_col.table_id != entity_table:
                         bridge_fks.setdefault(dst_col.table_id, []).append(dst_col.name)
+                # Also detect sibling FK columns by naming pattern (e.g. atom_id + atom_id2)
+                for bridge_table, fk_cols in list(bridge_fks.items()):
+                    if len(fk_cols) < 2:
+                        bt_schema = kg.get_table(bridge_table)
+                        if bt_schema:
+                            for col in bt_schema.columns:
+                                if col.name in fk_cols:
+                                    continue
+                                # Match patterns like atom_id2, atom_id_2, second_atom_id
+                                for existing_fk in list(fk_cols):
+                                    base = existing_fk.rstrip("0123456789")
+                                    if (col.name.startswith(base) and col.name != existing_fk
+                                            and col.name not in fk_cols):
+                                        fk_cols.append(col.name)
+                                        break
                 # Find bridge tables with exactly 2 FK columns to the entity
                 for bridge_table, fk_cols in bridge_fks.items():
                     if len(fk_cols) >= 2:

@@ -561,6 +561,7 @@ class QuestionDrivenAgent(
                 )
                 if hyp_result and hyp_result.get("rows"):
                     data_result = hyp_result
+                    sql = hyp_sql or sql
                     self._log("hypothesis_success", f"Hypothesis produced {len(hyp_result['rows'])} rows")
 
 
@@ -573,6 +574,7 @@ class QuestionDrivenAgent(
                     sample_data, ctx.knowledge_text,
                     grounding_context=grounding_context,
                     column_hints="",
+                    sql=sql or "",
                 )
 
             # Format answer
@@ -1171,6 +1173,7 @@ RULES:
         knowledge_text: str,
         grounding_context: str,
         column_hints: str,
+        sql: str = "",
     ) -> dict[str, Any]:
         """Validate result shape matches question expectations and fix if needed."""
         rows = data_result.get("rows", [])
@@ -1421,6 +1424,38 @@ Return ONLY: {{"sql": "SELECT ..."}}"""
                 if fix_result and fix_result.get("rows") and 0 < len(fix_result["rows"]) < len(rows):
                     self._log("shape_fixed_singular", f"Narrowed from {len(rows)} to {len(fix_result['rows'])} rows")
                     return fix_result
+
+        # Fix: multiple OR LIKE on same column → try AND when question uses "and"
+        # e.g. "water, veggie tray and supplies" should match a single description, not any of them
+        rows = data_result.get("rows", [])
+        cols = data_result.get("columns", [])
+        if sql and len(rows) > 1:
+            like_or_match = re.findall(
+                r"""(\w+(?:\.\w+)?)\s+LIKE\s+['"](%[^'"]+%)['"]""",
+                sql, re.IGNORECASE,
+            )
+            if len(like_or_match) >= 2 and " OR " in sql.upper():
+                col_groups: dict[str, list[str]] = {}
+                for col_name, pattern in like_or_match:
+                    base_col = col_name.split(".")[-1].lower()
+                    col_groups.setdefault(base_col, []).append(pattern)
+                for col_name, patterns in col_groups.items():
+                    if len(patterns) >= 2:
+                        and_sql = re.sub(
+                            r'\bOR\b(?=\s+\w*\.?' + col_name + r'\s+LIKE)',
+                            'AND', sql, flags=re.IGNORECASE,
+                        )
+                        if and_sql == sql:
+                            and_sql = sql.replace(" OR ", " AND ")
+                        if and_sql != sql:
+                            and_result = self._try_sql(db_path, and_sql)
+                            if (and_result and and_result.get("rows")
+                                    and 0 < len(and_result["rows"]) < len(rows)):
+                                self._log("like_or_to_and", f"OR→AND narrowed {len(rows)}→{len(and_result['rows'])} rows")
+                                data_result = and_result
+                                rows = data_result.get("rows", [])
+                                cols = data_result.get("columns", [])
+                        break
 
         # Deduplicate: when a single-column result is overwhelmingly duplicates,
         # it's almost certainly meant to be distinct values (e.g., 78 rows with 7 unique).
