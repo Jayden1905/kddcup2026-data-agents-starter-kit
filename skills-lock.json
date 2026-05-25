@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "mysql": {
+      "source": "sanjay3290/ai-skills",
+      "sourceType": "github",
+      "skillPath": "skills/mysql/SKILL.md",
+      "computedHash": "26665645defca646c88f5107c13c5bd76d007d427400d50fc5207fa425314eb9"
+    }
+  }
+}

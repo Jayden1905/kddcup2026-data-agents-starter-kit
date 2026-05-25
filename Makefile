@@ -1,4 +1,4 @@
-CONFIG ?= configs/react_baseline.qwen.yaml
+CONFIG ?= configs/kg_agent.local.yaml
 TASK   ?= task_11
 LIMIT  ?= 50
 DIFF   ?=

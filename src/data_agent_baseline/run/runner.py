@@ -11,13 +11,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from data_agent_baseline.agents.investigation import InvestigationAgent, InvestigationAgentConfig
+from data_agent_baseline.agents.kg_agent import KGAgent
 from data_agent_baseline.agents.model import AzureOpenAIModelAdapter, OpenAIModelAdapter
-from data_agent_baseline.agents.question_driven import QuestionDrivenAgent
-from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
-from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,53 +81,8 @@ def build_model_adapter(config: AppConfig):
     )
 
 
-def build_fast_model_adapter(config: AppConfig):
-    fast_model = config.agent.fast_model
-    if not fast_model:
-        return None
-    backend = (config.agent.fast_backend or config.agent.backend).lower()
-    api_base = config.agent.fast_api_base or config.agent.api_base
-    api_key = config.agent.fast_api_key or config.agent.api_key
-    if backend == "azure_openai":
-        return AzureOpenAIModelAdapter(
-            deployment_name=config.agent.fast_deployment_name or fast_model,
-            api_key=api_key,
-            endpoint=api_base,
-            api_version=config.agent.api_version,
-            temperature=config.agent.temperature,
-        )
-    return OpenAIModelAdapter(
-        model=fast_model,
-        api_base=api_base,
-        api_key=api_key,
-    )
-
-
-def _build_agent(
-    *, model, tools: ToolRegistry, config: AppConfig, fast_model=None, log_callback=None
-):
-    agent_type = config.agent.agent_type.lower()
-    if agent_type == "investigation":
-        return InvestigationAgent(
-            model=model,
-            tools=tools,
-            config=InvestigationAgentConfig(
-                max_steps=config.agent.max_steps,
-                max_iterations=config.agent.max_investigation_iterations,
-            ),
-            fast_model=fast_model,
-            log_callback=log_callback,
-        )
-    if agent_type == "question_driven":
-        return QuestionDrivenAgent(
-            model=model,
-            log_callback=log_callback,
-        )
-    return ReActAgent(
-        model=model,
-        tools=tools,
-        config=ReActAgentConfig(max_steps=config.agent.max_steps),
-    )
+def _build_agent(*, model, config: AppConfig, log_callback=None):
+    return KGAgent(model=model, log_callback=log_callback)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -161,23 +113,13 @@ def _run_single_task_core(
     task_id: str,
     config: AppConfig,
     model=None,
-    tools: ToolRegistry | None = None,
-    fast_model=None,
     log_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
     effective_model = model or build_model_adapter(config)
-    effective_tools = tools or create_default_tool_registry()
-    effective_fast_model = fast_model or build_fast_model_adapter(config)
-    agent = _build_agent(
-        model=effective_model,
-        tools=effective_tools,
-        config=config,
-        fast_model=effective_fast_model,
-        log_callback=log_callback,
-    )
+    agent = _build_agent(model=effective_model, config=config, log_callback=log_callback)
     run_result = agent.run(task)
     return run_result.to_dict()
 
@@ -287,13 +229,12 @@ def run_single_task(
     config: AppConfig,
     run_output_dir: Path,
     model=None,
-    tools: ToolRegistry | None = None,
 ) -> TaskRunArtifacts:
     started_at = perf_counter()
-    if model is None and tools is None:
+    if model is None:
         run_result = _run_single_task_with_timeout(task_id=task_id, config=config)
     else:
-        run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
+        run_result = _run_single_task_core(task_id=task_id, config=config, model=model)
     elapsed = round(perf_counter() - started_at, 3)
     run_result["e2e_elapsed_seconds"] = elapsed
     dataset_root = Path(config.dataset.root_path)
@@ -306,7 +247,6 @@ def run_benchmark(
     *,
     config: AppConfig,
     model=None,
-    tools: ToolRegistry | None = None,
     limit: int | None = None,
     difficulty: str | None = None,
     progress_callback: Callable[[TaskRunArtifacts], None] | None = None,
@@ -323,7 +263,7 @@ def run_benchmark(
     effective_workers = config.run.max_workers
     if effective_workers < 1:
         raise ValueError("max_workers must be at least 1.")
-    if model is not None or tools is not None:
+    if model is not None:
         effective_workers = 1
 
     task_ids = [task.task_id for task in tasks]
@@ -331,7 +271,6 @@ def run_benchmark(
     task_artifacts: list[TaskRunArtifacts]
     if effective_workers == 1:
         shared_model = model or build_model_adapter(config)
-        shared_tools = tools or create_default_tool_registry()
         task_artifacts = []
         for task_id in task_ids:
             artifact = run_single_task(
@@ -339,7 +278,6 @@ def run_benchmark(
                 config=config,
                 run_output_dir=run_output_dir,
                 model=shared_model,
-                tools=shared_tools,
             )
             task_artifacts.append(artifact)
             if progress_callback is not None:

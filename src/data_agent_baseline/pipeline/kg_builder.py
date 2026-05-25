@@ -308,11 +308,26 @@ class KGQueryService:
             role_tag = f" [{t.role}]" if t.role else ""
             col_names = ", ".join(c.name for c in t.columns)
             lines.append(f"{t.name}{role_tag} ({t.row_count} rows): {col_names}")
-        fks = self.kg.all_foreign_keys()[:10]
+        fks = self.kg.all_foreign_keys()
         if fks:
             lines.append("JOINS:")
-            for src, fk in fks:
+            for src, fk in fks[:12]:
                 lines.append(f"  {src}.{fk.column} -> {fk.ref_table}.{fk.ref_column}")
+            # Show transitive paths (A->B->C) for bridge tables
+            fk_graph: dict[str, list[tuple[str, str, str]]] = {}
+            for src, fk in fks:
+                fk_graph.setdefault(src, []).append((fk.column, fk.ref_table, fk.ref_column))
+            paths: list[str] = []
+            for start, edges in fk_graph.items():
+                if len(edges) >= 2:
+                    for col_a, ref_a, ref_col_a in edges:
+                        for col_b, ref_b, ref_col_b in edges:
+                            if ref_a != ref_b:
+                                paths.append(f"  {ref_a} -> {start}({col_a},{col_b}) -> {ref_b}")
+            if paths:
+                lines.append("BRIDGE PATHS (multi-hop):")
+                for p in sorted(set(paths))[:8]:
+                    lines.append(p)
         return "\n".join(lines)
 
     def schema_for_tables(

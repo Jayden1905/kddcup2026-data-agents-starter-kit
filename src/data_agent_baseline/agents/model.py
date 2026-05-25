@@ -56,11 +56,14 @@ class OpenAIModelAdapter:
         if self._client is None:
             from httpx import Timeout
 
-            self._client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.api_base,
-                timeout=Timeout(REQUEST_TIMEOUT, connect=10.0),
-            )
+            kwargs: dict[str, Any] = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+                "timeout": Timeout(REQUEST_TIMEOUT, connect=10.0),
+            }
+            if "services.ai.azure.com" in self.api_base:
+                kwargs["default_headers"] = {"api-key": self.api_key}
+            self._client = OpenAI(**kwargs)
         return self._client
 
     def complete(self, messages: list[ModelMessage], *, thinking: bool = True) -> str:
@@ -75,9 +78,9 @@ class OpenAIModelAdapter:
                 {"role": message.role, "content": message.content}
                 for message in messages
             ],
-            "max_tokens": 4096,
+            "max_completion_tokens": 4096,
         }
-        if self.temperature is not None:
+        if self.temperature is not None and "gpt-5" not in self.model.lower():
             kwargs["temperature"] = self.temperature
         if "qwen" in self.model.lower():
             if "deepinfra" in self.api_base:
@@ -135,7 +138,7 @@ class AzureOpenAIModelAdapter:
         self.api_version = api_version
         self.temperature = temperature
 
-    def complete(self, messages: list[ModelMessage]) -> str:
+    def complete(self, messages: list[ModelMessage], **kwargs) -> str:
         if not self.api_key:
             raise RuntimeError("Missing Azure OpenAI API key in config.agent.api_key.")
 
