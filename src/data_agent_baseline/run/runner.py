@@ -118,6 +118,14 @@ def _run_single_task_core(
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
+    # Clean up stale artifacts from prior runs
+    context_dir = Path(task.context_dir)
+    for stale in context_dir.glob("_consolidated*.db"):
+        stale.unlink(missing_ok=True)
+    stale_log = context_dir / "_agent.log"
+    if stale_log.exists():
+        stale_log.unlink()
+
     effective_model = model or build_model_adapter(config)
     agent = _build_agent(model=effective_model, config=config, log_callback=log_callback)
     run_result = agent.run(task)
@@ -211,6 +219,7 @@ def _write_task_outputs(
         consolidated_db = dataset_root / task_id / "context" / "_consolidated.db"
         if consolidated_db.exists():
             shutil.copy2(consolidated_db, task_output_dir / "consolidated.db")
+            consolidated_db.unlink()
 
     return TaskRunArtifacts(
         task_id=task_id,

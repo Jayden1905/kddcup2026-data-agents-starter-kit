@@ -397,6 +397,61 @@ def _cast_row(row: tuple[str, ...], types: list[str]) -> tuple[Any, ...]:
     return tuple(result)
 
 
+def _detect_pk_column(headers: list[str], rows: list | None = None) -> str | None:
+    """Heuristically detect the primary key column from headers.
+
+    If rows are provided, validates that the candidate column is actually unique
+    (>90% unique values). Returns None if no suitable PK found.
+    """
+    h_lower = [h.strip().lower() for h in headers]
+    candidates: list[str] = []
+    # Exact "id" column
+    if "id" in h_lower:
+        candidates.append(headers[h_lower.index("id")].strip())
+    # First column ending with _id or Id
+    for i, h in enumerate(h_lower):
+        if h.endswith("_id") or h.endswith("id"):
+            col = headers[i].strip()
+            if col not in candidates:
+                candidates.append(col)
+    # Columns named "key", "code", "name" (weaker signal)
+    for pattern in ("key", "code", "name", "identifier"):
+        for i, h in enumerate(h_lower):
+            if h == pattern or h.endswith(f"_{pattern}"):
+                col = headers[i].strip()
+                if col not in candidates:
+                    candidates.append(col)
+
+    if not candidates:
+        candidates.append(headers[0].strip() if headers else "")
+
+    # Validate uniqueness if rows are available
+    if rows and len(rows) > 10:
+        for cand in candidates:
+            idx = next(
+                (i for i, h in enumerate(headers) if h.strip() == cand), None
+            )
+            if idx is None:
+                continue
+            values = [r[idx] for r in rows[:500] if idx < len(r)]
+            if not values:
+                continue
+            unique_ratio = len(set(values)) / len(values)
+            if unique_ratio > 0.9:
+                return cand
+        return None
+
+    return candidates[0] if candidates else None
+
+
+def _get_existing_columns(conn: sqlite3.Connection, table_name: str) -> dict[str, str]:
+    """Get existing columns {name_lower: type} for a table."""
+    cols = {}
+    for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall():
+        cols[row[1].lower()] = row[2] or "TEXT"
+    return cols
+
+
 def _load_csv_into_db(conn: sqlite3.Connection, csv_path: Path, table_name: str) -> bool:
     try:
         with csv_path.open(encoding="utf-8", errors="replace", newline="") as f:
@@ -404,20 +459,45 @@ def _load_csv_into_db(conn: sqlite3.Connection, csv_path: Path, table_name: str)
             headers = next(reader, None)
             if not headers:
                 return False
-            # Read sample rows to infer types
+            headers = [h.strip() for h in headers]
+
+            # Check if table already exists with data — skip to avoid duplicates
+            existing_cols = _get_existing_columns(conn, table_name)
+            if existing_cols:
+                row_count = conn.execute(
+                    f'SELECT COUNT(*) FROM "{table_name}"'
+                ).fetchone()[0]
+                if row_count > 0:
+                    return True
+
             sample_rows: list[list[str]] = []
             all_rows: list[list[str]] = []
             for row in reader:
                 all_rows.append(row)
-                if len(sample_rows) < 50:
+                if len(sample_rows) < 500:
                     sample_rows.append(row)
 
-            col_types = _infer_column_types(sample_rows, len(headers))
-            cols_def = ", ".join(
-                f'"{h.strip()}" {col_types[i]}' for i, h in enumerate(headers)
-            )
-            conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_def})')
+            col_types = _infer_column_types(sample_rows[:50], len(headers))
+            pk_col = _detect_pk_column(headers, sample_rows)
+
+            if not existing_cols:
+                col_defs = []
+                for i, h in enumerate(headers):
+                    pk_suffix = " PRIMARY KEY" if h == pk_col else ""
+                    col_defs.append(f'"{h}" {col_types[i]}{pk_suffix}')
+                conn.execute(
+                    f'CREATE TABLE "{table_name}" ({", ".join(col_defs)})'
+                )
+
+            col_list = ", ".join(f'"{h}"' for h in headers)
             placeholders = ", ".join(["?"] * len(headers))
+            # Use INSERT OR REPLACE only when we have a valid PK
+            insert_verb = "INSERT OR REPLACE" if pk_col else "INSERT"
+            insert_sql = (
+                f'{insert_verb} INTO "{table_name}" ({col_list}) '
+                f'VALUES ({placeholders})'
+            )
+
             batch: list[tuple[Any, ...]] = []
             for row in all_rows:
                 if len(row) == len(headers):
@@ -428,14 +508,10 @@ def _load_csv_into_db(conn: sqlite3.Connection, csv_path: Path, table_name: str)
                     padded = tuple(row) + ("",) * (len(headers) - len(row))
                     batch.append(_cast_row(padded, col_types))
                 if len(batch) >= 1000:
-                    conn.executemany(
-                        f'INSERT INTO "{table_name}" VALUES ({placeholders})', batch
-                    )
+                    conn.executemany(insert_sql, batch)
                     batch.clear()
             if batch:
-                conn.executemany(
-                    f'INSERT INTO "{table_name}" VALUES ({placeholders})', batch
-                )
+                conn.executemany(insert_sql, batch)
         conn.commit()
         return True
     except Exception:
@@ -493,11 +569,37 @@ def _load_json_into_db(conn: sqlite3.Connection, json_path: Path, table_name: st
                     seen.add(k)
 
         col_types = [_infer_json_column_type(records, k) for k in all_keys]
-        cols_def = ", ".join(
-            f'"{all_keys[i]}" {col_types[i]}' for i in range(len(all_keys))
-        )
-        conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_def})')
+        # Build row-like samples for PK validation
+        sample_for_pk = [
+            [str(r.get(k, "")) for k in all_keys] for r in records[:500]
+        ]
+        pk_col = _detect_pk_column(all_keys, sample_for_pk)
+
+        # Check if table already exists with data — skip to avoid duplicates
+        existing_cols = _get_existing_columns(conn, table_name)
+        if existing_cols:
+            row_count = conn.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if row_count > 0:
+                return True
+        else:
+            col_defs = []
+            for i, k in enumerate(all_keys):
+                pk_suffix = " PRIMARY KEY" if k == pk_col else ""
+                col_defs.append(f'"{k}" {col_types[i]}{pk_suffix}')
+            conn.execute(
+                f'CREATE TABLE "{table_name}" ({", ".join(col_defs)})'
+            )
+
+        col_list = ", ".join(f'"{k}"' for k in all_keys)
         placeholders = ", ".join(["?"] * len(all_keys))
+        insert_verb = "INSERT OR REPLACE" if pk_col else "INSERT"
+        insert_sql = (
+            f'{insert_verb} INTO "{table_name}" ({col_list}) '
+            f'VALUES ({placeholders})'
+        )
+
         batch: list[tuple[Any, ...]] = []
         for r in records:
             row_vals: list[Any] = []
@@ -515,21 +617,22 @@ def _load_json_into_db(conn: sqlite3.Connection, json_path: Path, table_name: st
                     row_vals.append(str(val) if val is not None else None)
             batch.append(tuple(row_vals))
             if len(batch) >= 1000:
-                conn.executemany(
-                    f'INSERT INTO "{table_name}" VALUES ({placeholders})', batch
-                )
+                conn.executemany(insert_sql, batch)
                 batch.clear()
         if batch:
-            conn.executemany(
-                f'INSERT INTO "{table_name}" VALUES ({placeholders})', batch
-            )
+            conn.executemany(insert_sql, batch)
         conn.commit()
         return True
     except Exception:
         return False
 
 
-def _attach_sqlite_db(conn: sqlite3.Connection, db_path: Path, alias: str) -> list[str]:
+def _attach_sqlite_db(
+    conn: sqlite3.Connection,
+    db_path: Path,
+    alias: str,
+    existing_tables: set[str] | None = None,
+) -> list[str]:
     try:
         conn.execute(f"ATTACH DATABASE ? AS \"{alias}\"", (str(db_path),))
         tables = conn.execute(
@@ -538,9 +641,21 @@ def _attach_sqlite_db(conn: sqlite3.Connection, db_path: Path, alias: str) -> li
         ).fetchall()
         table_names = []
         for (tbl,) in tables:
-            conn.execute(
-                f'CREATE TABLE IF NOT EXISTS "{tbl}" AS SELECT * FROM "{alias}"."{tbl}"'
-            )
+            if existing_tables and tbl.lower() in existing_tables:
+                # Skip if table already has data to avoid duplicates
+                row_count = conn.execute(
+                    f'SELECT COUNT(*) FROM "{tbl}"'
+                ).fetchone()[0]
+                if row_count == 0:
+                    conn.execute(
+                        f'INSERT OR IGNORE INTO "{tbl}" '
+                        f'SELECT * FROM "{alias}"."{tbl}"'
+                    )
+            else:
+                conn.execute(
+                    f'CREATE TABLE IF NOT EXISTS "{tbl}" '
+                    f'AS SELECT * FROM "{alias}"."{tbl}"'
+                )
             table_names.append(tbl)
         conn.execute(f'DETACH DATABASE "{alias}"')
         conn.commit()
@@ -596,24 +711,25 @@ def consolidate_to_sqlite(context_dir: Path, output_dir: Path | None = None) -> 
     target_dir = output_dir or context_dir
     db_path = target_dir / CONSOLIDATED_DB_NAME
     try:
-        if db_path.exists():
-            db_path.unlink()
-    except OSError:
-        pass
-    try:
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA journal_mode=DELETE")
     except Exception:
         # context_dir is read-only — fall back to /tmp
         import tempfile
         db_path = Path(tempfile.gettempdir()) / f"_consolidated_{context_dir.name}.db"
-        if db_path.exists():
-            db_path.unlink()
         try:
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=DELETE")
         except Exception:
             return None
+
+    # Incremental: skip tables already present (preserves doc-extracted tables)
+    existing_tables = {
+        r[0].lower()
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
 
     loaded_tables: list[str] = []
     try:
@@ -622,18 +738,21 @@ def consolidate_to_sqlite(context_dir: Path, output_dir: Path | None = None) -> 
             table_name = _sanitize_table_name(csv_path.stem)
             if _load_csv_into_db(conn, csv_path, table_name):
                 loaded_tables.append(f"{table_name} (from {rel})")
+                existing_tables.add(table_name.lower())
 
         for json_path in json_files:
             rel = json_path.relative_to(context_dir).as_posix()
             table_name = _sanitize_table_name(json_path.stem)
             if _load_json_into_db(conn, json_path, table_name):
                 loaded_tables.append(f"{table_name} (from {rel})")
+                existing_tables.add(table_name.lower())
 
         for i, existing_db in enumerate(db_files):
             alias = f"attached_{i}"
-            tables = _attach_sqlite_db(conn, existing_db, alias)
+            tables = _attach_sqlite_db(conn, existing_db, alias, existing_tables)
             for t in tables:
                 loaded_tables.append(f"{t} (from {existing_db.name})")
+                existing_tables.add(t.lower())
 
         _coalesce_quantity_nulls(conn)
         conn.close()

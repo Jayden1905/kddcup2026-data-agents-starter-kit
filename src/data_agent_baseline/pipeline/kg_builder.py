@@ -65,7 +65,7 @@ class TableSchema:
 # Property Graph Node Types
 # ---------------------------------------------------------------------------
 
-VALUE_NODE_CARDINALITY_THRESHOLD = 50
+VALUE_NODE_CARDINALITY_THRESHOLD = 500
 VALUE_NODE_MAX_PER_COLUMN = 200
 SEMANTIC_SIMILARITY_THRESHOLD = 0.5
 
@@ -245,6 +245,12 @@ class KnowledgeGraph:
     concept_map: dict[str, str] = field(default_factory=dict)
     # Ontology: "table.column" → {semantic_type, value_vocab, unit, derived_from, hierarchy}
     ontology: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Alias registry: canonical_value → {aliases: [...], table, column}
+    alias_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Business topology: parent_entity → [child_entities] with table/column context
+    business_topology: list[dict[str, Any]] = field(default_factory=list)
+    # Document names loaded into knowledge (searchable via knowledge tool)
+    doc_names: list[str] = field(default_factory=list)
 
     @property
     def tables(self) -> list[TableSchema]:
@@ -504,6 +510,72 @@ def build_kg_from_sqlite(db_path: Path) -> KnowledgeGraph:
         _inferred_fks=inferred_fks,
         graph=graph,
     )
+    return kg
+
+
+def update_kg_with_new_tables(
+    kg: KnowledgeGraph, db_path: Path, existing_table_names: list[str]
+) -> KnowledgeGraph:
+    """Incrementally update a KG with newly added tables (e.g. from doc extraction).
+
+    Only processes tables not already in the graph. Adds nodes, value indexes,
+    FK edges, and semantic edges for the new tables.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    all_tables = _discover_tables(conn)
+    new_tables = [t for t in all_tables if t.name not in existing_table_names]
+
+    if not new_tables:
+        conn.close()
+        return kg
+
+    graph = kg.graph
+
+    # Add TableNodes + ColumnNodes for new tables
+    for table in new_tables:
+        tnode = TableNode(id=table.name, name=table.name, row_count=table.row_count)
+        graph.tables[tnode.id] = tnode
+        graph.has_column[tnode.id] = []
+
+        for col in table.columns:
+            stats = table.col_stats.get(col.name, {})
+            null_ratio = 0.0
+
+            col_node = ColumnNode(
+                id=f"{table.name}.{col.name}",
+                table_id=table.name,
+                name=col.name,
+                sql_type=col.sql_type,
+                is_pk=col.is_pk,
+                is_nullable=col.is_nullable,
+                description=col.description,
+                distinct_count=stats.get("distinct", 0),
+                null_ratio=null_ratio,
+                min_val=stats.get("min"),
+                max_val=stats.get("max"),
+                avg_val=stats.get("avg"),
+            )
+            graph.columns[col_node.id] = col_node
+            graph.has_column[tnode.id].append(col_node.id)
+            graph.column_of[col_node.id] = tnode.id
+
+    # Build value nodes for new tables
+    _build_value_nodes(conn, new_tables, graph)
+
+    # Infer FK edges between new tables and all tables
+    new_fks = _infer_foreign_keys_with_overlap(conn, all_tables, graph)
+
+    # Build semantic edges involving new tables
+    _build_semantic_edges(graph)
+
+    conn.close()
+
+    # Update the KnowledgeGraph facade
+    kg._tables.extend(new_tables)
+    kg._inferred_fks.extend(new_fks)
+
     return kg
 
 
@@ -1964,3 +2036,325 @@ def _build_dimensional_map(kg: KnowledgeGraph) -> None:
         "fact_grain": fact_table.grain_columns,
         "dimensions": dimensions,
     }
+
+
+# ---------------------------------------------------------------------------
+# Alias Registry: map user terms to canonical DB values
+# ---------------------------------------------------------------------------
+
+_ALIAS_PROMPT = """\
+You are a data dictionary expert. Given these distinct values from a database column, \
+generate common aliases/synonyms a user might type when referring to each value.
+
+TABLE: {table}
+COLUMN: {column}
+CONTEXT: {context}
+
+VALUES:
+{values}
+
+For each value, produce aliases that users commonly use: abbreviations, full names, \
+informal variants, codes, and natural language references.
+
+Return ONLY a JSON object (no markdown fences):
+{{"aliases": {{
+  "<canonical_value>": ["<alias1>", "<alias2>", ...],
+  ...
+}}}}
+
+Rules:
+- Only include values that have non-obvious aliases (skip if the value IS the obvious term)
+- Include: abbreviations ↔ full names, codes ↔ descriptions, informal names
+- Max 5 aliases per value
+- Lowercase all aliases"""
+
+
+def build_alias_registry(
+    kg: KnowledgeGraph,
+    model: "ModelAdapter",
+    db_path: Path,
+    log_fn: Any = None,
+) -> None:
+    """Build alias registry for low-cardinality identifier/category columns.
+
+    Identifies columns where users might use alternative names (machine IDs,
+    product codes, status values, etc.) and generates aliases via LLM.
+    """
+    if not kg or not kg.tables:
+        return
+
+    # Find candidate columns: text columns with 2-50 distinct values
+    # that serve as identifiers or categories (not free text)
+    candidates: list[tuple[TableSchema, Column, list[str]]] = []
+    conn = sqlite3.connect(str(db_path))
+
+    for table in kg.tables:
+        for col in table.columns:
+            stats = table.col_stats.get(col.name, {})
+            distinct = stats.get("distinct", 0)
+            if not (2 <= distinct <= 50):
+                continue
+            if col.sql_type.upper() not in ("TEXT", "VARCHAR", "CHAR", ""):
+                continue
+            # Skip columns that are clearly free-text (high cardinality ratio)
+            if stats.get("cardinality_ratio", 0) > 0.8 and table.row_count > 20:
+                continue
+
+            try:
+                rows = conn.execute(
+                    f'SELECT DISTINCT "{col.name}" FROM "{table.name}" '
+                    f'WHERE "{col.name}" IS NOT NULL AND "{col.name}" != "" '
+                    f'ORDER BY "{col.name}" LIMIT 50'
+                ).fetchall()
+                values = [r[0] for r in rows if r[0]]
+                if len(values) >= 2:
+                    candidates.append((table, col, values))
+            except Exception:
+                pass
+
+    conn.close()
+
+    if not candidates:
+        if log_fn:
+            log_fn("alias_registry", "0 candidate columns")
+        return
+
+    # Batch candidates into a single LLM call (group by semantic relevance)
+    # For efficiency, process max 5 columns per call
+    all_aliases: dict[str, dict[str, Any]] = {}
+    batch_size = 5
+
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i:i + batch_size]
+        values_section = ""
+        batch_context = []
+        for table, col, values in batch:
+            values_section += f"\n[{table.name}.{col.name}]: {', '.join(str(v) for v in values[:20])}\n"
+            batch_context.append(f"{table.name}.{col.name} ({table.role})")
+
+        prompt = _ALIAS_PROMPT.format(
+            table=", ".join(t.name for t, _, _ in batch),
+            column=", ".join(c.name for _, c, _ in batch),
+            context="; ".join(batch_context),
+            values=values_section,
+        )
+
+        try:
+            response = model.complete([
+                ModelMessage(role="user", content=prompt)
+            ])
+            parsed = _parse_json_response(response)
+            if parsed and "aliases" in parsed:
+                alias_map = parsed["aliases"]
+                # Map back to table.column context
+                for canonical, aliases in alias_map.items():
+                    if not isinstance(aliases, list):
+                        continue
+                    # Find which table.column this canonical value belongs to
+                    for table, col, values in batch:
+                        if canonical in values or str(canonical) in [str(v) for v in values]:
+                            all_aliases[canonical] = {
+                                "aliases": [a.lower() for a in aliases[:5]],
+                                "table": table.name,
+                                "column": col.name,
+                            }
+                            break
+        except Exception:
+            pass
+
+    kg.alias_registry = all_aliases
+    if log_fn:
+        log_fn("alias_registry", f"{len(all_aliases)} values with aliases from {len(candidates)} columns")
+
+
+# ---------------------------------------------------------------------------
+# Business Topology: parent-child hierarchies from FK + grouping patterns
+# ---------------------------------------------------------------------------
+
+_TOPOLOGY_PROMPT = """\
+You are a business domain expert. Given these tables and their relationships, \
+identify parent-child hierarchies (containment relationships) where a higher-level \
+entity groups or contains lower-level entities.
+
+SCHEMA:
+{schema}
+
+RELATIONSHIPS (FK):
+{relationships}
+
+SAMPLE DATA:
+{samples}
+
+Identify hierarchies like:
+- Line → Machine (a production line contains multiple machines)
+- Department → Employee
+- Region → Store → Product
+- Category → Subcategory → Item
+
+Return ONLY a JSON object (no markdown fences):
+{{"hierarchies": [
+  {{
+    "parent_table": "table_name",
+    "parent_column": "column_name",
+    "child_table": "table_name",
+    "child_column": "column_name",
+    "relationship": "contains/groups/manages",
+    "description": "Line contains machines"
+  }}
+]}}
+
+Rules:
+- Only include REAL containment hierarchies (not just any FK relationship)
+- The parent must group/contain the children (1:N containment, not just a reference)
+- If no hierarchies exist, return {{"hierarchies": []}}"""
+
+
+def build_business_topology(
+    kg: KnowledgeGraph,
+    model: "ModelAdapter",
+    db_path: Path,
+    log_fn: Any = None,
+) -> None:
+    """Detect parent-child business hierarchies and expand groupings.
+
+    After identifying hierarchies (e.g., Line→Machine), pre-computes the
+    membership mapping so the agent can expand "Line 1" to its machine IDs.
+    """
+    if not kg or not kg.tables or len(kg.tables) < 2:
+        return
+
+    # Build schema description for LLM
+    schema_lines = []
+    for t in kg.tables:
+        cols = ", ".join(f"{c.name}({c.sql_type})" for c in t.columns[:10])
+        schema_lines.append(f"{t.name} [{t.role}, {t.row_count} rows]: {cols}")
+
+    relationships = []
+    for src, fk in kg.all_foreign_keys():
+        relationships.append(f"{src}.{fk.column} → {fk.ref_table}.{fk.ref_column}")
+
+    # Get sample data for dimension/bridge tables (where groupings live)
+    conn = sqlite3.connect(str(db_path))
+    sample_lines = []
+    for t in kg.tables:
+        if t.role in ("dimension", "bridge") and t.row_count <= 200:
+            try:
+                cols_to_show = [c.name for c in t.columns[:5]]
+                col_str = ", ".join(f'"{c}"' for c in cols_to_show)
+                rows = conn.execute(
+                    f'SELECT {col_str} FROM "{t.name}" LIMIT 5'
+                ).fetchall()
+                if rows:
+                    sample_lines.append(f"[{t.name}] columns: {cols_to_show}")
+                    for r in rows[:3]:
+                        sample_lines.append(f"  {list(r)}")
+            except Exception:
+                pass
+    conn.close()
+
+    if not relationships:
+        if log_fn:
+            log_fn("business_topology", "no FKs, skipping")
+        return
+
+    prompt = _TOPOLOGY_PROMPT.format(
+        schema="\n".join(schema_lines),
+        relationships="\n".join(relationships),
+        samples="\n".join(sample_lines) if sample_lines else "(no dimension samples)",
+    )
+
+    try:
+        response = model.complete([
+            ModelMessage(role="user", content=prompt)
+        ])
+        parsed = _parse_json_response(response)
+        if not parsed or "hierarchies" not in parsed:
+            if log_fn:
+                log_fn("business_topology", "no hierarchies detected")
+            return
+
+        hierarchies = parsed["hierarchies"]
+        if not isinstance(hierarchies, list):
+            return
+
+        # For each hierarchy, pre-compute the membership mapping
+        conn = sqlite3.connect(str(db_path))
+        enriched: list[dict[str, Any]] = []
+
+        for h in hierarchies:
+            if not isinstance(h, dict):
+                continue
+            parent_table = h.get("parent_table", "")
+            parent_col = h.get("parent_column", "")
+            child_table = h.get("child_table", "")
+            child_col = h.get("child_column", "")
+
+            if not all([parent_table, parent_col, child_table, child_col]):
+                continue
+
+            # Validate tables exist
+            if not kg.get_table(parent_table) or not kg.get_table(child_table):
+                continue
+
+            # Build membership: parent_value → [child_values]
+            membership: dict[str, list[str]] = {}
+            try:
+                if parent_table == child_table:
+                    # Self-referencing hierarchy (e.g., category → subcategory in same table)
+                    rows = conn.execute(
+                        f'SELECT DISTINCT "{parent_col}", "{child_col}" '
+                        f'FROM "{parent_table}" '
+                        f'WHERE "{parent_col}" IS NOT NULL AND "{child_col}" IS NOT NULL'
+                    ).fetchall()
+                    for parent_val, child_val in rows:
+                        membership.setdefault(str(parent_val), []).append(str(child_val))
+                else:
+                    # Cross-table: join parent to child via FK
+                    # Find the FK linking them
+                    join_col = None
+                    for src, fk in kg.all_foreign_keys():
+                        if src == child_table and fk.ref_table == parent_table:
+                            join_col = (fk.column, fk.ref_column)
+                            break
+                        if src == parent_table and fk.ref_table == child_table:
+                            join_col = (fk.ref_column, fk.column)
+                            break
+                    if join_col:
+                        child_fk, parent_pk = join_col
+                        rows = conn.execute(
+                            f'SELECT DISTINCT p."{parent_col}", c."{child_col}" '
+                            f'FROM "{parent_table}" p '
+                            f'JOIN "{child_table}" c ON c."{child_fk}" = p."{parent_pk}" '
+                            f'WHERE p."{parent_col}" IS NOT NULL '
+                            f'AND c."{child_col}" IS NOT NULL '
+                            f'LIMIT 500'
+                        ).fetchall()
+                        for parent_val, child_val in rows:
+                            membership.setdefault(str(parent_val), []).append(str(child_val))
+            except Exception:
+                pass
+
+            if membership:
+                enriched.append({
+                    "parent_table": parent_table,
+                    "parent_column": parent_col,
+                    "child_table": child_table,
+                    "child_column": child_col,
+                    "relationship": h.get("relationship", "contains"),
+                    "description": h.get("description", ""),
+                    "membership": membership,
+                })
+
+        conn.close()
+        kg.business_topology = enriched
+
+        if log_fn:
+            total_mappings = sum(len(e["membership"]) for e in enriched)
+            log_fn(
+                "business_topology",
+                f"{len(enriched)} hierarchies, {total_mappings} parent→child mappings"
+            )
+
+    except Exception as e:
+        if log_fn:
+            log_fn("business_topology_error", str(e))

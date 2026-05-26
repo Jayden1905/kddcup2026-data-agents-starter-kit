@@ -63,6 +63,56 @@ def tool_overview(kg: KnowledgeGraph, question: str) -> str:
         for src, fk in fks:
             lines.append(f"  {src}.{fk.column} -> {fk.ref_table}.{fk.ref_column}")
 
+    # Surface relevant aliases from the question
+    if kg.alias_registry:
+        alias_hits = []
+        for canonical, info in kg.alias_registry.items():
+            aliases = info.get("aliases", [])
+            all_terms = [canonical.lower()] + aliases
+            if any(t in q_terms or any(t in a for a in all_terms) for t in q_terms):
+                alias_hits.append(
+                    f"  '{canonical}' ({info['table']}.{info['column']})"
+                    f" aliases: {aliases[:3]}"
+                )
+        if alias_hits:
+            lines.append("\nALIAS HINTS (use resolve tool for full mapping):")
+            lines.extend(alias_hits[:5])
+
+    # Surface relevant topology expansions
+    if kg.business_topology:
+        topo_hits = []
+        for h in kg.business_topology:
+            for parent_val in h.get("membership", {}):
+                if any(t in parent_val.lower() for t in q_terms if len(t) > 2):
+                    children = h["membership"][parent_val]
+                    topo_hits.append(
+                        f"  '{parent_val}' → {len(children)} "
+                        f"{h['child_column']}s in {h['child_table']}"
+                    )
+        if topo_hits:
+            lines.append("\nTOPOLOGY (use resolve tool to expand):")
+            lines.extend(topo_hits[:5])
+
+    # Show available documents with preview
+    if kg.doc_names:
+        lines.append(
+            f"\nDOCUMENTS (execute_python to parse/extract): "
+            f"{', '.join(kg.doc_names)}"
+        )
+        if kg.tables:
+            lines.append(
+                "  NOTE: Documents use IDs from the SQL tables above to link "
+                "records.\n"
+                "  WORKFLOW: run_sql to get IDs → execute_python to search "
+                "docs for those IDs."
+            )
+        lines.append(
+            "  TIP: docs variable has full text. Explore with:\n"
+            "    print(docs[:3000])  — see structure\n"
+            "    print([l for l in docs.split('\\n') if 'ID_HERE' in l][:10])  "
+            "— find linked records"
+        )
+
     return "\n".join(lines)
 
 
@@ -306,7 +356,20 @@ def _tool_schema_inner(
     ts = kg.get_table(table)
     if not ts:
         available = [t.name for t in kg.tables]
-        return f"Table '{table}' not found. Available: {available}", []
+        msg = f"Table '{table}' not found. Available: {available}"
+        # If a doc with similar name exists, hint to use execute_python
+        if kg.doc_names:
+            table_lower = table.lower()
+            for doc_name in kg.doc_names:
+                if table_lower in doc_name.lower() or doc_name.lower() in table_lower:
+                    msg += (
+                        f"\n\nNOTE: Document '{doc_name}' exists and may contain "
+                        f"this data as prose. Use execute_python to parse it:\n"
+                        f"  lines = [l for l in docs.split('\\n') if l.strip()]\n"
+                        f"  print(lines[:30])  # see structure first"
+                    )
+                    break
+        return msg, []
 
     lines = [f"TABLE: {table} (role={ts.role}, {ts.row_count} rows)"]
 
@@ -532,27 +595,132 @@ def tool_find_value(kg: KnowledgeGraph, value: str, db_path: Path) -> str:
     if not results:
         try:
             conn = sqlite3.connect(str(db_path), timeout=10)
+            like_pattern = f"%{value}%"
             for t in kg.tables:
                 for c in t.columns:
                     if c.sql_type.upper() not in ("TEXT", "VARCHAR", "NVARCHAR"):
                         continue
                     cur = conn.execute(
                         f'SELECT COUNT(*) FROM "{t.name}" '
-                        f'WHERE "{c.name}" = ? COLLATE NOCASE',
-                        (value,),
+                        f'WHERE "{c.name}" LIKE ? COLLATE NOCASE',
+                        (like_pattern,),
                     )
                     cnt = cur.fetchone()[0]
                     if cnt > 0:
                         results.append(
-                            f'  "{t.name}"."{c.name}" = \'{value}\' ({cnt} rows)'
+                            f'  "{t.name}"."{c.name}" contains \'{value}\' ({cnt} rows)'
                         )
             conn.close()
         except Exception:
             pass
 
     if not results:
-        return f"Value '{value}' not found in any table."
+        msg = f"Value '{value}' not found in any table."
+        if kg.doc_names:
+            msg += (
+                f"\nDocuments available: {kg.doc_names}. "
+                f"The value may exist in document text. "
+                f"Use execute_python to search:\n"
+                f"  print([l for l in docs.split('\\n') if '{value}' in l][:10])"
+            )
+        return msg
     return f"VALUE SEARCH: '{value}'\n" + "\n".join(results)
+
+
+def tool_resolve(kg: KnowledgeGraph, term: str, db_path: Path) -> str:
+    """Resolve a user term to canonical DB value(s) using alias registry and topology.
+
+    Handles:
+    1. Alias resolution: "injection molding machine 1" → "IM-M1"
+    2. Topology expansion: "Line 1" → [machine IDs belonging to Line 1]
+    """
+    term_lower = term.lower().strip()
+    results: list[str] = []
+
+    # 1. Check alias registry
+    if kg.alias_registry:
+        for canonical, info in kg.alias_registry.items():
+            aliases = info.get("aliases", [])
+            # Match: term matches an alias, or canonical matches term
+            if (term_lower in aliases
+                    or term_lower == canonical.lower()
+                    or any(term_lower in a for a in aliases)
+                    or any(a in term_lower for a in aliases if len(a) > 3)):
+                results.append(
+                    f"ALIAS MATCH: '{term}' → canonical value '{canonical}' "
+                    f"in {info['table']}.{info['column']}"
+                )
+                results.append(f"  Known aliases: {aliases}")
+                results.append(
+                    f"  USE: WHERE \"{info['column']}\" = '{canonical}'"
+                )
+
+    # 2. Check business topology (expand parent → children)
+    if kg.business_topology:
+        for hierarchy in kg.business_topology:
+            membership = hierarchy.get("membership", {})
+            parent_col = hierarchy["parent_column"]
+            child_table = hierarchy["child_table"]
+            child_col = hierarchy["child_column"]
+            description = hierarchy.get("description", "")
+
+            for parent_val, children in membership.items():
+                if (term_lower == parent_val.lower()
+                        or term_lower in parent_val.lower()
+                        or parent_val.lower() in term_lower):
+                    results.append(
+                        f"TOPOLOGY EXPANSION: '{term}' → '{parent_val}' "
+                        f"({description})"
+                    )
+                    results.append(
+                        f"  Contains {len(children)} children in "
+                        f"{child_table}.{child_col}: {children[:15]}"
+                    )
+                    if len(children) <= 20:
+                        child_list = ", ".join(f"'{c}'" for c in children)
+                        results.append(
+                            f"  USE: WHERE \"{child_col}\" IN ({child_list})"
+                        )
+                    else:
+                        results.append(
+                            f"  USE: JOIN with parent table on {parent_col}"
+                        )
+
+    # 3. Fallback: fuzzy search in sample values
+    if not results:
+        for t in kg.tables:
+            for col_name, samples in t.sample_values.items():
+                for val in samples:
+                    val_str = str(val).lower()
+                    if (term_lower in val_str or val_str in term_lower
+                            or _fuzzy_match(term_lower, val_str)):
+                        results.append(
+                            f"FUZZY MATCH: '{term}' ≈ '{val}' in "
+                            f"{t.name}.{col_name}"
+                        )
+                        results.append(
+                            f"  USE: WHERE \"{col_name}\" = '{val}'"
+                        )
+
+    if not results:
+        return (
+            f"No resolution found for '{term}'. Try:\n"
+            f"  - find_value to search DB content directly\n"
+            f"  - schema on the relevant table to see actual values"
+        )
+
+    return f"RESOLVE: '{term}'\n" + "\n".join(results)
+
+
+def _fuzzy_match(a: str, b: str) -> bool:
+    """Simple fuzzy matching: shared token overlap > 50%."""
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    if not tokens_a or not tokens_b:
+        return False
+    overlap = tokens_a & tokens_b
+    shorter = min(len(tokens_a), len(tokens_b))
+    return len(overlap) / shorter > 0.5 if shorter > 0 else False
 
 
 def tool_knowledge(knowledge_text: str, query: str) -> str:
@@ -575,7 +743,121 @@ def tool_knowledge(knowledge_text: str, query: str) -> str:
         return f"No knowledge found matching '{query}'. Full knowledge:\n{knowledge_text[:2000]}"
 
     results = [para for _, para in scored[:5]]
-    return "\n\n".join(results)
+    output = "\n\n".join(results)
+
+    # If many paragraphs match, hint that execute_python may be better
+    if len(scored) > 20:
+        output += (
+            f"\n\n[NOTE: {len(scored)} paragraphs match this query. "
+            f"If you need to filter/aggregate across many records in the "
+            f"documents, use execute_python with regex to parse the full "
+            f"text — it's available as `docs` variable.]"
+        )
+
+    return output
+
+
+def tool_distribution(db_path: Path, table: str, column: str) -> str:
+    """Analyze data distribution for a numeric column.
+
+    Returns: min, max, avg, median, stddev, percentiles (10th, 25th, 75th, 90th),
+    and suggested normal/abnormal thresholds based on the actual data.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        conn.execute("PRAGMA busy_timeout = 10000")
+
+        # Basic stats
+        cursor = conn.execute(
+            f'SELECT COUNT("{column}"), MIN("{column}"), MAX("{column}"), '
+            f'AVG("{column}") FROM "{table}" '
+            f'WHERE "{column}" IS NOT NULL AND "{column}" != \'\''
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            conn.close()
+            return f"No non-null values found for {table}.{column}"
+
+        count, val_min, val_max, val_avg = row
+
+        # Check if numeric
+        try:
+            float(val_min)
+            float(val_max)
+        except (ValueError, TypeError):
+            conn.close()
+            return (
+                f"{table}.{column}: not numeric (min='{val_min}', max='{val_max}'). "
+                f"Use run_sql with SELECT DISTINCT to see categorical values."
+            )
+
+        # Get all values sorted for percentile calculation
+        cursor = conn.execute(
+            f'SELECT CAST("{column}" AS REAL) FROM "{table}" '
+            f'WHERE "{column}" IS NOT NULL AND "{column}" != \'\' '
+            f'ORDER BY CAST("{column}" AS REAL)'
+        )
+        values = [r[0] for r in cursor.fetchall() if r[0] is not None]
+        conn.close()
+
+        if not values:
+            return f"No numeric values for {table}.{column}"
+
+        n = len(values)
+
+        def percentile(pct: float) -> float:
+            idx = int(n * pct / 100)
+            idx = max(0, min(idx, n - 1))
+            return values[idx]
+
+        p10 = percentile(10)
+        p25 = percentile(25)
+        p50 = percentile(50)
+        p75 = percentile(75)
+        p90 = percentile(90)
+        iqr = p75 - p25
+
+        lines = [
+            f"DISTRIBUTION: {table}.{column} ({n} non-null values)",
+            f"  Range: [{val_min}, {val_max}]",
+            f"  Mean: {val_avg:.2f}, Median: {p50:.2f}",
+            f"  Percentiles: P10={p10:.2f}, P25={p25:.2f}, "
+            f"P75={p75:.2f}, P90={p90:.2f}",
+            f"  IQR: {iqr:.2f} (P75 - P25)",
+            "",
+            "STATISTICAL PERCENTILES (NOT medical reference ranges):",
+            f"  P10-P90 range: [{p10:.2f}, {p90:.2f}]",
+            f"  P25-P75 range: [{p25:.2f}, {p75:.2f}]",
+            "",
+            "NOTE: For medical/clinical data, use standard reference ranges "
+            "(e.g., WBC 3.5-10.5, PLT 100-400, FG 150-400 mg/dL) instead of "
+            "these percentiles. Percentiles only describe this dataset's "
+            "distribution, NOT what is medically normal/abnormal.",
+        ]
+
+        # Count how many fall outside P10-P90
+        n_abnormal = sum(1 for v in values if v < p10 or v > p90)
+        lines.append(
+            f"  Values outside P10-P90: {n_abnormal}/{n} ({n_abnormal*100/n:.1f}%)"
+        )
+
+        # Histogram (5 buckets)
+        bucket_size = (float(val_max) - float(val_min)) / 5
+        if bucket_size > 0:
+            lines.append("")
+            lines.append("HISTOGRAM (5 buckets):")
+            for i in range(5):
+                lo = float(val_min) + i * bucket_size
+                hi = lo + bucket_size
+                cnt = sum(1 for v in values if lo <= v < hi) if i < 4 else \
+                    sum(1 for v in values if lo <= v <= float(val_max))
+                bar = "#" * min(30, int(cnt * 30 / n)) if n > 0 else ""
+                lines.append(f"  [{lo:.1f}-{hi:.1f}]: {cnt} {bar}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"ERROR analyzing {table}.{column}: {str(e)[:100]}"
 
 
 def tool_run_sql(db_path: Path, sql: str) -> tuple[str, dict[str, Any] | None]:
@@ -613,6 +895,53 @@ def _execute_sql(db_path: Path, sql: str) -> dict[str, Any] | str | None:
         return {"columns": columns, "rows": rows}
     except Exception as e:
         return str(e)
+
+
+def tool_execute_python(code: str, knowledge_text: str, db_path: Path) -> str:
+    """Execute Python code with access to doc text and DB path.
+
+    The code runs in a restricted namespace with:
+      - `docs`: the full knowledge/doc text (string)
+      - `db_path`: path to the SQLite database (string)
+      - `re`, `json`, `sqlite3`, `collections` pre-imported
+      - `print()` output is captured and returned
+
+    Returns stdout output (max 3000 chars) or error message.
+    """
+    import collections
+    import io
+    import json as json_mod
+    import re as re_mod
+    import contextlib
+
+    namespace = {
+        "docs": knowledge_text,
+        "db_path": str(db_path),
+        "re": re_mod,
+        "json": json_mod,
+        "sqlite3": sqlite3,
+        "collections": collections,
+        "Path": Path,
+    }
+
+    stdout_capture = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout_capture):
+            exec(compile(code, "<agent_python>", "exec"), namespace)  # noqa: S102
+    except Exception as e:
+        error_output = stdout_capture.getvalue()
+        error_msg = f"ERROR: {type(e).__name__}: {e}"
+        if error_output:
+            return f"{error_output}\n{error_msg}"
+        return error_msg
+
+    output = stdout_capture.getvalue()
+    if not output:
+        if "result" in namespace:
+            output = str(namespace["result"])
+    if len(output) > 3000:
+        output = output[:3000] + "\n... (truncated)"
+    return output or "(no output)"
 
 
 def _infer_cardinality(

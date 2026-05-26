@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from data_agent_baseline.pipeline.context_scanner import scan_context
 from data_agent_baseline.pipeline.kg_builder import (
     KGQueryService,
     KnowledgeGraph,
+    build_alias_registry,
+    build_business_topology,
     build_kg_from_sqlite,
     discover_joins_with_llm,
     profile_schema,
@@ -27,10 +30,13 @@ from data_agent_baseline.pipeline.kg_builder import (
 from data_agent_baseline.tools.kg_tools import (
     detect_ambiguities,
     format_resolution_prompt,
+    tool_distribution,
+    tool_execute_python,
     tool_find_value,
     tool_knowledge,
     tool_ontology,
     tool_overview,
+    tool_resolve,
     tool_run_sql,
     tool_schema,
     tool_topology,
@@ -86,12 +92,26 @@ ontology(column)
   FORMAT: {"action": "ontology", "column": "table.column", "reasoning": "why"}
 
 knowledge(query)
-  INTENT: Search domain knowledge for definitions, thresholds, formulas.
-  Use when the question contains domain-specific terms or abbreviations.
-  PARAMS: query — search terms related to the domain concept
-  RETURNS: Relevant definitions, thresholds, value mappings. May include example SQL (treat as hints only).
+  INTENT: Search domain knowledge for definitions, thresholds, formulas, \
+ID-to-name mappings, and schema descriptions.
+  Use for: column meanings, valid value ranges, metric formulas, entity lookups.
+  NOT for: filtering/aggregating many records — use execute_python for that.
+  PARAMS: query — search terms, IDs, or values to look up
+  RETURNS: Relevant paragraphs matching the query.
   ERRORS: Returns empty if no knowledge matches — proceed without it.
   FORMAT: {"action": "knowledge", "query": "search terms", "reasoning": "why"}
+
+distribution(table, column)
+  INTENT: Get the statistical distribution of a numeric column — percentiles, \
+histogram, and suggested normal/abnormal thresholds from the actual data.
+  Use when the question mentions "normal", "abnormal", "high", or "low" and \
+knowledge did not provide an explicit threshold.
+  PARAMS: table — exact table name from overview, column — exact column name
+  RETURNS: Count, min, max, mean, median, percentiles (P10/P25/P75/P90), IQR, \
+suggested normal/abnormal cutoffs, histogram with 5 buckets.
+  ERRORS: Returns "not numeric" if column contains text — use run_sql with \
+SELECT DISTINCT instead. Returns "not found" if table/column doesn't exist.
+  FORMAT: {"action": "distribution", "table": "TableName", "column": "ColName", "reasoning": "why"}
 
 find_value(value)
   INTENT: Search the knowledge graph for which tables/columns contain a value.
@@ -100,6 +120,17 @@ find_value(value)
   RETURNS: Matching table.column pairs with row counts and related tables via JOINs.
   ERRORS: Returns "not found" if value doesn't exist anywhere.
   FORMAT: {"action": "find_value", "value": "search term", "reasoning": "why"}
+
+resolve(term)
+  INTENT: Resolve a user-facing name/term to its canonical DB value, or expand a \
+group entity to its member IDs.
+  Use when the question references an entity by informal name, abbreviation, or \
+a higher-level group (e.g. "Line 1", "injection molding machine", "M1").
+  PARAMS: term — the user's term to resolve (as it appears in the question)
+  RETURNS: Canonical DB value with table.column location and SQL WHERE clause. \
+For group entities, returns the list of child IDs with an IN clause.
+  ERRORS: Returns "not found" if no alias or topology match — try find_value instead.
+  FORMAT: {"action": "resolve", "term": "user term", "reasoning": "why"}
 
 run_sql(sql)
   INTENT: Execute exploratory SQL to check values, verify formats, test filters.
@@ -121,6 +152,21 @@ answer(sql)
   RETURNS: Result is used as the answer — ensure it matches the question.
   ERRORS: Returns error if 0 rows — go back to run_sql to investigate.
   FORMAT: {"action": "answer", "sql": "SELECT ...", "reasoning": "why"}
+
+execute_python(code)
+  INTENT: Run Python code to parse/extract data from source documents or \
+perform calculations not possible in SQL alone.
+  Use when data lives in documents (not SQL tables) and you need to extract \
+structured records, parse prose, or compute values from text.
+  PREREQUISITE: You must run_sql first to get IDs before searching documents.
+  PARAMS: code — Python code. Available variables:
+    - `docs` (str): full text of all source documents
+    - `db_path` (str): path to SQLite database
+    - `re`, `json`, `sqlite3`, `collections` are pre-imported
+    Print your results — stdout is captured.
+  RETURNS: Stdout output (max 3000 chars).
+  ERRORS: Returns error with traceback if code fails.
+  FORMAT: {"action": "execute_python", "code": "...", "reasoning": "why"}
 
 == SQL RULES ==
 - Double-quote all identifiers: "Table"."Column"
@@ -151,6 +197,31 @@ This is mandatory — do NOT skip the division.
 with Avg, Sum, Total, Count, Num, etc.) already store computed values per row. \
 Filter them with WHERE — do NOT re-aggregate with GROUP BY HAVING. \
 HAVING is only needed when computing a new aggregate from raw data at query time.
+- "Average number of X that Y have": use CAST(COUNT(X) AS REAL) / COUNT(DISTINCT Y). \
+Do NOT use AVG(subquery) which double-counts when relationships are many-to-many.
+
+== THRESHOLD RULES ==
+- When the question mentions "normal"/"abnormal"/"high"/"low" for a numeric column:
+  1. FIRST check knowledge tool for an explicit threshold.
+  2. If knowledge has a threshold or reference range, use it exactly.
+  3. If knowledge has NO threshold, use standard medical/domain reference ranges \
+from your training data (e.g., WBC normal: 3.5-10.5 x10^3/µL, \
+Fibrinogen normal: 150-400 mg/dL, PLT normal: 100-400 x10^3/µL). \
+The data may use different units — that's OK, apply the standard definition. \
+If ALL values fall outside a standard range, they are ALL abnormal.
+  4. Only fall back to distribution percentiles (P10-P90) if NO standard \
+reference range exists for the metric in question.
+- "How many patients" means COUNT(DISTINCT patient_id), NOT COUNT(*) of rows. \
+One patient may have multiple records (lab tests, visits). Always use \
+COUNT(DISTINCT) on the grain/PK column when counting entities across fact tables.
+
+== FOREIGN KEY RESOLUTION ==
+- If a value looks like an internal ID/code rather than a human-readable answer, \
+use the knowledge tool to resolve it before returning it as the answer.
+
+== DOCUMENT CROSS-REFERENCING ==
+Documents reference records by internal IDs from SQL tables, not human names. \
+Get IDs from SQL first, then search docs for those IDs via execute_python.
 
 == PRIORITY ==
 1. [Intent] → AUTHORITATIVE. Your final SQL MUST include ALL parts of the intent:
@@ -300,7 +371,6 @@ def _check_column_resolution(
         # Check if the column is qualified with a DIFFERENT table/alias
         # Look for pattern: other_table."col" or other_alias."col"
         # where other != correct_table
-        import re
 
         # Find table.col or alias.col patterns in SELECT
         pattern = r'(\w+)\s*\.\s*"?' + re.escape(col_lower) + r'"?'
@@ -325,6 +395,135 @@ def _check_column_resolution(
             )
 
     return None
+
+
+def _find_outer_where(sql_upper: str) -> str | None:
+    """Extract the WHERE clause of the outermost query, ignoring subqueries."""
+    depth = 0
+    i = 0
+    where_start = -1
+    while i < len(sql_upper):
+        if sql_upper[i] == "(":
+            depth += 1
+        elif sql_upper[i] == ")":
+            depth -= 1
+        elif depth == 0 and sql_upper[i:i + 7] == " WHERE ":
+            where_start = i + 7
+            break
+        i += 1
+
+    if where_start == -1:
+        return None
+
+    # Find the end: next top-level ORDER BY / LIMIT / GROUP BY / HAVING
+    end = len(sql_upper)
+    depth = 0
+    i = where_start
+    while i < len(sql_upper):
+        if sql_upper[i] == "(":
+            depth += 1
+        elif sql_upper[i] == ")":
+            depth -= 1
+        elif depth == 0:
+            for kw in (" ORDER BY ", " LIMIT ", " GROUP BY ", " HAVING "):
+                if sql_upper[i:i + len(kw)] == kw:
+                    end = i
+                    break
+            if end != len(sql_upper):
+                break
+        i += 1
+
+    return sql_upper[where_start:end].strip() or None
+
+
+def _split_outer_and(where_clause: str) -> list[str]:
+    """Split a WHERE clause by AND at depth 0 only."""
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    i = 0
+    while i < len(where_clause):
+        if where_clause[i] == "(":
+            depth += 1
+            current += where_clause[i]
+        elif where_clause[i] == ")":
+            depth -= 1
+            current += where_clause[i]
+        elif depth == 0 and where_clause[i:i + 5] == " AND ":
+            parts.append(current.strip())
+            current = ""
+            i += 5
+            continue
+        else:
+            current += where_clause[i]
+        i += 1
+    if current.strip():
+        parts.append(current.strip())
+    return [p for p in parts if p]
+
+
+def _check_unverified_filter(
+    sql: str, verified_sql: str | None, failed: list[str]
+) -> str | None:
+    """Reject answer if it introduces WHERE conditions not tested via run_sql.
+
+    Checks both verified_sql (returned rows) and failed queries (returned 0 rows)
+    since both represent conditions the agent has already tested.
+    """
+    if not verified_sql and not failed:
+        return None
+
+    sql_upper = sql.upper()
+
+    # Extract outer WHERE clause only
+    answer_where = _find_outer_where(sql_upper)
+    if not answer_where:
+        return None
+
+    # Build pool of all tested conditions (from verified + failed queries)
+    tested_pool = ""
+    if verified_sql:
+        vw = _find_outer_where(verified_sql.upper())
+        if vw:
+            tested_pool += " " + vw
+
+    for entry in failed:
+        entry_upper = entry.upper()
+        # failed entries have " → reason" appended
+        arrow_pos = entry_upper.find(" →")
+        clean = entry_upper[:arrow_pos] if arrow_pos != -1 else entry_upper
+        fw = _find_outer_where(clean)
+        if fw:
+            tested_pool += " " + fw
+
+    if not tested_pool.strip():
+        return None
+
+    # Split into individual conditions by AND (respecting parens)
+    answer_conds = _split_outer_and(answer_where)
+
+    # Normalize: strip COLLATE NOCASE for comparison
+    def _strip_collate(s: str) -> str:
+        return s.replace(" COLLATE NOCASE", "").replace("COLLATE NOCASE", "")
+
+    tested_normalized = _strip_collate(tested_pool)
+
+    # Check each answer condition — is it present in any tested query?
+    new_conds = []
+    for cond in answer_conds:
+        cond_normalized = _strip_collate(cond)
+        if cond_normalized not in tested_normalized and cond not in tested_pool:
+            new_conds.append(cond)
+
+    if not new_conds:
+        return None
+
+    return (
+        f"UNVERIFIED FILTER: Your answer SQL introduces conditions not tested "
+        f"via run_sql: {', '.join(new_conds)}. "
+        f"Test your complete WHERE clause with run_sql first, then submit the "
+        f"same query as your answer."
+    )
 
 
 def _check_vacuous_filter(sql: str, db_path: Path) -> str | None:
@@ -573,9 +772,31 @@ def _check_cross_join(sql: str) -> str | None:
     upper = sql.upper()
     if "COUNT(" not in upper and "SUM(" not in upper:
         return None
-    from_idx = upper.find("FROM")
-    where_idx = upper.find("WHERE")
-    if from_idx < 0 or where_idx < 0:
+    # Find outer FROM: first FROM at depth 0
+    depth = 0
+    from_idx = -1
+    for i in range(len(upper)):
+        if upper[i] == "(":
+            depth += 1
+        elif upper[i] == ")":
+            depth -= 1
+        elif depth == 0 and upper[i:i + 5] == "FROM ":
+            from_idx = i
+            break
+    if from_idx < 0:
+        return None
+    # Find outer WHERE at depth 0 after FROM
+    where_idx = -1
+    depth = 0
+    for i in range(from_idx + 5, len(upper)):
+        if upper[i] == "(":
+            depth += 1
+        elif upper[i] == ")":
+            depth -= 1
+        elif depth == 0 and upper[i:i + 7] == " WHERE ":
+            where_idx = i
+            break
+    if where_idx < 0:
         return None
     from_clause = sql[from_idx + 4:where_idx].strip()
     # Skip if FROM contains a subquery or JOIN
@@ -594,27 +815,121 @@ def _check_cross_join(sql: str) -> str | None:
 
 
 
-def _check_unverified_filter(sql: str, memory: "AgentMemory") -> str | None:
-    """Warn if answer SQL has a WHERE filter never tested via any run_sql."""
-    upper = sql.upper()
-    where_idx = upper.find("WHERE")
-    if where_idx < 0:
+
+
+def _check_fk_resolution(
+    result: dict, columns: list[str], kg: "KnowledgeGraph", db_path: Path,
+    knowledge_text: str,
+) -> str | None:
+    """Reject answer if it returns raw FK values that exist in knowledge docs.
+
+    Detects when an answer column contains reference IDs (e.g. Airtable recXXX)
+    that point to entities described in doc files rather than SQL tables.
+    Uses two signals: column naming (link_to_X) and value presence in knowledge.
+    """
+    import sqlite3
+
+    if not result.get("rows") or not columns or not knowledge_text:
         return None
-    # Check if ANY prior verified query had a WHERE clause
-    queries = memory.nodes.get("_query", [])
-    if not queries:
-        return (
-            "WARNING: You haven't tested any filter with run_sql yet. "
-            "Verify your filter first."
-        )
-    # If at least one prior run_sql had a WHERE, we trust the model
-    for q in queries:
-        if "WHERE" in q.upper():
-            return None
-    return (
-        "WARNING: None of your prior run_sql queries used a WHERE clause. "
-        "Test your filter with run_sql first."
-    )
+
+    # Get all SQL tables
+    try:
+        conn = sqlite3.connect(str(db_path))
+        sql_tables = {
+            r[0].lower()
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        conn.close()
+    except Exception:
+        return None
+
+    # Collect FK columns that reference non-SQL tables (by KG metadata or naming)
+    fk_cols: set[str] = set()
+    for _, fk in kg.all_foreign_keys():
+        if fk.ref_table.lower() not in sql_tables:
+            fk_cols.add(fk.column.lower())
+
+    # Also detect "link_to_X" naming convention
+    for t in kg.tables:
+        for c in t.columns:
+            if c.name.lower().startswith("link_to_"):
+                ref = c.name[8:].lower()
+                if ref not in sql_tables:
+                    fk_cols.add(c.name.lower())
+
+    # Check each answer column: if it's a known FK col OR its values appear
+    # verbatim in knowledge_text (indicating they're doc-resolvable IDs)
+    rows = result["rows"]
+    for col_idx, col_name in enumerate(columns):
+        # Skip numeric-looking columns
+        sample_val = str(rows[0][col_idx]) if rows[0][col_idx] else ""
+        if not sample_val or len(sample_val) < 6:
+            continue
+        if sample_val.replace(".", "").replace("-", "").isdigit():
+            continue
+        if " " in sample_val:
+            continue
+
+        # Signal 1: column is a known FK to a doc-only table
+        is_fk = col_name.lower() in fk_cols
+
+        # Signal 2: the value appears in knowledge docs (it's a resolvable ref)
+        in_docs = sample_val in knowledge_text
+
+        if is_fk and in_docs:
+            return (
+                f"FK RESOLUTION NEEDED: Column \"{col_name}\" contains reference "
+                f"IDs (e.g. \"{sample_val}\") that map to names in the source "
+                f"documents. Use the knowledge tool to search for "
+                f"\"{sample_val}\" and find the human-readable name, then return "
+                f"that name instead of the raw ID."
+            )
+
+    return None
+
+
+def _check_string_literal_columns(result: dict, columns: list[str], db_path: Path) -> str | None:
+    """Detect when SQLite's double-quote fallback returns a column name as a string.
+
+    SQLite treats "nonexistent_col" as the string literal 'nonexistent_col' instead
+    of raising an error. Detect this by checking if any result value equals the
+    column alias stripped of quotes.
+    """
+    rows = result.get("rows", [])
+    if not rows:
+        return None
+
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        all_tables = [r[0] for r in cursor.fetchall()]
+        all_columns: set[str] = set()
+        for tbl in all_tables:
+            for col_info in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall():
+                all_columns.add(col_info[1].lower())
+        conn.close()
+    except Exception:
+        return None
+
+    for col_idx, col_name in enumerate(columns):
+        # Strip wrapping quotes from the column alias
+        clean_name = col_name.strip('"').strip("'").strip("`")
+        # Check if this "column" doesn't actually exist in any table
+        if clean_name.lower() in all_columns:
+            continue
+        # Check if the returned value IS the column name (string literal fallback)
+        first_val = str(rows[0][col_idx]) if rows[0][col_idx] is not None else ""
+        if first_val == clean_name:
+            return (
+                f"INVALID COLUMN: \"{clean_name}\" does not exist in any table. "
+                f"SQLite returned it as a string literal, not actual data. "
+                f"Check the schema to find the correct column name."
+            )
+
+    return None
 
 
 def _check_null_ratio(result: dict, cols: list[str]) -> str | None:
@@ -831,7 +1146,7 @@ def _record_vacuous(memory: "AgentMemory", msg: str) -> None:
     # Extract effective columns if mentioned
     if "actually filters rows:" in msg:
         after = msg.split("actually filters rows:")[1].strip()
-        memory.add_fact("_filter_evidence", after[:100])
+        memory.add_fact("_filter_evidence", after)
 
 
 def _check_duplicate(action: str, parsed: dict[str, Any], history: set[str]) -> str | None:
@@ -901,7 +1216,7 @@ class AgentMemory:
                 self.domain_sql.pop(0)
 
     def add_failed(self, sql: str, reason: str) -> None:
-        entry = f"{sql[:60]} → {reason}"
+        entry = f"{sql} → {reason}"
         self.failed.append(entry)
         if len(self.failed) > 3:
             self.failed.pop(0)
@@ -1056,12 +1371,14 @@ class KGAgent:
 
         try:
             # Phase 1: Context setup
-            db_path, kg, kg_query, knowledge_text = self._setup_context(task)
+            db_path, kg, kg_query, knowledge_text, doc_text = self._setup_context(task)
             if not db_path:
                 return self._fail(task, "Failed to consolidate data to SQLite.")
 
             # Phase 2: Agent loop
-            result = self._agent_loop(task.question, db_path, kg, kg_query, knowledge_text)
+            result = self._agent_loop(
+                task.question, db_path, kg, kg_query, knowledge_text, doc_text
+            )
             if not result or not result.get("rows"):
                 return self._fail(task, "Agent loop failed or returned no data.")
 
@@ -1079,7 +1396,7 @@ class KGAgent:
 
     def _setup_context(
         self, task: PublicTask
-    ) -> tuple[Path | None, KnowledgeGraph | None, KGQueryService | None, str]:
+    ) -> tuple[Path | None, KnowledgeGraph | None, KGQueryService | None, str, str]:
         ctx = scan_context(task.context_dir)
         self._log(
             "scan",
@@ -1089,10 +1406,25 @@ class KGAgent:
 
         db_path = consolidate_to_sqlite(task.context_dir)
         if not db_path or not db_path.exists():
-            return None, None, None, ""
+            return None, None, None, "", ""
 
+        # Build KG from structured tables
         kg = build_kg_from_sqlite(db_path)
         self._log("kg_built", f"{len(kg.tables)} tables, {len(kg.all_foreign_keys())} FKs")
+
+        # Load raw doc text separately for execute_python
+        doc_text_full = ""
+        if ctx.doc_sources:
+            doc_names = []
+            for doc_src in ctx.doc_sources:
+                try:
+                    doc_text = doc_src.path.read_text(errors="replace")
+                    doc_text_full += f"\n\n## Document: {doc_src.path.stem}\n{doc_text}"
+                    doc_names.append(doc_src.path.stem)
+                    self._log("doc_loaded", f"{doc_src.path.stem}: {len(doc_text)} chars")
+                except OSError:
+                    pass
+            kg.doc_names = doc_names
 
         try:
             kg = discover_joins_with_llm(kg, model=self.model, log_fn=self._log)
@@ -1101,8 +1433,35 @@ class KGAgent:
 
         profile_schema(kg)
 
+        # Pre-compute alias registry and business topology
+        try:
+            build_alias_registry(kg, self.model, db_path, log_fn=self._log)
+        except Exception as e:
+            self._log("alias_registry_error", str(e))
+        try:
+            build_business_topology(kg, self.model, db_path, log_fn=self._log)
+        except Exception as e:
+            self._log("business_topology_error", str(e))
+
         kg_query = KGQueryService(kg)
-        return db_path, kg, kg_query, ctx.knowledge_text
+        # knowledge_text = domain formulas/definitions only (from knowledge.md)
+        # doc_text_full = raw doc content for execute_python
+        # Combine both for tool_knowledge (it searches all)
+        combined_knowledge = ctx.knowledge_text + doc_text_full
+        return db_path, kg, kg_query, combined_knowledge, doc_text_full
+
+    @staticmethod
+    def _get_existing_tables(db_path: Path) -> list[str]:
+        import sqlite3 as _sql
+        try:
+            conn = _sql.connect(str(db_path))
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            conn.close()
+            return tables
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     # Phase 2: Agent Loop
@@ -1115,6 +1474,7 @@ class KGAgent:
         kg: KnowledgeGraph,
         kg_query: KGQueryService,
         knowledge_text: str,
+        doc_text: str = "",
     ) -> dict[str, Any] | None:
         max_turns = 50
         max_time = 300
@@ -1129,6 +1489,7 @@ class KGAgent:
         conv_buffer: list[ModelMessage] = []
         reflect_count = 0  # limit reflection rejections to 1
         zero_answer_count = 0  # track 0-row answer attempts
+        opaque_id_count = 0  # limit opaque ID rejections to 1
 
         # Intent extraction: understand what the question structurally requires
         # Provide table/column context so the model picks real column names
@@ -1137,6 +1498,9 @@ class KGAgent:
         if intent:
             self._log("intent", intent)
             memory.add_fact("_intent", intent)
+            self._intent_text = intent
+        else:
+            self._intent_text = ""
 
         for turn in range(max_turns):
             if self._elapsed() > max_time:
@@ -1286,13 +1650,26 @@ class KGAgent:
                 self._log("tool_input", f"knowledge({query})")
                 observation = tool_knowledge(knowledge_text, query)
                 if observation and len(observation) > 10:
-                    first_line = observation.split("\n")[0][:80]
+                    first_line = observation.split("\n")[0]
                     memory.add_fact("_knowledge", first_line)
+            elif action == "distribution":
+                dist_table = parsed.get("table", table)
+                dist_col = parsed.get("column", "")
+                self._log("tool_input", f"distribution({dist_table}, {dist_col})")
+                observation = tool_distribution(db_path, dist_table, dist_col)
+                memory.add_fact(
+                    f"{dist_table}.{dist_col}", "distribution analyzed"
+                )
             elif action == "find_value":
                 value = parsed.get("value", "")
                 self._log("tool_input", f"find_value({value})")
                 observation = tool_find_value(kg, value, db_path)
-                memory.add_fact("_find_value", f"{value}: {observation[:60]}")
+                memory.add_fact("_find_value", f"{value}: {observation}")
+            elif action == "resolve":
+                term = parsed.get("term", "")
+                self._log("tool_input", f"resolve({term})")
+                observation = tool_resolve(kg, term, db_path)
+                memory.add_fact("_resolve", f"{term}: {observation}")
             elif action == "run_sql":
                 if not sql:
                     self._log("tool_error", "run_sql called with empty sql")
@@ -1341,7 +1718,31 @@ class KGAgent:
                 # Update verified SQL with latest successful query
                 if row_count > 0:
                     memory.set_verified(sql, row_count, cols)
-                    memory.add_fact("_query", f"{row_count} rows: {sql[:80]}")
+                    memory.add_fact("_query", f"{row_count} rows: {sql}")
+                # Hint when SQL results contain IDs found in doc text
+                if row_count > 0 and doc_text and run_result:
+                    doc_refs = self._find_doc_references(
+                        run_result, doc_text
+                    )
+                    if doc_refs:
+                        observation += f"\n\n{doc_refs}"
+            elif action == "execute_python":
+                code = parsed.get("code", "")
+                if not code:
+                    self._log("tool_error", "execute_python called with empty code")
+                    observation = "ERROR: no code provided"
+                elif not memory.verified_sql and kg.tables and doc_text:
+                    observation = (
+                        "BLOCKED: Use run_sql on the SQL tables first to get "
+                        "relevant IDs, then use execute_python to search docs "
+                        "for those IDs."
+                    )
+                else:
+                    self._log("tool_input", f"execute_python: {code[:200]}")
+                    # Pass combined text so Python has access to everything
+                    full_text = knowledge_text + doc_text
+                    observation = tool_execute_python(code, full_text, db_path)
+                    memory.add_fact("_python", observation[:100])
             elif action == "answer":
                 if not sql:
                     self._log("tool_error", "answer called with empty sql")
@@ -1381,13 +1782,25 @@ class KGAgent:
                             f"conditions with run_sql first, then submit a corrected answer."
                         )
                     else:
-                        # Check column resolution violations
-                        col_error = _check_column_resolution(
-                            sql, memory.column_resolutions, db_path
+                        # Detect SQLite string-literal fallback
+                        literal_msg = _check_string_literal_columns(
+                            result, result["columns"], db_path
                         )
-                        if col_error:
+                        if literal_msg:
+                            self._log("string_literal_col", literal_msg)
+                            observation = literal_msg
+                        # Check column resolution violations
+                        elif (col_error := _check_column_resolution(
+                            sql, memory.column_resolutions, db_path
+                        )):
                             self._log("resolution_violation", col_error)
                             observation = col_error
+                        # Reject if answer introduces unverified filters
+                        elif (unverified_msg := _check_unverified_filter(
+                            sql, memory.verified_sql, memory.failed
+                        )):
+                            self._log("unverified_filter", unverified_msg)
+                            observation = unverified_msg
                         else:
                             # Reject if a numeric filter is vacuous
                             vacuous_msg = _check_vacuous_filter(sql, db_path)
@@ -1410,12 +1823,6 @@ class KGAgent:
                                 )):
                                     self._log("empty_order", empty_msg)
                                     observation = empty_msg
-                                # Check unverified filter
-                                elif (unv_msg := _check_unverified_filter(
-                                    sql, memory
-                                )):
-                                    self._log("unverified_filter", unv_msg)
-                                    observation = unv_msg
                                 else:
                                     # Log NULL ratio warning (non-blocking)
                                     null_msg = _check_null_ratio(
@@ -1423,8 +1830,19 @@ class KGAgent:
                                     )
                                     if null_msg:
                                         self._log("null_ratio_warn", null_msg)
+                                    # FK resolution check (max 1 rejection)
+                                    fk_msg = None
+                                    if opaque_id_count < 1:
+                                        fk_msg = _check_fk_resolution(
+                                            result, result["columns"],
+                                            kg, db_path, knowledge_text,
+                                        )
+                                    if fk_msg:
+                                        opaque_id_count += 1
+                                        self._log("fk_resolution_reject", fk_msg)
+                                        observation = fk_msg
                                     # Self-reflection (max 1 rejection)
-                                    if reflect_count < 1:
+                                    elif reflect_count < 1:
                                         reject = self._reflect(
                                             question, sql, result, memory,
                                         )
@@ -1455,7 +1873,8 @@ class KGAgent:
             else:
                 observation = (
                     f"Unknown action '{action}'. Available: overview, schema, "
-                    f"ontology, topology, knowledge, find_value, run_sql, answer"
+                    f"ontology, topology, knowledge, distribution, find_value, "
+                    f"resolve, run_sql, execute_python, answer"
                 )
 
             self._log("tool_output", observation)
@@ -1503,7 +1922,7 @@ class KGAgent:
                     conv_buffer.append(
                         ModelMessage(role="assistant", content=resolve_raw)
                     )
-                    memory.add_resolution(resolve_raw[:200])
+                    memory.add_resolution(resolve_raw)
                 else:
                     self._log("resolve_failed", "LLM returned empty response")
                 for amb in new_ambiguities:
@@ -1613,7 +2032,7 @@ class KGAgent:
             ln.strip() for ln in raw.strip().split("\n")
             if ln.strip() and ":" in ln
         ]
-        return " | ".join(lines[:4])[:250] if lines else None
+        return " | ".join(lines[:4]) if lines else None
 
     # ------------------------------------------------------------------
     # Self-Reflection
@@ -1634,6 +2053,10 @@ class KGAgent:
         columns = result.get("columns", [])
         rows = result.get("rows", [])
         if not rows:
+            return None
+
+        # Skip reflection for literal SELECTs (knowledge-resolved values)
+        if "FROM" not in sql.upper():
             return None
 
         # Format a preview of the result (first 5 rows)
@@ -1692,7 +2115,7 @@ class KGAgent:
         if not raw:
             return None
 
-        self._log("reflect_response", raw[:200])
+        self._log("reflect_response", raw)
 
         # Parse response
         stripped = raw.strip()
@@ -1768,8 +2191,78 @@ class KGAgent:
         rows = result.get("rows", [])
         if not columns or not rows:
             return None
+        # Strip columns not requested by the question
+        columns, rows = self._strip_extra_columns(columns, rows)
         str_rows = [[str(v) if v is not None else "" for v in row] for row in rows]
         return AnswerTable(columns=columns, rows=str_rows)
+
+    def _strip_extra_columns(
+        self, columns: list[str], rows: list[list[Any]]
+    ) -> tuple[list[str], list[list[Any]]]:
+        """Remove columns not mentioned in the intent's RETURN field.
+
+        Uses the pre-extracted intent to determine which columns are requested.
+        Only strips when there are clearly extra columns.
+        """
+        if len(columns) <= 1 or len(rows) == 1:
+            return columns, rows
+
+        # Extract RETURN field from intent
+        intent_facts = getattr(self, "_intent_text", "")
+        if not intent_facts:
+            return columns, rows
+
+        # Parse RETURN: section
+        return_text = ""
+        for part in intent_facts.split("|"):
+            if "RETURN" in part.upper():
+                return_text = part.split(":", 1)[-1].strip().lower()
+                break
+        if not return_text:
+            return columns, rows
+
+        # Extract meaningful words from RETURN field
+        return_words = {
+            w.rstrip("?.,!") for w in re.split(r'[_\s(),/]+', return_text)
+            if len(w) > 2 and w not in ("the", "and", "for", "all")
+        }
+        if not return_words:
+            return columns, rows
+
+        def _col_in_return(col: str) -> bool:
+            col_lower = col.lower().strip('"')
+            col_parts = [p for p in re.split(r'[_\s()]+', col_lower) if p and len(p) > 2]
+            # Aggregate or computed columns are always kept
+            if any(fn in col_lower for fn in (
+                "count", "sum", "avg", "max", "min", "cast",
+                "total", "ratio", "percent", "number", "num_",
+            )):
+                return True
+            for part in col_parts:
+                if part in ("id", "id2"):
+                    continue
+                for rw in return_words:
+                    shorter = min(len(part), len(rw))
+                    if shorter < 3:
+                        continue
+                    common = 0
+                    for a, b in zip(part, rw):
+                        if a != b:
+                            break
+                        common += 1
+                    if common / shorter >= 0.6:
+                        return True
+            return False
+
+        keep_indices = [i for i, col in enumerate(columns) if _col_in_return(col)]
+
+        if not keep_indices or len(keep_indices) == len(columns):
+            return columns, rows
+
+        new_cols = [columns[i] for i in keep_indices]
+        new_rows = [[row[i] for i in keep_indices] for row in rows]
+        self._log("column_strip", f"{columns} → {new_cols}")
+        return new_cols, new_rows
 
     # ------------------------------------------------------------------
     # Utilities
@@ -1858,6 +2351,45 @@ class KGAgent:
                     chars[i] = " "
             i += 1
         return "".join(chars)
+
+
+    def _find_doc_references(
+        self, result: dict[str, Any], doc_text: str
+    ) -> str:
+        """Detect when SQL results contain IDs/values that appear in doc text.
+
+        Returns a hint string if cross-referenceable values are found.
+        """
+        rows = result.get("rows", [])
+        if not rows or not doc_text:
+            return ""
+
+        # Collect string values from the result that look like reference IDs
+        ref_values: list[str] = []
+        for row in rows[:10]:
+            for val in row:
+                s = str(val) if val is not None else ""
+                if len(s) < 5 or len(s) > 50:
+                    continue
+                if s.replace(".", "").replace("-", "").isdigit():
+                    continue
+                if " " in s and len(s.split()) > 3:
+                    continue
+                if s in doc_text:
+                    ref_values.append(s)
+
+        if not ref_values:
+            return ""
+
+        unique_refs = list(dict.fromkeys(ref_values))[:3]
+        return (
+            f"DOC CROSS-REFERENCE: Values from SQL results appear in the "
+            f"source documents: {unique_refs}. "
+            f"Use execute_python to look up these IDs in the doc text:\n"
+            f"  matches = [l for l in docs.split('\\n') "
+            f"if '{unique_refs[0]}' in l]\n"
+            f"  print(matches[:10])"
+        )
 
     def _elapsed(self) -> float:
         return time.monotonic() - self._start_time

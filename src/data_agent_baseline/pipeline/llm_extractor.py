@@ -25,21 +25,22 @@ from data_agent_baseline.pipeline.sqlite_writer import _sanitize_column_name
 EXTRACT_PROMPT = """Extract ALL records from this text into a JSON array.
 
 ENTITY: {entity_name}
-ID FIELD: {id_field}
-FIELDS: {field_list}
-
+{db_context}
+{field_guidance}
 RULES:
-1. Each object: {{"{id_field}": "...", "Date": "YYYY-MM-DD", ...only fields present...}}
-2. CORRECTIONS: initially X, corrected/adjusted to Y → use ONLY Y.
-3. NaN/unavailable → null. Not mentioned → omit.
-4. Numbers only, no units.
-5. If text explicitly describes a field as elevated/impaired/compromised/dysfunction → add "<field>_status": "abnormal". If normal/healthy/unremarkable → "normal". Only for explicitly described fields.
-6. Extract EVERY record.
+1. Each record MUST have an ID field (numeric identifier, code, or registry number mentioned in text).
+2. Extract ALL attributes: names, numeric values, categories, IDs, codes, statuses, labels.
+3. CORRECTIONS: if text says "initially X, corrected/updated to Y" → use ONLY the corrected value Y.
+4. Numbers: extract as plain numbers without units. Use the attribute name to indicate what it measures.
+5. If a value is unavailable/unknown/not applicable → use null.
+6. Use snake_case for field names (e.g. height_cm, full_name, publisher_id).
+7. If the same entity appears multiple times (e.g. biometrics in a later paragraph), merge into one record.
+8. Extract EVERY entity/record mentioned. Do not skip any.
 
 TEXT:
 {text_chunk}
 
-JSON array only:"""
+Return a JSON array of objects. Each object is one record:"""
 
 
 def _build_field_list(schema: DocumentSchema) -> str:
@@ -50,6 +51,90 @@ def _build_field_list(schema: DocumentSchema) -> str:
             desc += f" (aka {', '.join(f.aliases[:3])})"
         parts.append(desc)
     return ", ".join(parts)
+
+
+def _get_db_context(db_path: Path, entity_name: str) -> str:
+    """Get existing DB schema as context hints for extraction."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if not tables:
+            conn.close()
+            return ""
+        lines = [
+            "EXISTING DB TABLES (extract fields that can JOIN with these):"
+        ]
+        for t in tables:
+            cols_info = conn.execute(f'PRAGMA table_info("{t}")').fetchall()
+            cols = [f"{r[1]} ({r[2]})" for r in cols_info]
+            lines.append(f"  {t}: {', '.join(cols)}")
+        conn.close()
+        return "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
+def _get_knowledge_fields(knowledge_text: str, entity_name: str) -> str:
+    """Extract field definitions from knowledge.md for the target entity."""
+    if not knowledge_text:
+        return ""
+    lines = knowledge_text.split("\n")
+    entity_lower = entity_name.lower()
+
+    field_lines: list[str] = []
+
+    # Strategy 1: Find "- **Entity**: description" followed by indented "  - **field**:"
+    # This is the most precise format (entity definition with sub-fields)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Match: "- **Molecule**: ..." — entity name must be in the bold label
+        if stripped.startswith("- **"):
+            bold_end = stripped.find("**", 4)
+            if bold_end > 0:
+                bold_label = stripped[4:bold_end].lower()
+                if entity_lower == bold_label or entity_lower in bold_label.split():
+                    for j in range(i + 1, min(i + 20, len(lines))):
+                        sub = lines[j]
+                        if sub.startswith("  ") and "**" in sub and ":" in sub:
+                            field_lines.append(sub.strip())
+                        elif sub.strip() and not sub.startswith(" "):
+                            break
+                    if field_lines:
+                        break
+
+    # Strategy 2: Find a heading like "### Superhero" with field bullets below
+    if not field_lines:
+        best_start = -1
+        best_specificity = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip().lower()
+            if stripped.startswith("#") and entity_lower in stripped:
+                level = len(stripped) - len(stripped.lstrip("#"))
+                exact = stripped.lstrip("#").strip() == entity_lower
+                specificity = level + (10 if exact else 0)
+                if specificity > best_specificity:
+                    best_specificity = specificity
+                    best_start = i
+
+        if best_start >= 0:
+            for line in lines[best_start + 1:]:
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    if field_lines:
+                        break
+                    continue
+                if stripped.startswith("- **") and ":" in stripped:
+                    if "SELECT " in stripped or "Formula" in stripped:
+                        continue
+                    if "Explanation" in stripped:
+                        continue
+                    field_lines.append(stripped)
+
+    if field_lines:
+        return "SCHEMA FROM KNOWLEDGE:\n" + "\n".join(field_lines) + "\n"
+    return ""
 
 
 def _detect_section_fields(text: str, schema: DocumentSchema) -> str:
@@ -126,6 +211,7 @@ def _chunk_by_section(sections: list[Section], max_chars: int = 30000) -> list[t
     """Chunk by section groups, returning (section_heading, text) pairs.
 
     Groups consecutive sections into chunks up to max_chars.
+    If a single section exceeds max_chars, splits it by paragraphs.
     Returns the heading of the first section in each group for field detection.
     """
     chunks: list[tuple[str, str]] = []
@@ -134,8 +220,31 @@ def _chunk_by_section(sections: list[Section], max_chars: int = 30000) -> list[t
     heading = ""
 
     for section in sections:
-        section_text = "\n\n".join(p for p in section.paragraphs if len(p) >= 30)
+        paragraphs = [p for p in section.paragraphs if len(p) >= 30]
+        section_text = "\n\n".join(paragraphs)
         if not section_text:
+            continue
+
+        # If this single section exceeds max_chars, split by paragraphs
+        if len(section_text) > max_chars:
+            # Flush current buffer first
+            if buffer:
+                chunks.append((heading, "\n\n".join(buffer)))
+                buffer = []
+                buffer_len = 0
+                heading = ""
+
+            para_buffer: list[str] = []
+            para_len = 0
+            for para in paragraphs:
+                if para_buffer and para_len + len(para) > max_chars:
+                    chunks.append((section.heading, "\n\n".join(para_buffer)))
+                    para_buffer = []
+                    para_len = 0
+                para_buffer.append(para)
+                para_len += len(para)
+            if para_buffer:
+                chunks.append((section.heading, "\n\n".join(para_buffer)))
             continue
 
         if buffer and buffer_len + len(section_text) > max_chars:
@@ -194,12 +303,16 @@ def hybrid_extract_docs(
 
         # Stage 2: Discover schema (deterministic)
         schema = discover_schema(text, doc_path.stem, knowledge_text)
+        db_context = _get_db_context(db_path, doc_path.stem)
+        knowledge_fields = _get_knowledge_fields(knowledge_text, doc_path.stem)
+        if knowledge_fields:
+            db_context = knowledge_fields + db_context
         if log_fn:
             log_fn("schema", f"{doc_path.stem}: {len(schema.fields)} fields, "
                    f"entity={schema.entity_name}")
 
         # Stage 3: Chunk by section groups
-        section_chunks = _chunk_by_section(data_sections, max_chars=30000)
+        section_chunks = _chunk_by_section(data_sections, max_chars=20000)
         if log_fn:
             log_fn("chunks", f"{doc_path.stem}: {len(section_chunks)} section chunks")
 
@@ -218,10 +331,16 @@ def hybrid_extract_docs(
             if not section_fields:
                 section_fields = _build_field_list(schema)
 
+            field_guidance = ""
+            if section_fields:
+                field_guidance = f"KNOWN FIELDS: {section_fields}\n"
+            elif schema.fields:
+                field_guidance = f"KNOWN FIELDS: {_build_field_list(schema)}\n"
+
             prompt = EXTRACT_PROMPT.format(
                 entity_name=schema.entity_name,
-                id_field=id_field,
-                field_list=section_fields,
+                db_context=db_context,
+                field_guidance=field_guidance,
                 text_chunk=chunk_text,
             )
             messages = [ModelMessage(role="user", content=prompt)]
@@ -257,6 +376,24 @@ def hybrid_extract_docs(
     return total_records
 
 
+def _detect_id_key(records: list[dict[str, Any]], id_field: str) -> str:
+    """Detect which key in the records is the actual ID field."""
+    candidates = [id_field, "ID", "id", "identifier", "record_id",
+                  "molecule_id", "registry_number", "hero_id", "race_id"]
+    for key in candidates:
+        hits = sum(1 for r in records[:20] if r.get(key))
+        if hits > len(records[:20]) * 0.5:
+            return key
+    # Fallback: find a field that looks like an ID (present in most records, unique-ish)
+    if records:
+        for key in records[0]:
+            if "id" in key.lower() or "identifier" in key.lower():
+                hits = sum(1 for r in records[:20] if r.get(key))
+                if hits > len(records[:20]) * 0.5:
+                    return key
+    return id_field
+
+
 def _merge_and_write(
     records: list[dict[str, Any]],
     schema: DocumentSchema,
@@ -266,10 +403,11 @@ def _merge_and_write(
     log_fn: Callable[[str, str], None] | None = None,
 ) -> int:
     """Merge extracted records by composite key and write to SQLite."""
+    actual_id_key = _detect_id_key(records, id_field)
     merged: dict[str, dict[str, Any]] = {}
 
     for rec in records:
-        rid = str(rec.get(id_field, rec.get("ID", rec.get("id", ""))))
+        rid = str(rec.get(actual_id_key, rec.get("ID", rec.get("id", ""))))
         if not rid:
             continue
         date_val = rec.get("Date", rec.get("date", ""))
@@ -279,9 +417,9 @@ def _merge_and_write(
             key = rid
 
         if key not in merged:
-            merged[key] = {"record_id": key, id_field.lower(): rid}
+            merged[key] = {"record_id": key}
         for k, v in rec.items():
-            if k in (id_field, "ID", "id"):
+            if k == actual_id_key:
                 continue
             col = _sanitize_column_name(k)
             if v is not None:
@@ -307,6 +445,9 @@ def _merge_and_write(
             val = rec.get(col)
             if val is None:
                 continue
+            if isinstance(val, (list, dict)):
+                is_numeric = False
+                break
             try:
                 float(val)
             except (ValueError, TypeError):
@@ -336,6 +477,9 @@ def _merge_and_write(
             row = [rec.get("record_id")]
             for col in sorted_cols:
                 val = rec.get(col)
+                # Flatten lists/dicts to strings
+                if isinstance(val, (list, dict)):
+                    val = str(val)
                 if val is not None and col_types.get(col) == "REAL":
                     try:
                         val = float(val)
