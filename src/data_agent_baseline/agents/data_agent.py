@@ -1,4 +1,4 @@
-"""KGAgent: LLM-driven agent with queryable Knowledge Graph.
+"""DataAgent: LLM-driven agent with queryable Knowledge Graph.
 
 Pipeline:
   1. [Deterministic] Consolidate data → SQLite, build KG, discover joins, profile schema
@@ -1074,16 +1074,25 @@ def _zero_row_hint(sql: str, db_path: Path, kg=None) -> str:
                             ]
                             if extra:
                                 # Values have MORE precision than prefix
-                                hints.append(
-                                    f"0 ROWS: '{value}' is not stored exactly. "
-                                    f"The data stores \"{col_name}\" as "
-                                    f"'{prefix}' + extra precision: {matches[:5]}. "
-                                    f"The question only says '{prefix}' — the "
-                                    f"extra characters ({extra[:3]}) are NOT in "
-                                    f"the question. Use LIKE '{prefix}%' to "
-                                    f"match ALL {len(matches)} values with "
-                                    f"this prefix."
-                                )
+                                # Find exact case-insensitive match if one exists
+                                exact_ci = [
+                                    m for m in matches
+                                    if m.lower() == value.lower()
+                                ]
+                                if exact_ci:
+                                    hints.append(
+                                        f"0 ROWS: '{value}' is a case mismatch. "
+                                        f"The data stores it as '{exact_ci[0]}'. "
+                                        f"Use = '{exact_ci[0]}' (exact match)."
+                                    )
+                                else:
+                                    hints.append(
+                                        f"0 ROWS: '{value}' is not stored exactly. "
+                                        f"Actual values in \"{col_name}\": "
+                                        f"{matches[:5]}. "
+                                        f"Pick the one that best matches the "
+                                        f"question — use exact = not LIKE."
+                                    )
                             elif prefix != value:
                                 hints.append(
                                     f"0 ROWS: '{value}' not found, but "
@@ -1385,7 +1394,7 @@ class AgentMemory:
         return "\n".join(lines)
 
 
-class KGAgent:
+class DataAgent:
     def __init__(
         self,
         *,

@@ -11,7 +11,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from data_agent_baseline.agents.kg_agent import KGAgent
+from data_agent_baseline.agents.data_agent import DataAgent
 from data_agent_baseline.agents.model import AzureOpenAIModelAdapter, OpenAIModelAdapter
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
@@ -82,7 +82,7 @@ def build_model_adapter(config: AppConfig):
 
 
 def _build_agent(*, model, config: AppConfig, log_callback=None):
-    return KGAgent(model=model, log_callback=log_callback)
+    return DataAgent(model=model, log_callback=log_callback)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

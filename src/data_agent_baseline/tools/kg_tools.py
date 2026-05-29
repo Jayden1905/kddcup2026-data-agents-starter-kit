@@ -1,4 +1,4 @@
-"""KG Tools: tool functions for the KGAgent loop.
+"""KG Tools: tool functions for the DataAgent loop.
 
 Each tool takes structured inputs and returns a formatted string observation.
 """
