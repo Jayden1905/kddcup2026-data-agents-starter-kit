@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from data_agent_baseline.agents.kg_approach_graph import ApproachGraph
+from data_agent_baseline.agents.kg_consult_agent import ConsultAgent
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
 from data_agent_baseline.agents.runtime import AgentRunResult
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
@@ -168,6 +170,33 @@ structured records, parse prose, or compute values from text.
   ERRORS: Returns error with traceback if code fails.
   FORMAT: {"action": "execute_python", "code": "...", "reasoning": "why"}
 
+recall_approaches(tables, columns, agg, grain, temporal, joins)
+  INTENT: Query your memory of past failed SQL approaches to avoid repeating them.
+  Use when you're stuck or want to see what strategies have already been tried \
+for specific tables, columns, join paths, or structural patterns.
+  PARAMS (all optional, combine any):
+    tables — filter by table names involved
+    columns — filter by select or filter columns
+    agg — filter by aggregation type (COUNT, SUM, AVG, MIN, MAX)
+    grain — filter by result grain (scalar, single_row, multi_row, grouped)
+    temporal — filter by temporal column used in filters
+    joins — filter by join conditions
+  RETURNS: Full history of matching failed approaches with SQL, structural \
+breakdown, result, and failure reason. Never truncated.
+  FORMAT: {"action": "recall_approaches", "tables": ["T"], "columns": ["C"], \
+"agg": "COUNT", "grain": "scalar", "temporal": "date", "joins": ["A.id=B.id"], \
+"reasoning": "why"}
+
+recall_memory(entity)
+  INTENT: Query the knowledge graph memory for facts about a specific table, \
+column, or topic you have learned during exploration.
+  Use to recall: column distributions, domain mappings, resolved values, \
+prior query results, knowledge findings.
+  PARAMS: entity (optional) — table name, "table.column", or topic like \
+"_knowledge", "_resolve". If omitted, returns full memory state.
+  RETURNS: All facts stored for the entity or the full graph state.
+  FORMAT: {"action": "recall_memory", "entity": "tablename", "reasoning": "why"}
+
 == SQL RULES ==
 - Double-quote all identifiers: "Table"."Column"
 - COLLATE NOCASE for text comparisons
@@ -198,7 +227,18 @@ with Avg, Sum, Total, Count, Num, etc.) already store computed values per row. \
 Filter them with WHERE — do NOT re-aggregate with GROUP BY HAVING. \
 HAVING is only needed when computing a new aggregate from raw data at query time.
 - "Average number of X that Y have": use CAST(COUNT(X) AS REAL) / COUNT(DISTINCT Y). \
-Do NOT use AVG(subquery) which double-counts when relationships are many-to-many.
+Do NOT use AVG(subquery) which double-counts when relationships are many-to-many. \
+Use only the declared FK join path — do NOT add OR conditions on other columns \
+to "catch more matches". The FK relationship defines the correct counting logic.
+- Only SELECT columns that directly answer the question. Never include IDs, \
+join keys, or helper columns in your final answer.
+- Filter values with exact equality (=) by default. Only broaden to LIKE or IN \
+with variants if exact match returns 0 rows.
+- Do NOT add WHERE col IS NOT NULL unless the question explicitly excludes \
+missing data. Aggregations already ignore NULLs — a NULL filter changes which \
+rows participate in OTHER columns' calculations.
+- When resolving a FK reference, always JOIN to the target table via the ID \
+column. Never use denormalized text fields — they are often NULL or stale.
 
 == THRESHOLD RULES ==
 - When the question mentions "normal"/"abnormal"/"high"/"low" for a numeric column:
@@ -1280,6 +1320,12 @@ class AgentMemory:
         if intent_facts:
             lines.append(f"[Intent] {intent_facts[-1]}")
 
+        # Formula from chain-of-thought — the exact math the SQL must implement
+        formula_facts = self.nodes.get("_formula", [])
+        if formula_facts:
+            lines.append("[FORMULA — your SQL MUST implement this exactly]")
+            lines.append(f"  {formula_facts[-1]}")
+
         # Show pending conditions from intent not yet in verified SQL
         if intent_facts and self.verified_sql:
             pending = self._pending_conditions(intent_facts[-1], self.verified_sql)
@@ -1476,7 +1522,7 @@ class KGAgent:
         knowledge_text: str,
         doc_text: str = "",
     ) -> dict[str, Any] | None:
-        max_turns = 50
+        max_turns = 200
         max_time = 300
         max_history = 6  # keep last N assistant+user message pairs
         final_result = None
@@ -1485,6 +1531,8 @@ class KGAgent:
         consecutive_blocks = 0
         evidence: list[str] = []
         memory = AgentMemory()
+        approaches = ApproachGraph()
+        consult_agent = ConsultAgent(self.model, question)
         # Conversation buffer (assistant/user pairs, pruned to max_history)
         conv_buffer: list[ModelMessage] = []
         reflect_count = 0  # limit reflection rejections to 1
@@ -1502,13 +1550,41 @@ class KGAgent:
         else:
             self._intent_text = ""
 
+        # Chain-of-thought: decompose question into exact math formula
+        # This runs once before the loop and guides all SQL generation
+        all_fks = kg.all_foreign_keys()
+        join_hint = "\n".join(
+            f"  {src_table}.{fk.column} -> {fk.ref_table}.{fk.ref_column}"
+            for src_table, fk in all_fks
+        ) if all_fks else ""
+        formula = self._decompose_formula(
+            question, intent or "", schema_hint, join_hint
+        )
+        if formula:
+            self._log("cot_formula", formula)
+            memory.add_fact("_formula", formula)
+            consult_agent.set_formula(formula)
+
         for turn in range(max_turns):
             if self._elapsed() > max_time:
                 self._log("agent_timeout", f"at turn {turn}, {self._elapsed():.0f}s elapsed")
                 break
 
+            # Proactive memory agent consultation every 10 turns
+            if turn > 0 and turn % 10 == 0 and approaches.nodes:
+                guidance = consult_agent.consult(
+                    approaches,
+                    schema_context=self._schema_hint(kg, question),
+                    trigger="proactive",
+                )
+                if guidance:
+                    self._log("consult_agent_proactive", guidance)
+
             # Build messages fresh each turn: system + graph memory + question + conv
-            messages = self._build_messages(question, memory, conv_buffer, max_history)
+            messages = self._build_messages(
+                question, memory, conv_buffer, max_history, approaches,
+                consult_agent=consult_agent,
+            )
 
             raw = self._call_llm(messages)
             if not raw:
@@ -1674,8 +1750,52 @@ class KGAgent:
                 if not sql:
                     self._log("tool_error", "run_sql called with empty sql")
                     break
+                # Hard gate: block duplicate approaches
+                dup_node = approaches.is_duplicate(sql)
+                if dup_node:
+                    self._log("approach_blocked", f"duplicate of turn {dup_node.turn}")
+                    fp = dup_node.fingerprint
+                    similar = approaches.similar_to(sql)
+                    observation = (
+                        f"BLOCKED: You already tried this exact structural approach "
+                        f"on turn {dup_node.turn}.\n"
+                        f"  Tables: {fp.tables}\n"
+                        f"  Joins: {fp.joins}\n"
+                        f"  Filters: {fp.filter_cols} = {fp.filter_values}\n"
+                        f"  Aggregations: {fp.aggs}\n"
+                        f"  Grain: {fp.grain}\n"
+                        f"  Result was: {dup_node.result} — {dup_node.reason}\n\n"
+                        f"You MUST change your strategy. Options:\n"
+                        f"  - Use different tables or join paths\n"
+                        f"  - Use different filter columns\n"
+                        f"  - Use a different aggregation or grain\n"
+                        f"  - Add/remove subqueries\n"
+                        f"  - Change GROUP BY structure"
+                    )
+                    if similar:
+                        observation += "\n\nAll related failures:"
+                        for s in similar:
+                            observation += (
+                                f"\n  ✗ Turn {s.turn}: {s.sql}\n"
+                                f"    → {s.result}: {s.reason}"
+                            )
+                    # Consult memory agent for strategic guidance
+                    guidance = consult_agent.consult(
+                        approaches,
+                        schema_context=self._schema_hint(kg, question),
+                        trigger="blocked",
+                    )
+                    if guidance:
+                        self._log("consult_agent_guidance", guidance)
+                        observation += f"\n\n[Strategy Advisor]: {guidance}"
+                    conv_buffer.append(ModelMessage(role="assistant", content=raw))
+                    conv_buffer.append(ModelMessage(role="user", content=observation))
+                    continue
                 self._log("tool_input", f"run_sql: {sql}")
                 observation, run_result = tool_run_sql(db_path, sql)
+                if run_result is None:
+                    node = approaches.record(sql, "error", observation, turn)
+                    consult_agent.observe(node)
                 row_count = (
                     len(run_result["rows"])
                     if run_result and run_result.get("rows")
@@ -1697,6 +1817,10 @@ class KGAgent:
                     hint = _zero_row_hint(sql, db_path, kg)
                     if hint:
                         observation += f"\n\n{hint}"
+                    node = approaches.record(
+                        sql, "0 rows", "no matching data", turn
+                    )
+                    consult_agent.observe(node)
                     memory.add_failed(sql, "0 rows")
                 # Check for vacuous filter (wrong column)
                 if row_count > 0:
@@ -1704,8 +1828,11 @@ class KGAgent:
                     if vacuous_msg:
                         observation += f"\n\n{vacuous_msg}"
                         self._log("vacuous_filter", vacuous_msg)
-                        # Add vacuous finding to the specific column node
                         _record_vacuous(memory, vacuous_msg)
+                        node = approaches.record(
+                            sql, f"{row_count} rows", "vacuous filter", turn
+                        )
+                        consult_agent.observe(node)
                 # Warn about duplicates during exploration
                 if row_count > 1 and run_result:
                     tuples = [tuple(r) for r in run_result["rows"]]
@@ -1858,6 +1985,10 @@ class KGAgent:
                                         break
                 else:
                     zero_answer_count += 1
+                    node = approaches.record(
+                        sql, "0 rows (answer)", "no data", turn
+                    )
+                    consult_agent.observe(node)
                     self._log("answer_failed", f"{obs} (attempt {zero_answer_count})")
                     if zero_answer_count >= 2:
                         self._log("answer_accept_fallback", "accepting after 2 zero-row attempts")
@@ -1870,11 +2001,51 @@ class KGAgent:
                         reflect_count = 1
                     else:
                         observation = f"{obs}\nUse run_sql to investigate, then try again."
+            elif action == "recall_approaches":
+                recall_tables = parsed.get("tables", [])
+                recall_cols = parsed.get("columns", [])
+                recall_agg = parsed.get("agg", "")
+                recall_grain = parsed.get("grain", "")
+                recall_temporal = parsed.get("temporal", "")
+                recall_joins = parsed.get("joins", [])
+                self._log(
+                    "tool_input",
+                    f"recall_approaches(tables={recall_tables}, "
+                    f"cols={recall_cols}, agg={recall_agg}, "
+                    f"grain={recall_grain}, temporal={recall_temporal}, "
+                    f"joins={recall_joins})",
+                )
+                results = approaches.recall(
+                    tables=recall_tables or None,
+                    columns=recall_cols or None,
+                    agg=recall_agg or None,
+                    grain=recall_grain or None,
+                    temporal=recall_temporal or None,
+                    joins=recall_joins or None,
+                )
+                if results:
+                    observation = approaches.render_for_prompt(results)
+                else:
+                    observation = "No matching past approaches found."
+            elif action == "recall_memory":
+                entity = parsed.get("entity", "")
+                self._log("tool_input", f"recall_memory({entity})")
+                if entity:
+                    facts = memory.nodes.get(entity, [])
+                    if facts:
+                        observation = f"[{entity}]\n" + "\n".join(
+                            f"  {f}" for f in facts
+                        )
+                    else:
+                        observation = f"No facts stored for '{entity}'."
+                else:
+                    observation = memory.render()
             else:
                 observation = (
                     f"Unknown action '{action}'. Available: overview, schema, "
                     f"ontology, topology, knowledge, distribution, find_value, "
-                    f"resolve, run_sql, execute_python, answer"
+                    f"resolve, run_sql, execute_python, recall_approaches, "
+                    f"recall_memory, answer"
                 )
 
             self._log("tool_output", observation)
@@ -1888,6 +2059,15 @@ class KGAgent:
                 evidence.append(f"Schema({table}):\n{observation}")
             elif action == "ontology":
                 evidence.append(f"Ontology({parsed.get('column', '')}):\n{observation}")
+
+            # --- Refine formula after significant discoveries ---
+            if action in ("overview", "schema", "topology") and consult_agent.get_formula():
+                refined = consult_agent.refine_formula(
+                    f"[{action}] {observation[:500]}"
+                )
+                if refined:
+                    self._log("formula_refined", refined)
+                    memory.add_fact("_formula", refined)
 
             # --- Generic ambiguity detection (runs after every tool) ---
             self._log("ambiguity_check", f"checking after {action}")
@@ -1914,7 +2094,8 @@ class KGAgent:
                 conv_buffer.append(ModelMessage(role="user", content=resolve_prompt))
                 # Build full messages for resolution call
                 resolve_msgs = self._build_messages(
-                    question, memory, conv_buffer, max_history
+                    question, memory, conv_buffer, max_history, approaches,
+                    consult_agent=consult_agent,
                 )
                 resolve_raw = self._call_llm(resolve_msgs)
                 if resolve_raw:
@@ -2038,6 +2219,63 @@ class KGAgent:
     # Self-Reflection
     # ------------------------------------------------------------------
 
+    def _decompose_formula(
+        self, question: str, intent: str, schema_hint: str,
+        join_hint: str = "",
+    ) -> str | None:
+        """Separate LLM call to decompose the question into an exact math formula.
+
+        Runs once before the agent loop. The formula is stored in memory and
+        guides all SQL generation throughout the session.
+        """
+        if not intent:
+            return None
+
+        fk_section = ""
+        if join_hint:
+            fk_section = (
+                f"\nDECLARED FOREIGN KEYS (use ONLY these join paths):\n"
+                f"{join_hint}\n"
+                f"RULE: Use ONLY the FK paths above. Do NOT invent joins on "
+                f"other columns (e.g. no OR on atom_id2 if FK is on atom_id).\n"
+            )
+
+        cot_prompt = (
+            f"QUESTION: {question}\n"
+            f"INTENT: {intent}\n"
+            f"SCHEMA:\n{schema_hint}\n"
+            f"{fk_section}\n"
+            f"Decompose this question into an exact mathematical formula.\n"
+            f"1. What computation does the question ask for? Write it as:\n"
+            f"   FORMULA: <exact math, e.g. AVG(Consumption) / 12>\n"
+            f"2. What does each part map to?\n"
+            f"   NUMERATOR: <what to count/sum/avg>\n"
+            f"   DENOMINATOR: <what to divide by, or NONE>\n"
+            f"3. What join path connects the tables?\n"
+            f"   JOIN: <use ONLY declared FKs above>\n"
+            f"4. Critical constraint:\n"
+            f"   CONSTRAINT: <any rule the SQL must follow>\n\n"
+            f"Be precise. The agent's SQL MUST implement this formula exactly."
+        )
+
+        messages = [
+            ModelMessage(
+                role="system",
+                content="You decompose questions into exact math formulas.",
+            ),
+            ModelMessage(role="user", content=cot_prompt),
+        ]
+
+        self._log("cot_call", "decomposing question into math formula")
+        result = self._call_llm(messages)
+        if not result:
+            return None
+
+        self._log("cot_result", result)
+        return result.strip()
+
+    # ------------------------------------------------------------------
+
     def _reflect(
         self,
         question: str,
@@ -2156,18 +2394,32 @@ class KGAgent:
         memory: AgentMemory,
         conv_buffer: list[ModelMessage],
         max_history: int,
+        approaches: ApproachGraph | None = None,
+        consult_agent: ConsultAgent | None = None,
     ) -> list[ModelMessage]:
-        """Build message list: system + graph memory, question, pruned conversation.
+        """Build message list: system + minimal context, question, pruned conversation.
 
-        The graph memory is always in the system prompt so the model never needs
-        to "remember" anything — all critical state is always visible.
+        Only intent + formula in system prompt. Everything else via tools
+        (recall_memory, recall_approaches).
         """
-        # System prompt with graph memory injected
-        graph_state = memory.render()
-        if graph_state:
-            system_content = f"{AGENT_SYSTEM}\n\n--- GRAPH MEMORY ---\n{graph_state}"
-        else:
-            system_content = AGENT_SYSTEM
+        # Minimal context: only intent and formula
+        intent_facts = memory.nodes.get("_intent", [])
+        formula_facts = memory.nodes.get("_formula", [])
+        verified = memory.verified_sql
+
+        context_lines: list[str] = []
+        if intent_facts:
+            context_lines.append(f"[Intent] {intent_facts[-1]}")
+        if formula_facts:
+            context_lines.append(f"[Formula] {formula_facts[-1]}")
+        if verified:
+            context_lines.append(
+                f"[Verified SQL] ({memory.verified_rows} rows): {verified}"
+            )
+
+        system_content = AGENT_SYSTEM
+        if context_lines:
+            system_content += "\n\n--- CONTEXT ---\n" + "\n".join(context_lines)
 
         msgs: list[ModelMessage] = [
             ModelMessage(role="system", content=system_content),
@@ -2191,78 +2443,8 @@ class KGAgent:
         rows = result.get("rows", [])
         if not columns or not rows:
             return None
-        # Strip columns not requested by the question
-        columns, rows = self._strip_extra_columns(columns, rows)
         str_rows = [[str(v) if v is not None else "" for v in row] for row in rows]
         return AnswerTable(columns=columns, rows=str_rows)
-
-    def _strip_extra_columns(
-        self, columns: list[str], rows: list[list[Any]]
-    ) -> tuple[list[str], list[list[Any]]]:
-        """Remove columns not mentioned in the intent's RETURN field.
-
-        Uses the pre-extracted intent to determine which columns are requested.
-        Only strips when there are clearly extra columns.
-        """
-        if len(columns) <= 1 or len(rows) == 1:
-            return columns, rows
-
-        # Extract RETURN field from intent
-        intent_facts = getattr(self, "_intent_text", "")
-        if not intent_facts:
-            return columns, rows
-
-        # Parse RETURN: section
-        return_text = ""
-        for part in intent_facts.split("|"):
-            if "RETURN" in part.upper():
-                return_text = part.split(":", 1)[-1].strip().lower()
-                break
-        if not return_text:
-            return columns, rows
-
-        # Extract meaningful words from RETURN field
-        return_words = {
-            w.rstrip("?.,!") for w in re.split(r'[_\s(),/]+', return_text)
-            if len(w) > 2 and w not in ("the", "and", "for", "all")
-        }
-        if not return_words:
-            return columns, rows
-
-        def _col_in_return(col: str) -> bool:
-            col_lower = col.lower().strip('"')
-            col_parts = [p for p in re.split(r'[_\s()]+', col_lower) if p and len(p) > 2]
-            # Aggregate or computed columns are always kept
-            if any(fn in col_lower for fn in (
-                "count", "sum", "avg", "max", "min", "cast",
-                "total", "ratio", "percent", "number", "num_",
-            )):
-                return True
-            for part in col_parts:
-                if part in ("id", "id2"):
-                    continue
-                for rw in return_words:
-                    shorter = min(len(part), len(rw))
-                    if shorter < 3:
-                        continue
-                    common = 0
-                    for a, b in zip(part, rw):
-                        if a != b:
-                            break
-                        common += 1
-                    if common / shorter >= 0.6:
-                        return True
-            return False
-
-        keep_indices = [i for i, col in enumerate(columns) if _col_in_return(col)]
-
-        if not keep_indices or len(keep_indices) == len(columns):
-            return columns, rows
-
-        new_cols = [columns[i] for i in keep_indices]
-        new_rows = [[row[i] for i in keep_indices] for row in rows]
-        self._log("column_strip", f"{columns} → {new_cols}")
-        return new_cols, new_rows
 
     # ------------------------------------------------------------------
     # Utilities
