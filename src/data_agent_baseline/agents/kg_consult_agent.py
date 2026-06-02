@@ -76,6 +76,43 @@ class ConsultAgent:
         )
         self._last_synthesis: str = ""
 
+    def create_resolution_plan(self, schema_overview: str = "") -> str:
+        """Identify unknowns in the formula and create a tool-call plan.
+
+        Returns a structured plan of which tools to call in what order to
+        resolve all unknowns before writing SQL. Called once after formula
+        is established.
+        """
+        if not self._formula:
+            return ""
+
+        prompt = (
+            f"[Resolution Planning]\n"
+            f"Question: {self.question}\n"
+            f"Formula:\n{self._formula}\n"
+            f"\nSchema overview:\n{schema_overview}\n\n"
+            f"Identify all UNKNOWNS in this formula that need resolution "
+            f"before SQL can be written. For each unknown, specify which tool "
+            f"to use:\n"
+            f"- recall_schema: check if we've seen this before\n"
+            f"- resolve: map informal name to DB value\n"
+            f"- knowledge: look up domain definitions/thresholds\n"
+            f"- find_value: locate where a value lives in the schema\n"
+            f"- distribution: check numeric ranges\n"
+            f"- run_sql: verify with SELECT DISTINCT\n\n"
+            f"Output a JSON list of steps:\n"
+            f'[{{"unknown": "what needs resolving", "tool": "tool_name", '
+            f'"params": {{...}}}}, ...]\n'
+            f"If no unknowns, respond: []"
+        )
+        self._context.append(ModelMessage(role="user", content=prompt))
+
+        response = self._call(self._context)
+        if response:
+            self._context.append(ModelMessage(role="assistant", content=response))
+            self._resolution_plan = response
+        return response or ""
+
     def refine_formula(self, discovery: str) -> str:
         """Refine the formula based on new schema/data discovery.
 

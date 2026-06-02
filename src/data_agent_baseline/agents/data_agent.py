@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,7 @@ from typing import Any
 from data_agent_baseline.agents.kg_approach_graph import ApproachGraph
 from data_agent_baseline.agents.kg_consult_agent import ConsultAgent
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
+from data_agent_baseline.agents.schema_memory import SchemaMemoryGraph
 from data_agent_baseline.agents.runtime import AgentRunResult
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.pipeline.context_scanner import scan_context
@@ -57,6 +57,11 @@ Always include a "reasoning" field explaining WHY you chose this action/filter.
 2. schema/ontology/find_value → understand columns, valid values, where entities live
 3. run_sql → verify filters and check data before answering
 4. answer → submit verified query
+
+SPEED RULE: If PRIOR KNOWLEDGE or Domain Mappings already tell you the exact \
+filter values, column ownership, and join paths needed — skip exploration tools \
+and go directly to run_sql to verify, then answer. Do NOT re-explore what is \
+already known.
 
 == TOOLS ==
 
@@ -196,6 +201,20 @@ prior query results, knowledge findings.
 "_knowledge", "_resolve". If omitted, returns full memory state.
   RETURNS: All facts stored for the entity or the full graph state.
   FORMAT: {"action": "recall_memory", "entity": "tablename", "reasoning": "why"}
+
+recall_schema(table, column, join, value)
+  INTENT: Query persistent schema memory from prior runs on this database. \
+Returns: domain value mappings, column ownership for ambiguous columns, \
+known value vocabularies, case-sensitivity gotchas, and confirmed join paths.
+  Use when you need to know: what integer maps to a label, which table owns \
+a column, what values exist in a column, or how to join tables.
+  PARAMS (all optional, combine any):
+    table — table name to recall facts about
+    column — column name (requires table)
+    join — join path substring to search
+    value — specific value to look up known facts about
+  RETURNS: Actionable facts only. Empty if first time seeing this schema.
+  FORMAT: {"action": "recall_schema", "table": "T", "column": "C", "reasoning": "why"}
 
 == SQL RULES ==
 - Double-quote all identifiers: "Table"."Column"
@@ -381,58 +400,93 @@ def _check_column_resolution(
 ) -> str | None:
     """Check if the answer SQL uses resolved columns from the correct table.
 
-    If the resolution says column X should come from table T, but the SQL
-    either (a) doesn't include table T at all, or (b) selects X from a different
-    table, return a hint telling the agent to fix it.
+    Only rejects when the column has DIFFERENT values across tables.
+    If the column is a join key (same value in both tables), accepts either.
     """
     if not column_resolutions:
         return None
 
     sql_lower = sql.lower()
-    select_end = sql_lower.find("from")
-    if select_end == -1:
+    from_idx = sql_lower.find("from")
+    if from_idx == -1:
         return None
-    select_part = sql_lower[:select_end]
+    select_clause = sql[:from_idx].replace("SELECT", "").replace("select", "").strip()
+
+    # Split SELECT items by comma at depth 0
+    items: list[str] = []
+    depth = 0
+    current = ""
+    for ch in select_clause:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            items.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        items.append(current.strip())
+
+    # Detect join keys from the SQL (columns in ON clauses are same value either way)
+    join_keys: set[str] = set()
+    on_parts = sql_lower.split(" on ")
+    for part in on_parts[1:]:
+        # Extract "a.col = b.col" — the column name is a join key
+        eq_idx = part.find("=")
+        if eq_idx > 0:
+            left = part[:eq_idx].strip().split(".")[-1].strip().strip('"')
+            right = part[eq_idx + 1:].strip().split()[0].split(".")[-1].strip().strip('"')
+            join_keys.add(left)
+            join_keys.add(right)
 
     for col, correct_table in column_resolutions.items():
         col_lower = col.lower()
-        # Is this column in the SELECT clause?
-        if col_lower not in select_part:
+
+        # Skip join keys — value is identical from either table
+        if col_lower in join_keys:
             continue
 
-        # Is the correct table in the query at all?
-        if correct_table not in sql_lower:
-            return (
-                f"COLUMN ERROR: You resolved \"{col}\" to come from "
-                f"\"{correct_table}\", but your SQL doesn't use that table. "
-                f"JOIN \"{correct_table}\" and SELECT \"{col}\" from it."
-            )
+        # Find the SELECT item that produces this column
+        for item in items:
+            item_lower = item.lower()
+            as_idx = item_lower.rfind(" as ")
+            if as_idx > 0:
+                alias = item_lower[as_idx + 4:].strip().strip('"')
+                expr = item_lower[:as_idx].strip()
+            else:
+                alias = ""
+                expr = item_lower
 
-        # Check if the column is qualified with a DIFFERENT table/alias
-        # Look for pattern: other_table."col" or other_alias."col"
-        # where other != correct_table
+            item_col = expr.split(".")[-1].strip().strip('"')
+            if item_col != col_lower and alias != col_lower:
+                continue
 
-        # Find table.col or alias.col patterns in SELECT
-        pattern = r'(\w+)\s*\.\s*"?' + re.escape(col_lower) + r'"?'
-        matches = re.findall(pattern, select_part, re.IGNORECASE)
-        for table_ref in matches:
-            ref_lower = table_ref.lower().strip('"')
-            if ref_lower == correct_table:
-                continue
-            # Check if this ref is an alias for the correct table
-            # Look for: correct_table AS ref or correct_table ref
-            alias_pattern = (
-                correct_table + r'\s+(?:AS\s+)?' + re.escape(ref_lower)
-            )
-            if re.search(alias_pattern, sql_lower):
-                continue
-            # It's from the wrong table
-            return (
-                f"COLUMN ERROR: You resolved \"{col}\" to come from "
-                f"\"{correct_table}\", but your SQL selects it from "
-                f"\"{table_ref}\". Fix the SELECT to use "
-                f"\"{correct_table}\".\"{col}\"."
-            )
+            # Found the item — check if it's qualified with the wrong table
+            if "." in expr:
+                table_part = expr.split(".")[0].strip().strip('"')
+                if table_part == correct_table:
+                    break
+
+                alias_check = (
+                    f'"{correct_table}" {table_part}' in sql_lower
+                    or f'"{correct_table}" as {table_part}' in sql_lower
+                    or f'{correct_table} {table_part}' in sql_lower
+                    or f'{correct_table} as {table_part}' in sql_lower
+                )
+                if alias_check:
+                    break
+
+                return (
+                    f"COLUMN ERROR: You resolved \"{col}\" to come from "
+                    f"\"{correct_table}\", but your SQL selects it from "
+                    f"\"{table_part}\". Fix the SELECT to use "
+                    f"\"{correct_table}\".\"{col}\"."
+                )
+            break
 
     return None
 
@@ -503,14 +557,14 @@ def _split_outer_and(where_clause: str) -> list[str]:
 
 
 def _check_unverified_filter(
-    sql: str, verified_sql: str | None, failed: list[str]
+    sql: str, verified_sql: str | None, failed: list[str],
+    domain_sql: list[str] | None = None,
 ) -> str | None:
     """Reject answer if it introduces WHERE conditions not tested via run_sql.
 
-    Checks both verified_sql (returned rows) and failed queries (returned 0 rows)
-    since both represent conditions the agent has already tested.
+    Checks verified_sql, failed queries, and domain_sql (pre-known mappings).
     """
-    if not verified_sql and not failed:
+    if not verified_sql and not failed and not domain_sql:
         return None
 
     sql_upper = sql.upper()
@@ -520,7 +574,14 @@ def _check_unverified_filter(
     if not answer_where:
         return None
 
-    # Build pool of all tested conditions (from verified + failed queries)
+    # Normalize: strip quotes, COLLATE NOCASE, extra whitespace
+    def _normalize(s: str) -> str:
+        s = s.replace('"', "").replace("'", "").replace("`", "")
+        s = s.replace(" COLLATE NOCASE", "").replace("COLLATE NOCASE", "")
+        # Collapse whitespace
+        return " ".join(s.split())
+
+    # Build pool of all tested conditions (from verified + failed + domain)
     tested_pool = ""
     if verified_sql:
         vw = _find_outer_where(verified_sql.upper())
@@ -529,12 +590,16 @@ def _check_unverified_filter(
 
     for entry in failed:
         entry_upper = entry.upper()
-        # failed entries have " → reason" appended
         arrow_pos = entry_upper.find(" →")
         clean = entry_upper[:arrow_pos] if arrow_pos != -1 else entry_upper
         fw = _find_outer_where(clean)
         if fw:
             tested_pool += " " + fw
+
+    # Domain SQL conditions are pre-validated by domain knowledge
+    if domain_sql:
+        for ds in domain_sql:
+            tested_pool += " " + ds.upper()
 
     if not tested_pool.strip():
         return None
@@ -542,16 +607,12 @@ def _check_unverified_filter(
     # Split into individual conditions by AND (respecting parens)
     answer_conds = _split_outer_and(answer_where)
 
-    # Normalize: strip COLLATE NOCASE for comparison
-    def _strip_collate(s: str) -> str:
-        return s.replace(" COLLATE NOCASE", "").replace("COLLATE NOCASE", "")
-
-    tested_normalized = _strip_collate(tested_pool)
+    tested_normalized = _normalize(tested_pool)
 
     # Check each answer condition — is it present in any tested query?
     new_conds = []
     for cond in answer_conds:
-        cond_normalized = _strip_collate(cond)
+        cond_normalized = _normalize(cond)
         if cond_normalized not in tested_normalized and cond not in tested_pool:
             new_conds.append(cond)
 
@@ -1430,10 +1491,22 @@ class DataAgent:
             if not db_path:
                 return self._fail(task, "Failed to consolidate data to SQLite.")
 
+            # Load schema memory (persistent across runs)
+            schema_memory = self._load_schema_memory(kg, task)
+            # Always record structural facts from KG (cheap, idempotent)
+            self._record_kg_structure(schema_memory, kg, knowledge_text)
+            if schema_memory.has_knowledge():
+                self._log("schema_memory_loaded", schema_memory.summary())
+
             # Phase 2: Agent loop
             result = self._agent_loop(
-                task.question, db_path, kg, kg_query, knowledge_text, doc_text
+                task.question, db_path, kg, kg_query, knowledge_text, doc_text,
+                schema_memory=schema_memory,
             )
+
+            # Save schema memory after task (writes discoveries back)
+            self._save_schema_memory(schema_memory, task)
+
             if not result or not result.get("rows"):
                 return self._fail(task, "Agent loop failed or returned no data.")
 
@@ -1505,6 +1578,83 @@ class DataAgent:
         combined_knowledge = ctx.knowledge_text + doc_text_full
         return db_path, kg, kg_query, combined_knowledge, doc_text_full
 
+    def _load_schema_memory(
+        self, kg: KnowledgeGraph, task: PublicTask
+    ) -> SchemaMemoryGraph:
+        """Load persistent schema memory for this task's schema."""
+        storage_dir = Path("artifacts/schema_memory")
+        schema_memory = SchemaMemoryGraph(storage_dir=storage_dir)
+
+        # Compute fingerprint from the KG tables
+        tables_info = [
+            {"name": t.name, "columns": [c.name for c in t.columns]}
+            for t in kg.tables
+        ]
+        fingerprint = SchemaMemoryGraph.compute_fingerprint(tables_info)
+        schema_memory.load(fingerprint)
+        return schema_memory
+
+    def _save_schema_memory(
+        self, schema_memory: SchemaMemoryGraph, task: PublicTask
+    ) -> None:
+        """Persist schema memory after task completes."""
+        try:
+            schema_memory.save()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _record_kg_structure(
+        schema_memory: SchemaMemoryGraph, kg, knowledge_text: str
+    ) -> None:
+        """Record structural facts from KG into schema memory.
+
+        Runs every task — cheap and idempotent (add_fact bumps confidence
+        if already exists). Ensures join paths, column types, and domain
+        mappings are always captured regardless of agent tool choices.
+        """
+        task_id = "setup"
+
+        # Join paths
+        for src_table, fk in kg.all_foreign_keys():
+            schema_memory.record_join(
+                src_table, fk.column, fk.ref_table, fk.ref_column,
+                f"FK: {src_table}.{fk.column} -> {fk.ref_table}.{fk.ref_column}",
+                task_id=task_id,
+            )
+
+        # Column types and roles
+        for t in kg.tables:
+            for col in t.columns:
+                schema_memory.record_column(
+                    t.name, col.name,
+                    f"type: {col.sql_type}, pk: {col.is_pk}",
+                    task_id=task_id,
+                )
+
+        # Domain SQL from knowledge text
+        if knowledge_text:
+            for line in knowledge_text.split("\n"):
+                conditions = _extract_where_conditions(line)
+                if conditions:
+                    parts = conditions.strip().split()
+                    if parts:
+                        col_name = parts[0].strip('"').strip("'")
+                        owner = ""
+                        for t in kg.tables:
+                            for c in t.columns:
+                                if c.name.lower() == col_name.lower():
+                                    owner = t.name
+                                    break
+                            if owner:
+                                break
+                        if owner:
+                            schema_memory.record_column(
+                                owner, col_name,
+                                f"domain mapping: WHERE {conditions}",
+                                task_id=task_id,
+                            )
+
     @staticmethod
     def _get_existing_tables(db_path: Path) -> list[str]:
         import sqlite3 as _sql
@@ -1530,6 +1680,7 @@ class DataAgent:
         kg_query: KGQueryService,
         knowledge_text: str,
         doc_text: str = "",
+        schema_memory: SchemaMemoryGraph | None = None,
     ) -> dict[str, Any] | None:
         max_turns = 200
         max_time = 300
@@ -1542,8 +1693,40 @@ class DataAgent:
         memory = AgentMemory()
         approaches = ApproachGraph()
         consult_agent = ConsultAgent(self.model, question)
-        # Conversation buffer (assistant/user pairs, pruned to max_history)
+
+        # Pre-extract domain SQL only if schema memory exists (agent learned before)
+        if schema_memory and schema_memory.has_knowledge() and knowledge_text:
+            for line in knowledge_text.split("\n"):
+                conditions = _extract_where_conditions(line)
+                if conditions:
+                    memory.add_domain_sql(conditions)
+
+        # Conversation buffer — pre-fill with schema memory if available
         conv_buffer: list[ModelMessage] = []
+        if schema_memory and schema_memory.has_knowledge():
+            # Simulate as if the agent already called overview and got prior knowledge
+            overview_result = tool_overview(kg, question)
+            prior = schema_memory.summarize_for_prompt()
+            if prior:
+                overview_result += f"\n\nPRIOR KNOWLEDGE (from previous runs):\n{prior}"
+            conv_buffer.append(
+                ModelMessage(
+                    role="assistant",
+                    content='{"action": "overview", "reasoning": "checking schema"}',
+                )
+            )
+            conv_buffer.append(
+                ModelMessage(role="user", content=overview_result)
+            )
+            # Pre-populate memory graph from schema memory resolutions
+            for node in schema_memory.nodes.values():
+                if node.node_type == "column":
+                    for fact in node.facts:
+                        if not fact.superseded and "resolved:" in fact.text:
+                            # Extract table.col from node_id "col:table.col"
+                            parts = node.node_id.replace("col:", "").split(".")
+                            if len(parts) == 2:
+                                memory.column_resolutions[parts[1]] = parts[0]
         reflect_count = 0  # limit reflection rejections to 1
         zero_answer_count = 0  # track 0-row answer attempts
         opaque_id_count = 0  # limit opaque ID rejections to 1
@@ -1561,6 +1744,9 @@ class DataAgent:
 
         # Chain-of-thought: decompose question into exact math formula
         # This runs once before the loop and guides all SQL generation
+        has_prior = schema_memory and schema_memory.has_knowledge()
+
+        # CoT always runs — it's about the question, not the schema
         all_fks = kg.all_foreign_keys()
         join_hint = "\n".join(
             f"  {src_table}.{fk.column} -> {fk.ref_table}.{fk.ref_column}"
@@ -1573,6 +1759,14 @@ class DataAgent:
             self._log("cot_formula", formula)
             memory.add_fact("_formula", formula)
             consult_agent.set_formula(formula)
+
+            # Resolution plan: skip if schema memory already covers the unknowns
+            if not has_prior:
+                overview_text = tool_overview(kg, question)
+                resolution_plan = consult_agent.create_resolution_plan(overview_text)
+                if resolution_plan:
+                    self._log("resolution_plan", resolution_plan)
+                    memory.add_fact("_plan", resolution_plan)
 
         for turn in range(max_turns):
             if self._elapsed() > max_time:
@@ -1679,6 +1873,13 @@ class DataAgent:
 
             if action == "overview":
                 observation = tool_overview(kg, question)
+                # Inject schema memory if available
+                if schema_memory and schema_memory.has_knowledge():
+                    prior = schema_memory.summarize_for_prompt()
+                    if prior:
+                        observation += (
+                            f"\n\nPRIOR KNOWLEDGE (from previous runs):\n{prior}"
+                        )
                 # Extract table names and add to graph
                 for t in kg.tables:
                     memory.add_fact(t.name, f"{t.role}, {t.row_count} rows")
@@ -1745,11 +1946,23 @@ class DataAgent:
                 memory.add_fact(
                     f"{dist_table}.{dist_col}", "distribution analyzed"
                 )
+                if schema_memory and dist_table and dist_col:
+                    schema_memory.record_column(
+                        dist_table, dist_col,
+                        f"distribution: {observation}",
+                        task_id=self._question,
+                    )
             elif action == "find_value":
                 value = parsed.get("value", "")
                 self._log("tool_input", f"find_value({value})")
                 observation = tool_find_value(kg, value, db_path)
                 memory.add_fact("_find_value", f"{value}: {observation}")
+                if schema_memory and observation:
+                    schema_memory.record_value(
+                        "search", "find_value", value,
+                        observation,
+                        task_id=self._question,
+                    )
             elif action == "resolve":
                 term = parsed.get("term", "")
                 self._log("tool_input", f"resolve({term})")
@@ -1874,11 +2087,11 @@ class DataAgent:
                         "for those IDs."
                     )
                 else:
-                    self._log("tool_input", f"execute_python: {code[:200]}")
+                    self._log("tool_input", f"execute_python: {code}")
                     # Pass combined text so Python has access to everything
                     full_text = knowledge_text + doc_text
                     observation = tool_execute_python(code, full_text, db_path)
-                    memory.add_fact("_python", observation[:100])
+                    memory.add_fact("_python", observation)
             elif action == "answer":
                 if not sql:
                     self._log("tool_error", "answer called with empty sql")
@@ -1933,7 +2146,8 @@ class DataAgent:
                             observation = col_error
                         # Reject if answer introduces unverified filters
                         elif (unverified_msg := _check_unverified_filter(
-                            sql, memory.verified_sql, memory.failed
+                            sql, memory.verified_sql, memory.failed,
+                            memory.domain_sql,
                         )):
                             self._log("unverified_filter", unverified_msg)
                             observation = unverified_msg
@@ -2049,12 +2263,36 @@ class DataAgent:
                         observation = f"No facts stored for '{entity}'."
                 else:
                     observation = memory.render()
+            elif action == "recall_schema":
+                rs_table = parsed.get("table", "")
+                rs_column = parsed.get("column", "")
+                rs_join = parsed.get("join", "")
+                rs_value = parsed.get("value", "")
+                self._log(
+                    "tool_input",
+                    f"recall_schema(table={rs_table}, col={rs_column}, "
+                    f"join={rs_join}, value={rs_value})",
+                )
+                if schema_memory:
+                    observation = schema_memory.recall(
+                        table=rs_table or None,
+                        column=rs_column or None,
+                        join=rs_join or None,
+                        value=rs_value or None,
+                    )
+                    if not observation:
+                        observation = (
+                            "No prior knowledge for this schema element. "
+                            "This may be the first time seeing this database."
+                        )
+                else:
+                    observation = "Schema memory not available."
             else:
                 observation = (
                     f"Unknown action '{action}'. Available: overview, schema, "
                     f"ontology, topology, knowledge, distribution, find_value, "
                     f"resolve, run_sql, execute_python, recall_approaches, "
-                    f"recall_memory, answer"
+                    f"recall_memory, recall_schema, answer"
                 )
 
             self._log("tool_output", observation)
@@ -2069,10 +2307,17 @@ class DataAgent:
             elif action == "ontology":
                 evidence.append(f"Ontology({parsed.get('column', '')}):\n{observation}")
 
+            # --- Record discoveries to persistent schema memory ---
+            if schema_memory:
+                self._record_to_schema_memory(
+                    schema_memory, action, table, sql, observation,
+                    memory, kg,
+                )
+
             # --- Refine formula after significant discoveries ---
             if action in ("overview", "schema", "topology") and consult_agent.get_formula():
                 refined = consult_agent.refine_formula(
-                    f"[{action}] {observation[:500]}"
+                    f"[{action}] {observation}"
                 )
                 if refined:
                     self._log("formula_refined", refined)
@@ -2256,7 +2501,12 @@ class DataAgent:
             f"{fk_section}\n"
             f"Decompose this question into an exact mathematical formula.\n"
             f"1. What computation does the question ask for? Write it as:\n"
-            f"   FORMULA: <exact math, e.g. AVG(Consumption) / 12>\n"
+            f"   FORMULA: <exact math>\n"
+            f"   Rules:\n"
+            f"   - PERCENTAGE → must include * 100\n"
+            f"   - RATIO → use CAST(... AS REAL) for division\n"
+            f"   - AVERAGE PER TIME PERIOD → if data is at finer grain, divide by periods\n"
+            f"   - AVERAGE NUMBER OF X PER Y → COUNT(X) / COUNT(DISTINCT Y)\n"
             f"2. What does each part map to?\n"
             f"   NUMERATOR: <what to count/sum/avg>\n"
             f"   DENOMINATOR: <what to divide by, or NONE>\n"
@@ -2411,9 +2661,10 @@ class DataAgent:
         Only intent + formula in system prompt. Everything else via tools
         (recall_memory, recall_approaches).
         """
-        # Minimal context: only intent and formula
+        # Minimal context: intent, formula, plan, domain mappings, verified SQL
         intent_facts = memory.nodes.get("_intent", [])
         formula_facts = memory.nodes.get("_formula", [])
+        plan_facts = memory.nodes.get("_plan", [])
         verified = memory.verified_sql
 
         context_lines: list[str] = []
@@ -2421,6 +2672,13 @@ class DataAgent:
             context_lines.append(f"[Intent] {intent_facts[-1]}")
         if formula_facts:
             context_lines.append(f"[Formula] {formula_facts[-1]}")
+        if plan_facts:
+            context_lines.append("[Resolution Plan — resolve these BEFORE writing SQL]")
+            context_lines.append(f"  {plan_facts[-1]}")
+        if memory.domain_sql:
+            context_lines.append("[Domain Mappings — use these exact values]")
+            for s in memory.domain_sql:
+                context_lines.append(f"  >> WHERE {s}")
         if verified:
             context_lines.append(
                 f"[Verified SQL] ({memory.verified_rows} rows): {verified}"
@@ -2543,6 +2801,168 @@ class DataAgent:
             i += 1
         return "".join(chars)
 
+
+    def _record_to_schema_memory(
+        self,
+        schema_memory: SchemaMemoryGraph,
+        action: str,
+        table: str,
+        sql: str,
+        observation: str,
+        memory: AgentMemory,
+        kg: KnowledgeGraph,
+    ) -> None:
+        """Record structural facts and patterns to persistent schema memory.
+
+        Records: domain mappings, column ownership, value formats, join paths,
+        column value vocabularies. NOT results or success/failure outcomes.
+        """
+        task_id = self._question
+
+        # Domain SQL mappings → record on the specific COLUMN
+        if action == "schema" and memory.domain_sql:
+            for ds in memory.domain_sql:
+                parts = ds.strip().split()
+                if parts:
+                    col_name = parts[0].strip('"').strip("'")
+                    owner = self._extract_table_for_column(col_name, kg)
+                    if owner:
+                        schema_memory.record_column(
+                            owner, col_name,
+                            f"domain mapping: WHERE {ds}",
+                            task_id=task_id,
+                        )
+
+        # Column collision resolutions → which table owns which column
+        if memory.column_resolutions:
+            for col, resolved_table in memory.column_resolutions.items():
+                schema_memory.record_column(
+                    resolved_table, col,
+                    f"resolved: use {resolved_table}.{col} (not other tables)",
+                    task_id=task_id,
+                )
+
+        # Value format facts from zero-row hints
+        if action == "run_sql" and observation:
+            if "case mismatch" in observation or "not stored exactly" in observation:
+                first_line = observation.split("\n")[0]
+                col_name = self._extract_filter_column(sql)
+                tbl_name = self._extract_table_for_column(col_name, kg)
+                if tbl_name and col_name:
+                    schema_memory.record_column(
+                        tbl_name, col_name,
+                        f"value format: {first_line}",
+                        task_id=task_id,
+                    )
+
+        # Column value vocabulary from SELECT DISTINCT results
+        if action == "run_sql" and observation and sql:
+            sql_upper = sql.upper()
+            if "DISTINCT" in sql_upper and "columns:" in observation:
+                # Extract column name from SQL
+                col_name = self._extract_select_column(sql)
+                tbl_name = self._extract_from_table(sql)
+                if col_name and tbl_name:
+                    # Extract values from observation
+                    values_line = ""
+                    for line in observation.split("\n"):
+                        if line.strip().startswith("["):
+                            values_line += line.strip() + " "
+                    if values_line:
+                        schema_memory.record_column(
+                            tbl_name, col_name,
+                            f"known values: {values_line.strip()}",
+                            task_id=task_id,
+                        )
+
+        # find_value → which table.column contains a value
+        if action == "find_value" and observation and "not found" not in observation:
+            for line in observation.split("\n"):
+                if "contains" in line.lower() and '"' in line:
+                    parts = line.split('"')
+                    if len(parts) >= 4:
+                        tbl = parts[1]
+                        col = parts[3]
+                        schema_memory.record_column(
+                            tbl, col, "contains values matching query",
+                            task_id=task_id,
+                        )
+                        break
+
+        # Join paths — record from KG on first overview/topology
+        if action in ("overview", "topology"):
+            all_fks = kg.all_foreign_keys()
+            for src_table, fk in all_fks:
+                schema_memory.record_join(
+                    src_table, fk.column, fk.ref_table, fk.ref_column,
+                    f"FK: {src_table}.{fk.column} -> {fk.ref_table}.{fk.ref_column}",
+                    task_id=task_id,
+                )
+
+        # Column types and roles from schema inspection
+        if action == "schema" and table:
+            ts = kg.get_table(table)
+            if ts:
+                for col in ts.columns:
+                    schema_memory.record_column(
+                        table, col.name,
+                        f"type: {col.sql_type}, pk: {col.is_pk}",
+                        task_id=task_id,
+                    )
+
+    @staticmethod
+    def _extract_filter_column(sql: str) -> str:
+        """Extract the column name from a WHERE clause in SQL."""
+        upper = sql.upper()
+        where_idx = upper.find("WHERE")
+        if where_idx == -1:
+            return ""
+        after_where = sql[where_idx + 5:].strip()
+        # First token after WHERE (strip quotes and table prefix)
+        token = after_where.split()[0] if after_where.split() else ""
+        if "." in token:
+            token = token.split(".")[-1]
+        return token.strip('"').strip("'").strip("`")
+
+    @staticmethod
+    def _extract_table_for_column(col_name: str, kg) -> str:
+        """Find which table owns a column."""
+        if not col_name:
+            return ""
+        for t in kg.tables:
+            for c in t.columns:
+                if c.name.lower() == col_name.lower():
+                    return t.name
+        return ""
+
+    @staticmethod
+    def _extract_select_column(sql: str) -> str:
+        """Extract the column name from a SELECT DISTINCT query."""
+        upper = sql.upper()
+        from_idx = upper.find("FROM")
+        if from_idx == -1:
+            return ""
+        select_part = sql[7:from_idx].strip()  # skip "SELECT "
+        # Remove DISTINCT
+        if select_part.upper().startswith("DISTINCT"):
+            select_part = select_part[8:].strip()
+        # Get first column (strip table prefix and quotes)
+        col = select_part.split(",")[0].strip()
+        if "." in col:
+            col = col.split(".")[-1]
+        return col.strip('"').strip("'").strip("`")
+
+    @staticmethod
+    def _extract_from_table(sql: str) -> str:
+        """Extract the table name from the FROM clause."""
+        upper = sql.upper()
+        from_idx = upper.find("FROM")
+        if from_idx == -1:
+            return ""
+        after_from = sql[from_idx + 4:].strip()
+        # First token is the table (stop at WHERE, JOIN, ORDER, etc.)
+        token = after_from.split()[0] if after_from.split() else ""
+        return token.strip('"').strip("'").strip("`")
 
     def _find_doc_references(
         self, result: dict[str, Any], doc_text: str

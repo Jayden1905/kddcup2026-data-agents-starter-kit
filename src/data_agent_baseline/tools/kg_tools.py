@@ -142,6 +142,10 @@ def detect_ambiguities(
     if action == "schema":
         ambiguities.extend(_detect_column_collisions(kg, table, question, db_path))
 
+    if action == "overview":
+        for t in kg.tables:
+            ambiguities.extend(_detect_column_collisions(kg, t.name, question, db_path))
+
     if action == "topology":
         ambiguities.extend(_detect_join_ambiguity(kg, tables or [], db_path))
 
